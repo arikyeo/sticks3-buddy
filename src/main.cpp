@@ -60,7 +60,7 @@ enum DisplayMode { DISP_NORMAL, DISP_PET, DISP_INFO, DISP_COUNT };
 uint8_t displayMode = DISP_NORMAL;
 uint8_t infoPage = 0;
 uint8_t petPage = 0;
-const uint8_t PET_PAGES = 2;
+const uint8_t PET_PAGES = 3;
 uint8_t msgScroll = 0;
 uint16_t lastLineGen = 0;
 char     lastPromptId[40] = "";
@@ -826,6 +826,56 @@ static void drawPetStats(const Palette& p) {
   tokFmt("today    ", tama.tokensToday, y + 40);
 }
 
+// Token-usage page: three bars (context / hourly / weekly), ported from
+// bjedwards 1ec45c0 onto the pet screen. The bridge doesn't send real
+// usage telemetry yet, so the percentages are the same heuristics the
+// original used, derived from the tokens-today counter — swap in bridge
+// fields when the host grows them (PROTOCOL_V2 optional-field superset).
+static void drawTokenBar(const Palette& p, int y, const char* label,
+                         uint32_t used, uint32_t budget) {
+  const uint16_t USE_GREEN = 0x07E0, USE_YELLOW = 0xFFE0, USE_RED = 0xF800;
+  uint32_t pct = budget ? (uint32_t)((uint64_t)used * 100 / budget) : 0;
+  if (pct > 100) pct = 100;
+  uint16_t col = pct >= 85 ? USE_RED : pct >= 60 ? USE_YELLOW : USE_GREEN;
+
+  const int BX = 32, BW = 66, BH = 6;
+  spr.setTextColor(p.textDim, p.bg);
+  spr.setCursor(6, y);
+  spr.print(label);
+  spr.drawRect(BX, y - 1, BW, BH + 2, p.textDim);
+  int fill = (int)((uint32_t)(BW - 2) * pct / 100);
+  if (fill > 0) spr.fillRect(BX + 1, y, fill, BH, col);
+  spr.setCursor(BX + BW + 4, y);
+  spr.printf("%lu%%", (unsigned long)pct);
+}
+
+static void drawPetUsage(const Palette& p) {
+  const int TOP = 70;
+  spr.fillRect(0, TOP, W, H - TOP, p.bg);
+  spr.setTextSize(1);
+  int y = TOP + 20;
+
+  spr.setTextColor(p.body, p.bg);
+  spr.setCursor(6, y); spr.print("TOKEN USAGE");
+  y += 16;
+
+  // Heuristic budgets (bjedwards): ~100K/hour, ~1M/week; context proxied
+  // by progress through a 200K window. Real telemetry needs bridge fields.
+  drawTokenBar(p, y, "ctx", tama.tokensToday % 200000, 200000);  y += 22;
+  drawTokenBar(p, y, "hr",  tama.tokensToday,          100000);  y += 22;
+  drawTokenBar(p, y, "wk",  tama.tokensToday,         1000000);  y += 28;
+
+  spr.setTextColor(p.textDim, p.bg);
+  auto tokFmt = [&](const char* label, uint32_t v, int yPx) {
+    spr.setCursor(6, yPx);
+    if (v >= 1000000)   spr.printf("%s%lu.%luM", label, v/1000000, (v/100000)%10);
+    else if (v >= 1000) spr.printf("%s%lu.%luK", label, v/1000, (v/100)%10);
+    else                spr.printf("%s%lu", label, v);
+  };
+  tokFmt("today    ", tama.tokensToday, y);
+  tokFmt("lifetime ", stats().tokens, y + 10);
+}
+
 static void drawPetHowTo(const Palette& p) {
   const int TOP = 70;
   spr.fillRect(0, TOP, W, H - TOP, p.bg);
@@ -862,6 +912,7 @@ void drawPet() {
   int y = 70;
 
   if (petPage == 0) drawPetStats(p);
+  else if (petPage == 1) drawPetUsage(p);
   else drawPetHowTo(p);
 
   // Header on top of whichever page drew — title left, counter right
