@@ -19,10 +19,12 @@ import time
 from typing import Any, Optional
 
 from . import protocol
+from .adapters import claude_cli
 from .config import Config
 from .ble.link import LinkManager
 from .ipc.endpoint import remove_endpoint, write_endpoint
 from .ipc.server import IpcServer
+from .registry import SessionRegistry
 
 log = logging.getLogger(__name__)
 
@@ -44,6 +46,7 @@ class Daemon:
             mode=cfg.ble_mode,
             on_connect=self._on_ble_connect,
         )
+        self.registry = SessionRegistry()
         self.started_at = time.time()
         self.last_device_status: dict[str, Any] = {}
         self._last_sent_line = ""
@@ -52,15 +55,42 @@ class Daemon:
         self._last_status_poll_ts = 0.0
         self._stop_evt = asyncio.Event()
 
-    # ---- snapshot source (phases 2-3 plug the registry/ledger in here) ----
+    # ---- snapshot source ----
+
+    def tokens_totals(self) -> tuple[int, int]:
+        """(lifetime, today) token totals; the usage ledger plugs in in phase 3."""
+        return self.registry.total_tokens(), 0
+
+    def headline(self) -> str:
+        total, running, waiting = self.registry.counts()
+        if waiting:
+            return f"{waiting} waiting for you"
+        if running:
+            return f"{running} running"
+        if total:
+            return f"{total} idle"
+        return "bridge up"
+
+    def pending_prompt(self) -> Optional[str]:
+        return self.registry.pending_prompt()
 
     def snapshot_line(self) -> str:
+        total, running, waiting = self.registry.counts()
+        tokens, tokens_today = self.tokens_totals()
         return protocol.build_snapshot(
-            total=0, running=0, waiting=0, msg="bridge up", entries=(),
-            tokens=0, tokens_today=0, prompt=None,
+            total=total,
+            running=running,
+            waiting=waiting,
+            msg=self.headline(),
+            entries=tuple(self.registry.entries),
+            tokens=tokens,
+            tokens_today=tokens_today,
+            prompt=self.pending_prompt(),
         )
 
     def status_payload(self) -> dict[str, Any]:
+        total, running, waiting = self.registry.counts()
+        tokens, tokens_today = self.tokens_totals()
         return {
             "ok": True,
             "pid": os.getpid(),
@@ -69,6 +99,25 @@ class Daemon:
             "ble_connected": self.link.connected,
             "device": self.last_device_status,
             "host_id": self.cfg.host_id,
+            "sessions": {"total": total, "running": running, "waiting": waiting},
+            "tokens": tokens,
+            "tokens_today": tokens_today,
+        }
+
+    def sessions_payload(self) -> dict[str, Any]:
+        return {
+            "sessions": [
+                {
+                    "agent": s.agent,
+                    "sid": s.sid,
+                    "title": s.title,
+                    "state": s.state,
+                    "cwd": s.cwd,
+                    "tokens": s.tokens,
+                    "last_seen": int(s.last_seen),
+                }
+                for s in self.registry.sessions_sorted()
+            ]
         }
 
     # ---- IPC ----
@@ -77,18 +126,27 @@ class Daemon:
         event = msg.get("event")
         if event == "status":
             return self.status_payload()
+        if event == "sessions":
+            return self.sessions_payload()
         if event == "shutdown":
             self._stop_evt.set()
             return {"ok": True}
-        handled = await self.handle_agent_event(msg)
-        if handled is not None:
-            return handled
-        log.debug("ipc: unhandled event %r", event)
+        if event == "hook":
+            self.handle_hook_mirror(msg)  # fire-and-forget: no reply line
+            return None
+        if event == "permission_request":
+            return await self.handle_permission_request(msg)
+        log.debug("ipc: unhandled event %r", msg)
         return None
 
-    async def handle_agent_event(self, msg: dict[str, Any]) -> Optional[dict[str, Any]]:
-        """Hook/adapters entry point; extended in later phases."""
-        return None
+    def handle_hook_mirror(self, msg: dict[str, Any]) -> None:
+        agent = msg.get("agent")
+        if agent == "claude" and self.cfg.claude_enabled:
+            claude_cli.handle_event(self.registry, msg)
+
+    async def handle_permission_request(self, msg: dict[str, Any]) -> dict[str, Any]:
+        """Gate requests answer "ask" until the DecisionRouter lands (phase 4)."""
+        return {"decision": "ask"}
 
     # ---- BLE ----
 
@@ -147,7 +205,8 @@ class Daemon:
                 log.exception("daemon: pump tick failed")
 
     async def tick(self) -> None:
-        """Once-a-second housekeeping; extended in later phases (reaper, scanners)."""
+        """Once-a-second housekeeping (extended by later phases)."""
+        self.registry.reap()
 
     # ---- lifecycle ----
 
