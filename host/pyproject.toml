@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "buddy-bridge"
+version = "0.1.0"
+description = "Bridge Claude Code CLI and Codex CLI sessions to an M5 StickS3 BLE desk buddy"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+dependencies = [
+    "bleak>=0.22,<1",
+    "watchfiles>=0.21",
+]
+
+[project.optional-dependencies]
+win32 = [
+    "winrt-Windows.Devices.Bluetooth>=2.0",
+    "winrt-Windows.Devices.Radios>=2.0",
+]
+dev = [
+    "pytest>=8",
+    "pytest-asyncio>=0.24",
+    "ruff",
+]
+
+[project.scripts]
+buddy-bridge = "buddy_bridge.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "W"]
