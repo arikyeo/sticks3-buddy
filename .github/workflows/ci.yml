@@ -1,0 +1,182 @@
+name: CI
+
+on:
+  push:
+    branches: [main, "track-*"]
+  pull_request:
+    branches: [main, "track-*"]
+
+jobs:
+  firmware:
+    name: firmware (${{ matrix.env }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - env: m5stick-s3
+            continue-on-error: false
+          # Multi-board support lands in P2 — these envs don't exist in
+          # platformio.ini yet. Kept here as placeholders so the matrix
+          # doesn't need editing when they land; continue-on-error means
+          # a missing env fails the step but not the workflow.
+          - env: m5stickc-plus
+            continue-on-error: true
+          - env: m5stickc-plus2
+            continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Cache PlatformIO
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.platformio
+            ~/.cache/pip
+          key: pio-${{ runner.os }}-${{ hashFiles('platformio.ini') }}
+          restore-keys: |
+            pio-${{ runner.os }}-
+
+      - name: Install PlatformIO
+        run: pip install platformio
+
+      - name: Pin-lint platform version
+        run: grep -E "platform = espressif32@[0-9]" platformio.ini || exit 1
+
+      - name: Build firmware
+        continue-on-error: ${{ matrix.continue-on-error }}
+        run: pio run -e ${{ matrix.env }}
+
+      - name: Flash-size guard
+        if: ${{ matrix.env == 'm5stick-s3' }}
+        run: |
+          python3 - <<'EOF'
+          import subprocess
+          import sys
+
+          ENV = "m5stick-s3"
+          # no_ota.csv app0 partition: 0x2F0000 bytes. Guard fails the build
+          # once the app image exceeds 88% of that slot, so we get a warning
+          # well before a full partition blocks OTA-less re-flashing.
+          PARTITION_SIZE = 0x2F0000  # 3080192
+          THRESHOLD = 0.88
+
+          result = subprocess.run(
+              ["pio", "run", "-e", ENV, "-t", "size"],
+              capture_output=True,
+              text=True,
+              check=False,
+          )
+          output = result.stdout + result.stderr
+          print(output)
+
+          # PlatformIO's size report prints a line like:
+          #   Flash: [==        ]  23.4% (used 719648 bytes from 3072000 bytes)
+          # but the byte figures vary by report format/version, so parse the
+          # firmware.bin size directly from the build dir instead — it's the
+          # actual app image PlatformIO just linked.
+          import pathlib
+
+          bin_path = pathlib.Path(f".pio/build/{ENV}/firmware.bin")
+          if not bin_path.exists():
+              print(f"::error::{bin_path} not found — build must have failed")
+              sys.exit(1)
+
+          app_size = bin_path.stat().st_size
+          pct = app_size / PARTITION_SIZE
+          print(
+              f"App image: {app_size} bytes / {PARTITION_SIZE} bytes "
+              f"partition ({pct:.1%})"
+          )
+
+          if pct > THRESHOLD:
+              print(
+                  f"::error::Firmware is {pct:.1%} of the app partition, "
+                  f"over the {THRESHOLD:.0%} guard threshold. "
+                  "Trim assets or code before this fills the partition."
+              )
+              sys.exit(1)
+
+          print(f"OK: under {THRESHOLD:.0%} guard threshold.")
+          EOF
+
+      - name: Upload firmware artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: firmware-${{ matrix.env }}
+          path: .pio/build/${{ matrix.env }}/firmware.bin
+          if-no-files-found: ignore
+          retention-days: 14
+
+  firmware-native-tests:
+    name: firmware native tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Cache PlatformIO
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.platformio
+            ~/.cache/pip
+          key: pio-${{ runner.os }}-${{ hashFiles('platformio.ini') }}
+          restore-keys: |
+            pio-${{ runner.os }}-
+
+      - name: Install PlatformIO
+        run: pip install platformio
+
+      # No `native` test env exists in platformio.ini yet (lands P2/P9).
+      # continue-on-error keeps this job green (not skipped, so it still
+      # shows up and reports failure clearly) until then.
+      - name: Run native tests
+        continue-on-error: true
+        run: pio test -e native
+
+  host:
+    name: host (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check host/ exists
+        id: host-check
+        shell: bash
+        run: |
+          if [ -f "host/pyproject.toml" ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "host/pyproject.toml not found — host/ lands on a parallel branch, skipping gracefully."
+          fi
+
+      - uses: actions/setup-python@v5
+        if: ${{ steps.host-check.outputs.present == 'true' }}
+        with:
+          python-version: "3.11"
+
+      - name: Install host package
+        if: ${{ steps.host-check.outputs.present == 'true' }}
+        run: pip install -e "./host[dev]"
+
+      - name: Lint (ruff)
+        if: ${{ steps.host-check.outputs.present == 'true' }}
+        run: ruff check host
+
+      - name: Test (pytest)
+        if: ${{ steps.host-check.outputs.present == 'true' }}
+        run: pytest host/tests -q
