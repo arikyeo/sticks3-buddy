@@ -1,11 +1,20 @@
 #include "compat.h"
 #include "config.h"
 #include "hal/hal.h"
+#include "logic/wrap_text_logic.h"
 #include <LittleFS.h>
 #include <stdarg.h>
+#include "esp_task_wdt.h"
 #include "ble_bridge.h"
 #include "data.h"
 #include "buddy.h"
+
+#ifdef BUDDY_DEBUG
+#include "esp_system.h"
+// Reset-reason diagnostics (ttpears): survives resets but not power-on —
+// RTC_NOINIT memory is garbage on cold boot, so a magic word gates the read.
+RTC_NOINIT_ATTR uint32_t g_lastReset, g_lastResetMagic;
+#endif
 
 TFT_eSprite spr = TFT_eSprite(&M5.Lcd);
 
@@ -704,40 +713,6 @@ void drawInfo() {
 }
 
 
-// Greedy word-wrap into fixed-width rows. Continuation rows get a leading
-// space. Returns number of rows written.
-static uint8_t wrapInto(const char* in, char out[][24], uint8_t maxRows, uint8_t width) {
-  uint8_t row = 0, col = 0;
-  const char* p = in;
-  while (*p && row < maxRows) {
-    while (*p == ' ') p++;                     // skip leading spaces
-    // measure next word
-    const char* w = p;
-    while (*p && *p != ' ') p++;
-    uint8_t wlen = p - w;
-    if (wlen == 0) break;
-    uint8_t need = (col > 0 ? 1 : 0) + wlen;
-    if (col + need > width) {
-      out[row][col] = 0;
-      if (++row >= maxRows) return row;
-      out[row][0] = ' '; col = 1;              // continuation indent
-    }
-    if (col > 1 || (col == 1 && out[row][0] != ' ')) out[row][col++] = ' ';
-    else if (col == 1 && row > 0) {}           // already have the indent space
-    // hard-break words that still don't fit
-    while (wlen > width - col) {
-      uint8_t take = width - col;
-      memcpy(&out[row][col], w, take); col += take; w += take; wlen -= take;
-      out[row][col] = 0;
-      if (++row >= maxRows) return row;
-      out[row][0] = ' '; col = 1;
-    }
-    memcpy(&out[row][col], w, wlen); col += wlen;
-  }
-  if (col > 0 && row < maxRows) { out[row][col] = 0; row++; }
-  return row;
-}
-
 static void drawApproval() {
   const Palette& p = characterPalette();
   const int AREA = 78;
@@ -997,9 +972,32 @@ void setup() {
   }
 
   Serial.printf("buddy: %s\n", buddyMode ? "ASCII mode" : "GIF character loaded");
+
+#ifdef BUDDY_DEBUG
+  {
+    int cur = (int)esp_reset_reason();
+    if (cur != ESP_RST_POWERON && cur != ESP_RST_SW) {
+      g_lastReset = (uint32_t)cur; g_lastResetMagic = 0xB0D1;  // latch a real crash
+    } else if (g_lastResetMagic != 0xB0D1) {
+      g_lastReset = 0;                                         // cold boot: garbage
+    }
+    Serial.printf("[DBG] boot: reset_reason=%d last_crash=%lu\n",
+                  cur, (unsigned long)g_lastReset);
+  }
+#endif
+
+  // Self-heal watchdog (johnwong 3fa0884): if loop() ever wedges (e.g. a
+  // corrupt render path), the BLE stack task keeps ACKing writes so the
+  // bridge sees a healthy link while the screen is frozen — only a manual
+  // power-cycle recovered it. Subscribe the loop task to the TWDT with
+  // panic=reboot so any >12s stall reboots the device, which then
+  // re-advertises and the bridge reconnects on its own.
+  esp_task_wdt_init(12, true);   // 12s timeout, panic+reboot on elapse
+  esp_task_wdt_add(NULL);        // watch this (loop) task
 }
 
 void loop() {
+  esp_task_wdt_reset();   // pet the watchdog; loop normally cycles <100ms
   board::update();
   t++;
   uint32_t now = millis();
