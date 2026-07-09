@@ -47,6 +47,8 @@ def merge(env: str, out: Path) -> None:
         cmd += [hex(offset), str(build_dir / name)]
 
     print(f"merging {env} -> {out}")
+    out = out.resolve()
+    cmd[cmd.index("-o") + 1] = str(out)
     subprocess.run(cmd, cwd=PROJECT, check=True)
     print(f"\nwrote {out} ({out.stat().st_size:,} bytes)")
     print("flash with: esptool.py --chip esp32s3 write_flash 0x0", out)
