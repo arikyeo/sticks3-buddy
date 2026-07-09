@@ -16,14 +16,24 @@ from pathlib import Path
 
 PROJECT = Path(__file__).resolve().parent.parent
 
-# no_ota.csv (the current board_build.partitions) has no ota_0/ota_1
-# slots, so there's no boot_app0.bin to merge in — see the comment in
-# .github/workflows/release.yml for the full explanation.
+# partitions/sticks3_8mb_ota.csv (the current board_build.partitions) has
+# ota_0/ota_1 slots, so the merged image must include boot_app0.bin (the
+# OTA-slot selector stub) at the otadata-adjacent 0xE000 offset. It ships
+# with the Arduino framework package, not the per-env build dir.
 PARTS = [
     (0x0, "bootloader.bin"),
     (0x8000, "partitions.bin"),
     (0x10000, "firmware.bin"),
 ]
+BOOT_APP0_OFFSET = 0xE000
+
+
+def find_boot_app0() -> Path:
+    core = Path.home() / ".platformio"
+    hits = sorted(core.glob("packages/framework-arduinoespressif32*/tools/partitions/boot_app0.bin"))
+    if not hits:
+        sys.exit(f"boot_app0.bin not found under {core}/packages — run a build first")
+    return hits[0]
 
 
 def merge(env: str, out: Path) -> None:
@@ -35,6 +45,8 @@ def merge(env: str, out: Path) -> None:
     if missing:
         sys.exit(f"missing build output(s) in {build_dir}: {', '.join(missing)}")
 
+    boot_app0 = find_boot_app0()
+
     cmd = [
         sys.executable, "-m", "esptool",
         "--chip", "esp32s3",
@@ -43,8 +55,12 @@ def merge(env: str, out: Path) -> None:
         "--flash_mode", "keep",
         "--flash_size", "8MB",
     ]
-    for offset, name in PARTS:
-        cmd += [hex(offset), str(build_dir / name)]
+    images = sorted(
+        [(offset, build_dir / name) for offset, name in PARTS]
+        + [(BOOT_APP0_OFFSET, boot_app0)]
+    )
+    for offset, path in images:
+        cmd += [hex(offset), str(path)]
 
     print(f"merging {env} -> {out}")
     out = out.resolve()

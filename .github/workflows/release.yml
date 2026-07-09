@@ -52,15 +52,13 @@ jobs:
         run: |
           BUILD_DIR=.pio/build/m5stick-s3
 
-          # platformio.ini pins board_build.partitions = no_ota.csv, which
-          # has no ota_0/ota_1 slots — just bootloader, partition table, and
-          # one app0 slot. boot_app0.bin (the "which OTA slot is active"
-          # stub) only matters when a partition table has ota_0/ota_1 to
-          # choose between, so it's intentionally NOT part of this merge.
-          # If board_build.partitions ever switches to an OTA-capable table
-          # (e.g. sticks3_8mb_ota.csv), this step needs a
-          # 0xe000 <boot_app0.bin> line added back in.
-          #
+          # board_build.partitions = partitions/sticks3_8mb_ota.csv has
+          # ota_0/ota_1 slots, so the merged image includes boot_app0.bin
+          # (the OTA-slot selector stub) at 0xE000. It ships inside the
+          # Arduino framework package, not the per-env build dir.
+          BOOT_APP0=$(ls ~/.platformio/packages/framework-arduinoespressif32*/tools/partitions/boot_app0.bin | head -1)
+          test -f "$BOOT_APP0"
+
           # flash_mode: platformio.ini sets board_build.flash_mode = qio,
           # but the board's actual PSRAM wiring is qio_opi (see
           # board_build.psram_type = opi). --flash_mode keep reads the
@@ -74,6 +72,7 @@ jobs:
             --flash_size 8MB \
             0x0     "$BUILD_DIR/bootloader.bin" \
             0x8000  "$BUILD_DIR/partitions.bin" \
+            0xe000  "$BOOT_APP0" \
             0x10000 "$BUILD_DIR/firmware.bin"
 
       - name: Stage release assets
