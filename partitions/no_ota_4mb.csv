@@ -1,0 +1,9 @@
+# For the (currently dropped) m5stickc-plus env — see TODO(P2) in
+# platformio.ini. Content mirrors the arduino-esp32 framework's no_ota.csv
+# (4MB flash, single app slot, no OTA), vendored here so the env can pin a
+# repo-local table when P2 restores multi-board builds.
+# Name,   Type, SubType, Offset,  Size, Flags
+nvs,      data, nvs,     0x9000,  0x5000,
+otadata,  data, ota,     0xe000,  0x2000,
+app0,     app,  ota_0,   0x10000, 0x200000,
+spiffs,   data, spiffs,  0x210000,0x1F0000,
