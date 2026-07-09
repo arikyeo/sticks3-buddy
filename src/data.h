@@ -2,6 +2,7 @@
 #include <Arduino.h>
 #include <ArduinoJson.h>
 #include "config.h"
+#include "hal/hal.h"
 #include "ble_bridge.h"
 #include "xfer.h"
 
@@ -74,20 +75,16 @@ static void _applyJson(const char* line, TamaState* out) {
   if (xferCommand(doc)) { _lastLiveMs = millis(); return; }
 
   // Bridge sends {"time":[epoch_sec, tz_offset_sec]}; gmtime_r on the
-  // adjusted epoch yields local components including weekday.
+  // adjusted epoch yields local components including weekday. The board
+  // clock stores them — BM8563 hardware on the Plus/Plus2, millis-projected
+  // software clock on the S3 (which has no RTC).
   JsonArray t = doc["time"];
   if (!t.isNull() && t.size() == 2) {
     time_t local = (time_t)t[0].as<uint32_t>() + (int32_t)t[1];
     struct tm lt; gmtime_r(&local, &lt);
-    RTC_TimeTypeDef tm;
-    tm.hours = (uint8_t)lt.tm_hour; tm.minutes = (uint8_t)lt.tm_min; tm.seconds = (uint8_t)lt.tm_sec;
-    RTC_DateTypeDef dt;
-    dt.year = (uint16_t)(lt.tm_year + 1900); dt.month = (uint8_t)(lt.tm_mon + 1);
-    dt.date = (uint8_t)lt.tm_mday;          dt.weekDay = (uint8_t)lt.tm_wday;
-    M5.Rtc.setTime(&tm);
-    M5.Rtc.setDate(&dt);
+    board::setClock(&lt);
     extern uint32_t _clkLastRead;
-    _clkLastRead = 0;   // force re-read so _clkDt and _rtcValid agree
+    _clkLastRead = 0;   // force clockRefreshRtc() to re-read immediately
     _rtcValid = true;
     _lastLiveMs = millis();
     return;

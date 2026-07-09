@@ -1,6 +1,6 @@
 #pragma once
 #include <stdint.h>
-#include "m5_compat.h"
+#include "compat.h"
 
 // Multi-species ASCII buddy renderer. Each species lives in its own
 // src/buddies/<name>.cpp file and exposes 7 state functions matching

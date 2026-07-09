@@ -1,4 +1,6 @@
-#include "m5_compat.h"
+#include "compat.h"
+#include "config.h"
+#include "hal/hal.h"
 #include <LittleFS.h>
 #include <stdarg.h>
 #include "ble_bridge.h"
@@ -23,7 +25,6 @@ static void startBt() {
 const int W = 135, H = 240;
 const int CX = W / 2;
 const int CY_BASE = 120;
-const int LED_PIN = BUDDY_DEFAULT_LED_PIN;   // red LED, active-low (S3: G19)
 
 // Colors used across multiple UI surfaces
 const uint16_t HOT   = 0xFA20;   // red-orange: warnings, impatience, deny
@@ -90,16 +91,19 @@ uint32_t promptArrivedMs = 0;
 // Face-down = Z-axis dominant and negative. Debounced so a toss doesn't count.
 static bool isFaceDown() {
   float ax, ay, az;
-  compat::getAccel(&ax, &ay, &az);
+  board::imuAccel(&ax, &ay, &az);
   return az < -0.7f && fabsf(ax) < 0.4f && fabsf(ay) < 0.4f;
 }
 
-static void applyBrightness() { compat::setScreenBrightness0_100(20 + settings().bright * 20); }
+// Backlight on the historic AXP192 0..100 scale, remapped to M5GFX's 0..255
+// so the tuned dim/breath values carry over unchanged.
+static void screenBreath(uint8_t v0_100) { board::setBrightness((uint8_t)((uint16_t)v0_100 * 255 / 100)); }
+static void applyBrightness() { screenBreath(20 + settings().bright * 20); }
 
 static void wake() {
   lastInteractMs = millis();
   if (screenOff) {
-    compat::screenPower(true);
+    board::screenPower(true);
     applyBrightness();
     screenOff = false;
     wakeTransitionUntil = millis() + 12000;
@@ -109,7 +113,7 @@ static void wake() {
 bool     responseSent = false;
 
 static void beep(uint16_t freq, uint16_t dur) {
-  if (settings().sound) compat::beep(freq, dur);
+  if (settings().sound) board::beep(freq, dur);
 }
 
 static void sendCmd(const char* json) {
@@ -306,7 +310,7 @@ static void drawReset() {
 void menuConfirm() {
   switch (menuSel) {
     case 0: settingsOpen = true; menuOpen = false; settingsSel = 0; break;
-    case 1: compat::powerOff(); break;
+    case 1: board::powerOff(); break;
     case 2:
     case 3:
       menuOpen = false;
@@ -350,21 +354,22 @@ static uint8_t paintedOrient = 0;
 // RTC and IMU share an I2C bus. Reading the RTC at 60fps starves the IMU
 // reads in clockUpdateOrient — orientation detection gets noisy. Cache the
 // time once per second; mood logic and drawClock both read from here.
-static RTC_TimeTypeDef _clkTm;
-static RTC_DateTypeDef _clkDt;
-uint32_t               _clkLastRead = 0;   // zeroed by data.h on time-sync
-static bool            _onUsb       = false;
+// (On the S3 the "RTC" is the software clock and the read is free, but the
+// 1Hz cadence keeps behavior identical across boards.)
+static struct tm _clk        = {};
+uint32_t         _clkLastRead = 0;   // zeroed by data.h on time-sync
+static bool      _onUsb      = false;
 static void clockRefreshRtc() {
   if (millis() - _clkLastRead < 1000) return;
   _clkLastRead = millis();
-  _onUsb = compat::vbusVoltageV() > 4.0f;
-  M5.Rtc.getTime(&_clkTm);
-  M5.Rtc.getDate(&_clkDt);
+  _onUsb = board::onUsb();
+  struct tm lt;
+  if (board::getClock(&lt)) _clk = lt;
 }
 
 static void clockUpdateOrient() {
   float ax, ay, az;
-  compat::getAccel(&ax, &ay, &az);
+  board::imuAccel(&ax, &ay, &az);
   uint8_t lock = settings().clockRot;
   if (lock == 1) { clockOrient = 0; return; }
   if (lock == 2) {
@@ -409,13 +414,13 @@ static const char* const MON[] = {
 };
 static const char* const DOW[] = {"Sun","Mon","Tue","Wed","Thu","Fri","Sat"};
 
-static uint8_t clockDow() { return _clkDt.weekDay % 7; }
+static uint8_t clockDow() { return (uint8_t)_clk.tm_wday % 7; }
 static void drawClock() {
   const Palette& p = characterPalette();
-  char hm[6]; snprintf(hm, sizeof(hm), "%02u:%02u", _clkTm.hours, _clkTm.minutes);
-  char ss[4]; snprintf(ss, sizeof(ss), ":%02u", _clkTm.seconds);
-  uint8_t mi = (_clkDt.month >= 1 && _clkDt.month <= 12) ? _clkDt.month - 1 : 0;
-  char dl[8]; snprintf(dl, sizeof(dl), "%s %02u", MON[mi], _clkDt.date);
+  char hm[6]; snprintf(hm, sizeof(hm), "%02u:%02u", (unsigned)_clk.tm_hour, (unsigned)_clk.tm_min);
+  char ss[4]; snprintf(ss, sizeof(ss), ":%02u", (unsigned)_clk.tm_sec);
+  uint8_t mi = (_clk.tm_mon >= 0 && _clk.tm_mon < 12) ? (uint8_t)_clk.tm_mon : 0;
+  char dl[8]; snprintf(dl, sizeof(dl), "%s %02u", MON[mi], (unsigned)_clk.tm_mday);
 
   if (clockOrient == 0) {
     paintedOrient = 0;
@@ -440,10 +445,10 @@ static void drawClock() {
 
   // Seconds tick at 1Hz; redrawing 3 strings at 60fps is 180 SPI ops/sec
   // for nothing. Gate on the second changing (or full repaint).
-  if (repaint || _clkTm.seconds != lastSec) {
-    lastSec = _clkTm.seconds;
-    char wdl[12]; snprintf(wdl, sizeof(wdl), "%s %s %02u", DOW[clockDow()], MON[mi], _clkDt.date);
-    char ssl[3]; snprintf(ssl, sizeof(ssl), "%02u", _clkTm.seconds);
+  if (repaint || (uint8_t)_clk.tm_sec != lastSec) {
+    lastSec = (uint8_t)_clk.tm_sec;
+    char wdl[12]; snprintf(wdl, sizeof(wdl), "%s %s %02u", DOW[clockDow()], MON[mi], (unsigned)_clk.tm_mday);
+    char ssl[3]; snprintf(ssl, sizeof(ssl), "%02u", (unsigned)_clk.tm_sec);
     M5.Lcd.setTextDatum(MC_DATUM);
     M5.Lcd.setTextSize(3); M5.Lcd.setTextColor(p.text, p.bg);    M5.Lcd.drawString(hm, 170, 42);
     M5.Lcd.setTextSize(2); M5.Lcd.setTextColor(p.textDim, p.bg); M5.Lcd.drawString(ssl, 170, 72);
@@ -492,7 +497,7 @@ void triggerOneShot(PersonaState s, uint32_t durMs) {
 
 bool checkShake() {
   float ax, ay, az;
-  compat::getAccel(&ax, &ay, &az);
+  board::imuAccel(&ax, &ay, &az);
   float mag = sqrtf(ax*ax + ay*ay + az*az);
   float delta = fabsf(mag - accelBaseline);
   accelBaseline = accelBaseline * 0.95f + mag * 0.05f;
@@ -573,7 +578,11 @@ void drawInfo() {
     spr.setTextColor(p.textDim, p.bg); ln("    menu"); y += 4;
     spr.setTextColor(p.text, p.bg);    ln("Power  left side");
     spr.setTextColor(p.textDim, p.bg); ln("    tap = screen off");
+#if defined(BOARD_STICKS3)
+    ln("    2-tap = power off");   // long hold is download mode on the S3
+#else
     ln("    hold 6s = off");
+#endif
 
   } else if (infoPage == 2) {
     _infoHeader(p, y, "CLAUDE", infoPage);
@@ -594,14 +603,16 @@ void drawInfo() {
   } else if (infoPage == 3) {
     _infoHeader(p, y, "DEVICE", infoPage);
 
-    int vBat_mV = (int)(compat::batVoltageV() * 1000);
-    int iBat_mA = (int)compat::batCurrentMA();
-    int vBus_mV = (int)(compat::vbusVoltageV() * 1000);
-    int pct = (vBat_mV - 3200) / 10;   // (v-3.2)/(4.2-3.2)*100 = (v-3.2)*100 = (mv-3200)/10
-    if (pct < 0) pct = 0; if (pct > 100) pct = 100;
+    int vBat_mV = board::batteryMilliVolts();
+    int iBat_mA = board::batteryCurrentMa();
+    int vBus_mV = board::usbMilliVolts();
+    int pct = board::batteryPercent();
     bool usb = vBus_mV > 4000;
-    bool charging = usb && iBat_mA > 1;
-    bool full = usb && vBat_mV > 4100 && iBat_mA < 10;
+    // With real current sense (AXP192) keep the historic thresholds; other
+    // PMICs report a charge flag instead.
+    bool charging = usb && (board::hasBatteryCurrent() ? iBat_mA > 1 : board::isCharging());
+    bool full = usb && vBat_mV > 4100 &&
+                (board::hasBatteryCurrent() ? iBat_mA < 10 : !board::isCharging());
 
     spr.setTextColor(p.text, p.bg);
     spr.setTextSize(2);
@@ -615,7 +626,7 @@ void drawInfo() {
 
     spr.setTextColor(p.textDim, p.bg);
     ln("  battery  %d.%02dV", vBat_mV/1000, (vBat_mV%1000)/10);
-    ln("  current  %+dmA", iBat_mA);
+    if (board::hasBatteryCurrent()) ln("  current  %+dmA", iBat_mA);
     if (usb) ln("  usb in   %d.%02dV", vBus_mV/1000, (vBus_mV%1000)/10);
     y += 8;
 
@@ -628,7 +639,7 @@ void drawInfo() {
     ln("  heap     %uKB", ESP.getFreeHeap() / 1024);
     ln("  bright   %u/4", settings().bright);
     ln("  bt       %s", settings().bt ? (dataBtActive() ? "linked" : "on") : "off");
-    ln("  temp     %dC", compat::chipTempC());
+    if (board::hasInternalTemp()) ln("  temp     %dC", board::internalTempC());
 
   } else if (infoPage == 4) {
     _infoHeader(p, y, "BLUETOOTH", infoPage);
@@ -683,8 +694,12 @@ void drawInfo() {
     spr.setTextColor(p.textDim, p.bg);
     ln("hardware");
     y += 4;
-    ln("M5StickC Plus S3");
+    ln("%s", board::name());
+#if defined(BOARD_STICKS3)
     ln("ESP32-S3 + BMI270");
+#else
+    ln("ESP32 + MPU6886");
+#endif
   }
 }
 
@@ -937,14 +952,10 @@ void drawHUD() {
 }
 
 void setup() {
-  auto cfg = M5.config();
-  M5.begin(cfg);
+  board::begin();        // M5.begin + speaker + per-board power/LED setup
+  board::serialInit();
   M5.Display.setRotation(0);
-  M5.Speaker.begin();
-  M5.Speaker.setVolume(160);
   startBt();
-  pinMode(LED_PIN, OUTPUT);
-  digitalWrite(LED_PIN, HIGH);   // off
   settingsLoad();
   applyBrightness();
   lastInteractMs = millis();
@@ -989,7 +1000,7 @@ void setup() {
 }
 
 void loop() {
-  M5.update();
+  board::update();
   t++;
   uint32_t now = millis();
 
@@ -1024,12 +1035,9 @@ void loop() {
   }
   prevActiveState = activeState;
 
-  // LED: pulse on attention, otherwise off
-  if (activeState == P_ATTENTION && settings().led) {
-    digitalWrite(LED_PIN, (now / 400) % 2 ? LOW : HIGH);
-  } else {
-    digitalWrite(LED_PIN, HIGH);
-  }
+  // LED: pulse on attention, otherwise off (no-op on LED-less boards)
+  board::attentionLed(activeState == P_ATTENTION && settings().led &&
+                      (now / 400) % 2 != 0);
 
   // shake → dizzy + force scenario advance
   if (now - lastShakeCheck > 50) {
@@ -1083,13 +1091,18 @@ void loop() {
     wake();
   }
 
-  // Power button (left side): short-press toggles screen off.
-  // Long-press (6s) still powers off via hardware on supported boards.
-  if (M5.BtnPWR.wasClicked()) {
+  // Power button (left side): single click toggles the screen. On the S3
+  // a double click powers off (its PMIC reserves the long hold for download
+  // mode); AXP boards keep the hardware 6s hold as the off gesture.
+  if (board::powerOffRequested()) {
+    beep(660, 120);
+    delay(150);          // let the tone finish before the power rail drops
+    board::powerOff();   // PMIC off on battery; deep-sleep on USB
+  } else if (board::screenToggleRequested()) {
     if (screenOff) {
       wake();
     } else {
-      compat::screenPower(false);
+      board::screenPower(false);
       screenOff = true;
     }
   }
@@ -1202,7 +1215,7 @@ void loop() {
     bool weekend = (dow == 0 || dow == 6);
     bool friday  = (dow == 5);
 
-    uint8_t h = _clkTm.hours;
+    uint8_t h = (uint8_t)_clk.tm_hour;
     if (h >= 1 && h < 7)             activeState = P_SLEEP;
     else if (weekend)                activeState = (now/8000 % 6 == 0) ? P_HEART : P_SLEEP;
     else if (h < 9)                  activeState = (now/6000 % 4 == 0) ? P_IDLE  : P_SLEEP;
@@ -1275,7 +1288,7 @@ void loop() {
   if (!napping && faceDownFrames >= 15) {
     napping = true;
     napStartMs = now;
-    compat::setScreenBrightness0_100(8);
+    screenBreath(8);
     dimmed = true;
   } else if (napping && faceDownFrames <= -8) {
     napping = false;
@@ -1289,7 +1302,7 @@ void loop() {
   // No auto-off on USB power — clock face wants to stay visible while charging.
   if (!screenOff && !inPrompt && !_onUsb
       && millis() - lastInteractMs > SCREEN_OFF_MS) {
-    compat::screenPower(false);
+    board::screenPower(false);
     screenOff = true;
   }
 
