@@ -19,8 +19,13 @@ import time
 from typing import Any, Optional
 
 from . import protocol
-from .adapters import claude_cli
+from .adapters import claude_cli, codex
 from .adapters.claude_jsonl import AssistantEvent, JsonlTailer, claude_projects_root
+from .adapters.codex_sessions import (
+    CodexSessionInfo,
+    CodexSessionScanner,
+    codex_sessions_root,
+)
 from .audit import (
     SOURCE_AUTO_ALLOW,
     SOURCE_DAEMON_DOWN,
@@ -73,6 +78,10 @@ class Daemon:
             offsets_path=cfg.home / "offsets.json",
             on_event=self._on_claude_transcript,
         )
+        self.codex_scanner = CodexSessionScanner(
+            root=codex_sessions_root(),
+            on_session=self._on_codex_session,
+        )
         self.started_at = time.time()
         self.last_device_status: dict[str, Any] = {}
         self._last_sent_line = ""
@@ -91,6 +100,15 @@ class Daemon:
             self.ledger.add("claude", event.session_id, event.output_tokens)
         if event.text:
             self.registry.add_entry(protocol.format_entry(event.hhmm, event.text))
+
+    def _on_codex_session(self, info: CodexSessionInfo) -> None:
+        added = self.ledger.add_cumulative("codex", info.session_id, info.output_tokens)
+        session = self.registry.get("codex", info.session_id)
+        if session is not None:
+            if added:
+                self.registry.add_tokens("codex", info.session_id, added)
+            if info.cwd and not session.cwd:
+                self.registry.upsert("codex", info.session_id, info.cwd)
 
     # ---- snapshot source ----
 
@@ -181,8 +199,12 @@ class Daemon:
         agent = msg.get("agent")
         if agent == "claude" and self.cfg.claude_enabled:
             claude_cli.handle_event(self.registry, msg)
-            if msg.get("name") == "SessionEnd":
-                self.router.cancel_session("claude", str(msg.get("session_id") or ""))
+        elif agent == "codex" and self.cfg.codex_enabled:
+            codex.handle_event(self.registry, msg)
+        else:
+            return
+        if msg.get("name") == "SessionEnd":
+            self.router.cancel_session(str(agent), str(msg.get("session_id") or ""))
 
     # ---- permission gate ----
 
@@ -322,6 +344,8 @@ class Daemon:
         tasks: list[asyncio.Task] = []
         if self.cfg.claude_enabled:
             tasks.append(asyncio.create_task(self.claude_tailer.run(), name="claude-jsonl"))
+        if self.cfg.codex_enabled:
+            tasks.append(asyncio.create_task(self.codex_scanner.run(), name="codex-sessions"))
         return tasks
 
     async def run(self) -> None:
