@@ -19,7 +19,11 @@ from __future__ import annotations
 
 import json
 import time as _time
-from typing import Iterable, Sequence
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Iterable, Sequence
+
+if TYPE_CHECKING:  # pragma: no cover
+    from .config import Config
 
 # Nordic UART Service
 NUS_SERVICE_UUID = "6e400001-b5a3-f393-e0a9-e50e24dcca9e"
@@ -182,3 +186,113 @@ def iter_lines(lines: Iterable[str]) -> Iterable[bytes]:
     """Encode outbound protocol lines with the trailing newline the device expects."""
     for line in lines:
         yield line.encode("utf-8") + b"\n"
+
+
+# ---------------------------------------------------------------------------
+# Protocol v2 — STUB ONLY (firmware side lands in a later track; everything
+# here stays dormant unless a hello-ack negotiates proto >= 2, and the daemon
+# does not even send the hello unless its proto2 flag is switched on).
+# ---------------------------------------------------------------------------
+
+PROTO_V1 = 1
+PROTO_V2 = 2
+HELLO_ACK_TIMEOUT_SECS = 2.0  # no ack within this window -> stay in v1 mode
+V2_CAPS = ("sessions", "ask", "rxack", "cancel")
+V2_TITLE_MAX = 24
+V2_DEFAULT_MAX_SESSIONS = 6
+
+_SID_PREFIX = {"claude": "cli", "codex": "cdx"}
+
+
+def build_hello(cfg: "Config") -> str:
+    """Canonical v2 hello: {"cmd":"hello","proto":2,"host":{...},"caps":[...]}."""
+    from . import __version__
+
+    return dumps(
+        {
+            "cmd": "hello",
+            "proto": PROTO_V2,
+            "host": {
+                "id": cfg.host_id,
+                "name": truncate_utf8_bytes(sanitize(cfg.host_name), V2_TITLE_MAX),
+                "app": "buddy-bridge",
+                "ver": __version__,
+            },
+            "caps": list(V2_CAPS),
+        }
+    )
+
+
+@dataclass
+class HelloAck:
+    proto: int = PROTO_V1
+    max_line: int = LINE_BUDGET
+    max_sessions: int = V2_DEFAULT_MAX_SESSIONS
+    sel: bool = False
+
+
+def parse_hello_ack(obj: object) -> HelloAck | None:
+    """Parse a device hello-ack frame; None when ``obj`` is something else."""
+    if not isinstance(obj, dict):
+        return None
+    if obj.get("cmd") not in ("hello-ack", "helloAck", "hello_ack"):
+        return None
+    ack = HelloAck()
+    proto = obj.get("proto")
+    if isinstance(proto, int) and not isinstance(proto, bool) and proto >= 1:
+        ack.proto = proto
+    max_line = obj.get("maxLine")
+    if isinstance(max_line, int) and not isinstance(max_line, bool):
+        ack.max_line = max(128, min(4096, max_line))
+    max_sessions = obj.get("maxSessions")
+    if isinstance(max_sessions, int) and not isinstance(max_sessions, bool):
+        ack.max_sessions = max(1, min(16, max_sessions))
+    ack.sel = obj.get("sel") is True
+    return ack
+
+
+def build_sessions_frame(
+    sessions: Sequence,
+    *,
+    max_sessions: int = V2_DEFAULT_MAX_SESSIONS,
+    budget: int = LINE_BUDGET,
+) -> str:
+    """v2 sessions frame from Session-like objects (agent/title/state/tokens/
+    last_seen/wait_seq attributes — the registry's Session works as-is).
+
+    Waiting sessions come first (FIFO by wait_seq) so a max_sessions cut can
+    never drop a session that needs the user. Short wire sids are minted per
+    agent in emitted order: cli:1, cli:2 / cdx:1, ... (stable only within a
+    frame — the phase-6 device UI work will pin them properly).
+    """
+    ordered = sorted(
+        sessions,
+        key=lambda s: (
+            0 if getattr(s, "state", "") == "wait" else 1,
+            getattr(s, "wait_seq", 0) or float("inf"),
+            -float(getattr(s, "last_seen", 0.0)),
+        ),
+    )
+    counters: dict[str, int] = {}
+    entries: list[dict] = []
+    for session in ordered[: max(0, max_sessions)]:
+        agent = str(getattr(session, "agent", "") or "")
+        prefix = _SID_PREFIX.get(agent, agent[:3] or "unk")
+        counters[prefix] = counters.get(prefix, 0) + 1
+        entries.append(
+            {
+                "sid": f"{prefix}:{counters[prefix]}",
+                "agent": agent,
+                "title": truncate_utf8_bytes(
+                    sanitize(getattr(session, "title", "") or ""), V2_TITLE_MAX
+                ),
+                "state": str(getattr(session, "state", "") or "idle"),
+                "tok": int(getattr(session, "tokens", 0) or 0),
+                "last": int(getattr(session, "last_seen", 0.0) or 0),
+            }
+        )
+    line = dumps({"cmd": "sessions", "sessions": entries})
+    while _bytelen(line) > budget and entries:
+        entries.pop()  # trim from the tail: waiting sessions at the front survive
+        line = dumps({"cmd": "sessions", "sessions": entries})
+    return line

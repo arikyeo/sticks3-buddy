@@ -84,6 +84,13 @@ class Daemon:
         )
         self.started_at = time.time()
         self.last_device_status: dict[str, Any] = {}
+        # Protocol v2 stub: dormant until the firmware track lands. Even when
+        # enabled, v2 only activates after the device acks proto >= 2; no ack
+        # within HELLO_ACK_TIMEOUT_SECS leaves the link in v1 mode.
+        self.proto2_enabled = False
+        self.negotiated_proto = protocol.PROTO_V1
+        self.hello_ack: Optional[protocol.HelloAck] = None
+        self._hello_deadline = 0.0
         self._last_sent_line = ""
         self._last_send_ts = 0.0
         self._last_timesync_ts = 0.0
@@ -277,6 +284,12 @@ class Daemon:
     # ---- BLE ----
 
     async def _on_ble_connect(self) -> None:
+        self.negotiated_proto = protocol.PROTO_V1
+        self.hello_ack = None
+        self._hello_deadline = 0.0
+        if self.proto2_enabled:
+            if await self.link.send_line(protocol.build_hello(self.cfg)):
+                self._hello_deadline = time.monotonic() + protocol.HELLO_ACK_TIMEOUT_SECS
         await self._send_timesync()
         if self.cfg.owner:
             await self.link.send_line(protocol.build_owner_frame(self.cfg.owner))
@@ -286,6 +299,18 @@ class Daemon:
         cmd = obj.get("cmd")
         if cmd == "permission":
             await self.handle_device_permission(obj)
+            return
+        ack = protocol.parse_hello_ack(obj)
+        if ack is not None:
+            self.hello_ack = ack
+            self._hello_deadline = 0.0
+            if self.proto2_enabled and ack.proto >= protocol.PROTO_V2:
+                self.negotiated_proto = protocol.PROTO_V2
+                log.info(
+                    "ble: negotiated protocol v2 (maxLine=%d maxSessions=%d sel=%s)",
+                    ack.max_line, ack.max_sessions, ack.sel,
+                )
+            await self._send_snapshot(force=True)
             return
         if cmd is None and obj:
             # status replies and other unsolicited frames
@@ -303,8 +328,19 @@ class Daemon:
         if await self.link.send_line(protocol.build_time_frame()):
             self._last_timesync_ts = time.monotonic()
 
+    def outbound_state_line(self) -> str:
+        """v1 snapshot, or the v2 sessions frame once proto >= 2 is negotiated."""
+        if self.negotiated_proto >= protocol.PROTO_V2:
+            ack = self.hello_ack or protocol.HelloAck()
+            return protocol.build_sessions_frame(
+                self.registry.sessions_sorted(),
+                max_sessions=ack.max_sessions,
+                budget=min(ack.max_line, protocol.LINE_BUDGET),
+            )
+        return self.snapshot_line()
+
     async def _send_snapshot(self, force: bool = False) -> bool:
-        line = self.snapshot_line()
+        line = self.outbound_state_line()
         now = time.monotonic()
         if not force and line == self._last_sent_line and now - self._last_send_ts < HEARTBEAT_SECS:
             return False
@@ -333,9 +369,13 @@ class Daemon:
                 log.exception("daemon: pump tick failed")
 
     async def tick(self) -> None:
-        """Once-a-second housekeeping (extended by later phases)."""
+        """Once-a-second housekeeping."""
         self.registry.reap()
         self.ledger.save_if_dirty()
+        if self._hello_deadline and time.monotonic() > self._hello_deadline:
+            self._hello_deadline = 0.0
+            log.info("ble: no hello-ack within %.0fs, staying in protocol v1",
+                     protocol.HELLO_ACK_TIMEOUT_SECS)
 
     # ---- lifecycle ----
 
