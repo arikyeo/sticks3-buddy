@@ -3,6 +3,7 @@
 #include <ArduinoJson.h>
 #include "config.h"
 #include "hal/hal.h"
+#include "logic/utf8_text_logic.h"
 #include "ble_bridge.h"
 #include "xfer.h"
 
@@ -97,8 +98,11 @@ static void _applyJson(const char* line, TamaState* out) {
   uint32_t bridgeTokens = doc["tokens"] | 0;
   if (doc["tokens"].is<uint32_t>()) statsOnBridgeTokens(bridgeTokens);
   out->tokensToday = doc["tokens_today"] | out->tokensToday;
+  // Display text is sanitized at ingestion (UTF-8 punctuation -> ASCII,
+  // everything unrenderable -> '?') so stored buffers are always safe for
+  // the ASCII-only fonts and the wrap logic.
   const char* m = doc["msg"];
-  if (m) { strncpy(out->msg, m, sizeof(out->msg)-1); out->msg[sizeof(out->msg)-1]=0; }
+  if (m) utf8Sanitize(out->msg, sizeof(out->msg), m);
   JsonArray la = doc["entries"];
   if (!la.isNull()) {
     // Entries are oldest-first; if more arrive than the buffer holds, skip the
@@ -109,7 +113,7 @@ static void _applyJson(const char* line, TamaState* out) {
     for (JsonVariant v : la) {
       if (skip > 0) { skip--; continue; }
       const char* s = v.as<const char*>();
-      strncpy(out->lines[n], s ? s : "", 91); out->lines[n][91]=0;
+      utf8Sanitize(out->lines[n], sizeof(out->lines[n]), s ? s : "");
       n++;
     }
     if (n != out->nLines || (n > 0 && strcmp(out->lines[n-1], out->msg) != 0)) {
@@ -120,9 +124,11 @@ static void _applyJson(const char* line, TamaState* out) {
   JsonObject pr = doc["prompt"];
   if (!pr.isNull()) {
     const char* pid = pr["id"]; const char* pt = pr["tool"]; const char* ph = pr["hint"];
+    // promptId is an opaque token echoed back in the permission response —
+    // copy it verbatim. Tool/hint are display text -> sanitize.
     strncpy(out->promptId,   pid ? pid : "", sizeof(out->promptId)-1);   out->promptId[sizeof(out->promptId)-1]=0;
-    strncpy(out->promptTool, pt  ? pt  : "", sizeof(out->promptTool)-1); out->promptTool[sizeof(out->promptTool)-1]=0;
-    strncpy(out->promptHint, ph  ? ph  : "", sizeof(out->promptHint)-1); out->promptHint[sizeof(out->promptHint)-1]=0;
+    utf8Sanitize(out->promptTool, sizeof(out->promptTool), pt ? pt : "");
+    utf8Sanitize(out->promptHint, sizeof(out->promptHint), ph ? ph : "");
   } else {
     out->promptId[0] = 0; out->promptTool[0] = 0; out->promptHint[0] = 0;
   }
