@@ -20,11 +20,13 @@ from typing import Any, Optional
 
 from . import protocol
 from .adapters import claude_cli
+from .adapters.claude_jsonl import AssistantEvent, JsonlTailer, claude_projects_root
 from .config import Config
 from .ble.link import LinkManager
 from .ipc.endpoint import remove_endpoint, write_endpoint
 from .ipc.server import IpcServer
 from .registry import SessionRegistry
+from .usage import LEDGER_FILENAME, UsageLedger
 
 log = logging.getLogger(__name__)
 
@@ -47,6 +49,12 @@ class Daemon:
             on_connect=self._on_ble_connect,
         )
         self.registry = SessionRegistry()
+        self.ledger = UsageLedger(cfg.home / LEDGER_FILENAME)
+        self.claude_tailer = JsonlTailer(
+            root=claude_projects_root(),
+            offsets_path=cfg.home / "offsets.json",
+            on_event=self._on_claude_transcript,
+        )
         self.started_at = time.time()
         self.last_device_status: dict[str, Any] = {}
         self._last_sent_line = ""
@@ -55,11 +63,22 @@ class Daemon:
         self._last_status_poll_ts = 0.0
         self._stop_evt = asyncio.Event()
 
+    # ---- transcript + usage ----
+
+    def _on_claude_transcript(self, event: AssistantEvent) -> None:
+        if event.session_id:
+            self.registry.add_tokens("claude", event.session_id, event.output_tokens)
+            if event.cwd and self.registry.get("claude", event.session_id) is not None:
+                self.registry.upsert("claude", event.session_id, event.cwd)
+            self.ledger.add("claude", event.session_id, event.output_tokens)
+        if event.text:
+            self.registry.add_entry(protocol.format_entry(event.hhmm, event.text))
+
     # ---- snapshot source ----
 
     def tokens_totals(self) -> tuple[int, int]:
-        """(lifetime, today) token totals; the usage ledger plugs in in phase 3."""
-        return self.registry.total_tokens(), 0
+        """(lifetime, today) output-token totals from the persistent ledger."""
+        return self.ledger.totals()
 
     def headline(self) -> str:
         total, running, waiting = self.registry.counts()
@@ -207,12 +226,16 @@ class Daemon:
     async def tick(self) -> None:
         """Once-a-second housekeeping (extended by later phases)."""
         self.registry.reap()
+        self.ledger.save_if_dirty()
 
     # ---- lifecycle ----
 
     async def start_background(self) -> list[asyncio.Task]:
         """Extra long-running tasks (adapters); extended in later phases."""
-        return []
+        tasks: list[asyncio.Task] = []
+        if self.cfg.claude_enabled:
+            tasks.append(asyncio.create_task(self.claude_tailer.run(), name="claude-jsonl"))
+        return tasks
 
     async def run(self) -> None:
         self.cfg.home.mkdir(parents=True, exist_ok=True)
@@ -237,6 +260,9 @@ class Daemon:
                     await task
             await self.link.stop()
             await self.ipc.stop()
+            with contextlib.suppress(Exception):
+                self.ledger.save_if_dirty()
+                self.claude_tailer.flush()
             remove_endpoint(self.cfg.home)
             log.info("daemon: stopped")
 
