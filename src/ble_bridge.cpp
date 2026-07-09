@@ -1,4 +1,5 @@
 #include "ble_bridge.h"
+#include "config.h"
 #include <BLEDevice.h>
 #include <BLEServer.h>
 #include <BLEUtils.h>
@@ -21,7 +22,7 @@
 // rxPush runs in the BLE stack task (Core 0); bleRead/bleAvailable run in the
 // main loop (Core 1). volatile alone is not sufficient on dual-core ESP32 —
 // use a portMUX spinlock to prevent torn head/tail reads.
-static const size_t RX_CAP = 2048;
+static const size_t RX_CAP = BUDDY_RX_CAP;   // per-board, see config.h
 static uint8_t  rxBuf[RX_CAP];
 static size_t   rxHead = 0;
 static size_t   rxTail = 0;
