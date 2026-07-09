@@ -1,0 +1,13 @@
+{
+  "name": "StickS3 Buddy",
+  "version": "__VERSION__",
+  "new_install_prompt_erase": true,
+  "builds": [
+    {
+      "chipFamily": "ESP32-S3",
+      "parts": [
+        { "path": "__MERGED_BIN_URL__", "offset": 0 }
+      ]
+    }
+  ]
+}

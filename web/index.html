@@ -1,0 +1,148 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>StickS3 Buddy — Web Installer</title>
+  <script
+    type="module"
+    src="https://unpkg.com/esp-web-tools@10/dist/web/install-button.js?module"
+  ></script>
+  <style>
+    :root {
+      color-scheme: light dark;
+      --bg: #faf9f5;
+      --fg: #1a1a1a;
+      --muted: #6b6b6b;
+      --card: #ffffff;
+      --border: #e3e1d9;
+      --accent: #d97757;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #1a1a1a;
+        --fg: #f5f4ef;
+        --muted: #a3a3a3;
+        --card: #262626;
+        --border: #3a3a3a;
+      }
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+        Helvetica, Arial, sans-serif;
+      background: var(--bg);
+      color: var(--fg);
+      line-height: 1.6;
+      display: flex;
+      justify-content: center;
+      padding: 3rem 1.25rem;
+    }
+    main { max-width: 640px; width: 100%; }
+    h1 { font-size: 2rem; margin: 0 0 0.5rem; }
+    .lede { color: var(--muted); margin: 0 0 2rem; }
+    .card {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 1.75rem;
+      margin-bottom: 1.5rem;
+    }
+    .install { text-align: center; }
+    esp-web-install-button { display: inline-block; }
+    esp-web-install-button[install-unsupported] { display: none; }
+    .unsupported {
+      display: none;
+      color: var(--accent);
+      font-weight: 600;
+    }
+    esp-web-install-button[install-unsupported]
+      + .unsupported { display: block; }
+    a { color: var(--accent); }
+    ol, ul { padding-left: 1.25rem; }
+    code {
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      padding: 0.1rem 0.35rem;
+      font-size: 0.9em;
+    }
+    footer {
+      color: var(--muted);
+      font-size: 0.85rem;
+      text-align: center;
+      margin-top: 2rem;
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>StickS3 Buddy</h1>
+    <p class="lede">
+      Flash the M5StickC Plus S3 desk-pet firmware straight from your
+      browser — no PlatformIO, no toolchain.
+    </p>
+
+    <div class="card install">
+      <esp-web-install-button manifest="./manifest.json">
+        <button slot="activate">Install firmware</button>
+      </esp-web-install-button>
+      <p class="unsupported">
+        Your browser can't talk to serial devices. Open this page in
+        desktop Chrome, Edge, or Opera.
+      </p>
+    </div>
+
+    <div class="card">
+      <h2>Before you start</h2>
+      <ol>
+        <li>Use desktop Chrome, Edge, or Opera (Web Serial is required).</li>
+        <li>Connect the StickS3 to your computer over USB-C.</li>
+        <li>
+          Put it in download mode: <strong>long-press the side power
+          button for 6 seconds</strong> to power it fully off, then
+          plug/replug USB while <strong>holding the BOOT button</strong>
+          until the green LED flashes.
+        </li>
+        <li>Click <strong>Install firmware</strong> and pick the device's
+          serial port.</li>
+        <li>Choose <strong>Install</strong> and wait for the flash to
+          finish.</li>
+      </ol>
+      <p>
+        <strong>No driver install needed on Windows 11</strong> — the
+        StickS3 uses native USB-CDC, which Windows 11 handles out of the
+        box. Older Windows versions may need a CDC driver.
+      </p>
+      <p>
+        <strong>The COM port changes between modes.</strong> The
+        bootloader (download mode, used for flashing) and the running
+        app (normal mode) enumerate as different USB-CDC ports. If the
+        installer can't find your device after a flash finishes and it
+        reboots, re-pick the port — it likely moved.
+      </p>
+    </div>
+
+    <div class="card">
+      <h2>After flashing</h2>
+      <p>
+        Pair the buddy with Claude Code or Codex by installing the
+        bridge and connecting over BLE. See the
+        <a href="https://github.com/arikyeo/sticks3-buddy#readme">README</a>
+        for pairing steps and
+        <a href="https://github.com/arikyeo/sticks3-buddy/releases">release
+        notes</a> for what changed.
+      </p>
+    </div>
+
+    <footer>
+      Built from
+      <a href="https://github.com/arikyeo/sticks3-buddy">
+        arikyeo/sticks3-buddy</a>.
+      Installer powered by
+      <a href="https://esphome.github.io/esp-web-tools/">esp-web-tools</a>.
+    </footer>
+  </main>
+</body>
+</html>

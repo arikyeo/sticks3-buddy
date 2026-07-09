@@ -1,0 +1,124 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Version tag (e.g. v1.0.0) — required for manual runs, ignored on tag push"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Cache PlatformIO
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.platformio
+            ~/.cache/pip
+          key: pio-${{ runner.os }}-${{ hashFiles('platformio.ini') }}
+          restore-keys: |
+            pio-${{ runner.os }}-
+
+      - name: Install PlatformIO and esptool
+        run: pip install platformio esptool
+
+      - name: Build firmware
+        run: pio run -e m5stick-s3
+
+      - name: Determine version
+        id: version
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "tag=${{ github.event.inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Merge single-image binary
+        run: |
+          BUILD_DIR=.pio/build/m5stick-s3
+
+          # platformio.ini pins board_build.partitions = no_ota.csv, which
+          # has no ota_0/ota_1 slots — just bootloader, partition table, and
+          # one app0 slot. boot_app0.bin (the "which OTA slot is active"
+          # stub) only matters when a partition table has ota_0/ota_1 to
+          # choose between, so it's intentionally NOT part of this merge.
+          # If board_build.partitions ever switches to an OTA-capable table
+          # (e.g. sticks3_8mb_ota.csv), this step needs a
+          # 0xe000 <boot_app0.bin> line added back in.
+          #
+          # flash_mode: platformio.ini sets board_build.flash_mode = qio,
+          # but the board's actual PSRAM wiring is qio_opi (see
+          # board_build.psram_type = opi). --flash_mode keep reads the
+          # mode already baked into bootloader.bin by the qio_opi-aware
+          # build instead of re-asserting a possibly-wrong mode byte, so
+          # the merged image can't end up with a flash-mode mismatch that
+          # only shows up on real hardware.
+          python -m esptool --chip esp32s3 merge_bin \
+            -o buddy-sticks3-merged.bin \
+            --flash_mode keep \
+            --flash_size 8MB \
+            0x0     "$BUILD_DIR/bootloader.bin" \
+            0x8000  "$BUILD_DIR/partitions.bin" \
+            0x10000 "$BUILD_DIR/firmware.bin"
+
+      - name: Stage release assets
+        run: |
+          mkdir -p release
+          cp buddy-sticks3-merged.bin release/buddy-sticks3-merged.bin
+          cp .pio/build/m5stick-s3/firmware.bin release/firmware.bin
+
+      - name: Generate manifest.json
+        run: |
+          VERSION="${{ steps.version.outputs.tag }}"
+          REPO="${{ github.repository }}"
+          BASE_URL="https://github.com/${REPO}/releases/download/${VERSION}"
+          sed \
+            -e "s|__MERGED_BIN_URL__|${BASE_URL}/buddy-sticks3-merged.bin|" \
+            -e "s|__VERSION__|${VERSION}|" \
+            web/manifest-template.json > release/manifest.json
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: ${{ steps.version.outputs.tag }}
+          generate_release_notes: true
+          body: |
+            ## Flashing
+
+            **New device or want a clean factory state:** use the
+            [web flasher](https://arikyeo.github.io/sticks3-buddy/) or flash
+            `buddy-sticks3-merged.bin` at offset `0x0`. This **erases NVS**
+            (BLE bonds, owner name, pet choice, and settings) since it
+            overwrites the whole flash including the `nvs` partition.
+
+            **Updating an already-paired device:** flash `firmware.bin`
+            (the OTA/app-only payload) at offset `0x10000` instead, or
+            `pio run -t upload` from a checkout of this tag. This preserves
+            NVS — your device stays paired and keeps its stats.
+
+            ## Assets
+
+            - `buddy-sticks3-merged.bin` — full-flash image (bootloader +
+              partition table + app), erases NVS
+            - `firmware.bin` — app-only image, preserves NVS
+            - `manifest.json` — ESP Web Tools manifest for the web flasher
+          files: |
+            release/buddy-sticks3-merged.bin
+            release/firmware.bin
+            release/manifest.json
