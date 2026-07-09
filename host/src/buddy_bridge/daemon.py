@@ -21,10 +21,26 @@ from typing import Any, Optional
 from . import protocol
 from .adapters import claude_cli
 from .adapters.claude_jsonl import AssistantEvent, JsonlTailer, claude_projects_root
+from .audit import (
+    SOURCE_AUTO_ALLOW,
+    SOURCE_DAEMON_DOWN,
+    SOURCE_DEVICE,
+    SOURCE_TIMEOUT_FALLBACK,
+    append_audit,
+)
 from .config import Config
 from .ble.link import LinkManager
+from .decision import ALLOW, ASK, DENY, DecisionRouter, build_hint
 from .ipc.endpoint import remove_endpoint, write_endpoint
 from .ipc.server import IpcServer
+from .matchers import (
+    ALWAYS_ASK,
+    AUTO_ALLOW,
+    MATCHERS_FILENAME,
+    STRICT,
+    is_safe_tool,
+    load_matchers,
+)
 from .registry import SessionRegistry
 from .usage import LEDGER_FILENAME, UsageLedger
 
@@ -49,6 +65,8 @@ class Daemon:
             on_connect=self._on_ble_connect,
         )
         self.registry = SessionRegistry()
+        self.router = DecisionRouter()
+        self.matchers = load_matchers(cfg.home / MATCHERS_FILENAME)
         self.ledger = UsageLedger(cfg.home / LEDGER_FILENAME)
         self.claude_tailer = JsonlTailer(
             root=claude_projects_root(),
@@ -91,7 +109,8 @@ class Daemon:
         return "bridge up"
 
     def pending_prompt(self) -> Optional[str]:
-        return self.registry.pending_prompt()
+        # A live gate decision outranks passive attention hints.
+        return self.router.oldest_hint() or self.registry.pending_prompt()
 
     def snapshot_line(self) -> str:
         total, running, waiting = self.registry.counts()
@@ -162,10 +181,76 @@ class Daemon:
         agent = msg.get("agent")
         if agent == "claude" and self.cfg.claude_enabled:
             claude_cli.handle_event(self.registry, msg)
+            if msg.get("name") == "SessionEnd":
+                self.router.cancel_session("claude", str(msg.get("session_id") or ""))
+
+    # ---- permission gate ----
+
+    def _decision_timeout(self, agent: str) -> float:
+        return self.cfg.codex_decision if agent == "codex" else self.cfg.claude_decision
+
+    async def _device_available(self) -> bool:
+        if self.cfg.ble_mode == "off":
+            return False
+        if self.link.connected:
+            return True
+        if self.cfg.ble_mode == "ondemand":
+            return await self.link.ensure_connected(timeout=10.0)
+        return False
 
     async def handle_permission_request(self, msg: dict[str, Any]) -> dict[str, Any]:
-        """Gate requests answer "ask" until the DecisionRouter lands (phase 4)."""
-        return {"decision": "ask"}
+        """Decide allow/deny/ask for a blocking hook request.
+
+        ask = "no opinion": the hook prints nothing and the agent's native
+        prompt takes over. That is the answer for SAFE_TOOLS, unmatched
+        (default) invocations, an unreachable device, and timeouts.
+        """
+        agent = str(msg.get("agent") or "claude")
+        sid = str(msg.get("session_id") or "")
+        tool = str(msg.get("tool_name") or "")
+        tool_input = msg.get("tool_input")
+        if not isinstance(tool_input, dict):
+            tool_input = {}
+        command = str(tool_input.get("command") or "")
+        hint = protocol.sanitize(build_hint(tool, tool_input))
+
+        def audit(decision: str, source: str) -> None:
+            append_audit(
+                self.cfg.home,
+                host=self.cfg.host_id,
+                agent=agent,
+                sid=sid,
+                tool=tool,
+                hint=hint,
+                decision=decision,
+                source=source,
+            )
+
+        if not tool or is_safe_tool(tool):
+            return {"decision": ASK}  # hard-skip: never gated, not audited
+
+        klass = self.matchers.classify(tool, command)
+        if klass == AUTO_ALLOW:
+            audit(ALLOW, SOURCE_AUTO_ALLOW)
+            return {"decision": ALLOW}
+        if klass not in (ALWAYS_ASK, STRICT):
+            return {"decision": ASK}  # default: native prompt handles it
+
+        if not await self._device_available():
+            audit(ASK, SOURCE_DAEMON_DOWN)
+            return {"decision": ASK}
+
+        pending = self.router.create(agent, sid, str(msg.get("tool_use_id") or ""), hint)
+        await self._send_snapshot(force=True)  # surface the prompt immediately
+        try:
+            decision = await self.router.wait(pending, self._decision_timeout(agent))
+        finally:
+            await self._send_snapshot(force=True)  # and clear it again
+        if decision in (ALLOW, DENY):
+            audit(decision, SOURCE_DEVICE)
+        else:
+            audit(ASK, SOURCE_TIMEOUT_FALLBACK)
+        return {"decision": decision}
 
     # ---- BLE ----
 
@@ -187,8 +272,10 @@ class Daemon:
         log.debug("ble: unhandled device frame %r", obj)
 
     async def handle_device_permission(self, obj: dict[str, Any]) -> None:
-        """Device permission decisions; wired to the DecisionRouter in phase 4."""
-        log.info("ble: permission frame ignored (gate not active): %r", obj)
+        wire_id = str(obj.get("id") or "")
+        decision = str(obj.get("decision") or "")
+        if not self.router.resolve(wire_id, decision):
+            log.info("ble: stale/unknown permission decision %r -> %r", wire_id, decision)
 
     async def _send_timesync(self) -> None:
         if await self.link.send_line(protocol.build_time_frame()):
