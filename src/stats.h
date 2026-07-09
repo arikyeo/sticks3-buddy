@@ -26,7 +26,32 @@ static Stats _stats;
 static Preferences _prefs;
 static bool _dirty = false;
 
+// --- NVS schema migration ----------------------------------------------------
+// "sv" tracks the NVS schema version; absent = v0 (original layout).
+// v0 → v1: appr/deny were u16 (putUShort). The counters are u32 now, and NVS
+// typing is strict — getUInt on a u16 entry returns the default, silently
+// zeroing a device's history. Re-key both as u32, and seed s_bright (added in
+// the same wave) if absent so brightness starts at the documented default.
+// Idempotent: sv=1 short-circuits every boot after the first.
+static const uint8_t NVS_SCHEMA_V = 1;
+
+inline void nvsMigrate() {
+  _prefs.begin("buddy", false);
+  if (_prefs.getUChar("sv", 0) < 1) {
+    uint32_t appr = _prefs.getUShort("appr", 0);
+    uint32_t deny = _prefs.getUShort("deny", 0);
+    _prefs.remove("appr");
+    _prefs.remove("deny");
+    _prefs.putUInt("appr", appr);
+    _prefs.putUInt("deny", deny);
+    if (!_prefs.isKey("s_bright")) _prefs.putUChar("s_bright", 4);
+    _prefs.putUChar("sv", NVS_SCHEMA_V);
+  }
+  _prefs.end();
+}
+
 inline void statsLoad() {
+  nvsMigrate();
   _prefs.begin("buddy", true);
   _stats.napSeconds = _prefs.getUInt("nap", 0);
   _stats.approvals  = _prefs.getUInt("appr", 0);
