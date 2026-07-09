@@ -1,27 +1,9 @@
-# claude-desktop-buddy (M5StickC Plus **S3** port)
+# StickS3 Buddy
 
-> **Unofficial fork.** This branch ports the upstream firmware from the
-> original M5StickC Plus (ESP32) to the newer **M5StickC Plus S3** (ESP32-S3).
-> Upstream explicitly does not accept board-port PRs — see
-> [CONTRIBUTING.md](CONTRIBUTING.md). For the protocol reference and the
-> original M5StickC Plus support, see [anthropics/claude-desktop-buddy](https://github.com/anthropics/claude-desktop-buddy).
->
-> **What changed for the S3:**
-> - `platformio.ini` targets `esp32-s3-devkitc-1` with `M5Unified` (not `M5StickCPlus`)
-> - New `src/m5_compat.h` shim maps the old `M5.Axp.*`/`M5.Beep.*`/`M5.Imu.*`/`M5.Rtc.*` APIs onto the M5Unified equivalents
-> - RTC struct field names switched to lowercase (`.hours`, `.month`, `.weekDay`)
-> - Power button handled via `M5.BtnPWR.wasClicked()` instead of `M5.Axp.GetBtnPress()`
-> - LED moved from G10 → **G19**
-> - `src/data.h` no longer reads from USB `Serial` — on ESP32-S3 with native USB CDC, `Serial.available()` can deadlock `dataPoll` when no host is actively draining. BLE is the only data channel on S3.
->
-> **Flashing an S3 for the first time:**
-> StickS3 has no GPIO-0 boot button. To enter download mode: plug in USB,
-> then **long-press the side power button until the green LED flashes**
-> (3-5 seconds). Only then will `pio run -t upload` succeed. After the
-> first flash, `ARDUINO_USB_CDC_ON_BOOT=1` usually lets subsequent uploads
-> reset into download mode automatically.
-
-### Running on a StickS3
+A desk pet that lives on your M5StickC Plus S3 and reacts to Claude Code
+and Codex sessions over Bluetooth LE — sleeps when nothing's happening,
+wakes when a session starts, gets visibly impatient when a permission
+prompt is waiting, and lets you approve or deny right from the device.
 
 <p align="center">
   <img src="docs/s3/approval.jpg" alt="Approval prompt for a Bash command on M5StickS3" width="240">
@@ -29,42 +11,40 @@
   <img src="docs/s3/credits.jpg" alt="Credits page showing hardware line M5StickC Plus S3 / ESP32-S3 + BMI270" width="240">
 </p>
 
-Left: live approval prompt (`Bash` tool waiting on `git config user.name; git config user.email`). Middle: pet stats page after a few approvals. Right: Info → Credits page identifying the hardware as StickS3.
+This is a unified fork: the original ESP32 firmware and BLE protocol from
+[anthropics/claude-desktop-buddy](https://github.com/anthropics/claude-desktop-buddy),
+merged with an independent ESP32-S3 port and a long tail of community
+fixes and features. See [Credits](#credits) for the full list.
 
----
+## Features
 
-Claude for macOS and Windows can connect Claude Cowork and Claude Code to
-maker devices over BLE, so developers and makers can build hardware that
-displays permission prompts, recent messages, and other interactions. We've
-been impressed by the creativity of the maker community around Claude -
-providing a lightweight, opt-in API is our way of making it easier to build
-fun little hardware devices that integrate with Claude.
+- **Multi-host.** Pairs with more than one desktop/bridge; the device
+  soft-pins to one active host and slow-retries the rest (see
+  [PROTOCOL_V2.md](PROTOCOL_V2.md)).
+- **Multi-session.** A single host can surface several concurrent CLI
+  sessions (`claude` and `codex`), each with its own state and token
+  count.
+- **Multi-board.** M5StickC Plus S3 today; classic M5StickC Plus support
+  is planned (see [PROTOCOL_V2.md](PROTOCOL_V2.md) and open CI matrix
+  entries in `.github/workflows/ci.yml`).
+- **GIF and ASCII pets.** Eighteen built-in ASCII species, or drag a
+  custom GIF character pack onto the bridge's drop target.
+- **Extras.** Optional notification cards (`ntfy`) for CI results, GitHub
+  events, and more, on top of the core approval/session flow.
+- **OTA-friendly updates.** Releases publish both a full-flash image (for
+  first-time setup) and an app-only image (for updating an already-paired
+  device without losing BLE bonds or settings).
 
-> **Building your own device?** You don't need any of the code here. See
-> **[REFERENCE.md](REFERENCE.md)** for the wire protocol: Nordic UART
-> Service UUIDs, JSON schemas, and the folder push transport.
+## Quickstart
 
-As an example, we built a desk pet on ESP32 that lives off permission
-approvals and interaction with Claude. It sleeps when nothing's happening,
-wakes when sessions start, gets visibly impatient when an approval prompt is
-waiting, and lets you approve or deny right from the device.
+### 1. Flash the firmware
 
-<p align="center">
-  <img src="docs/device.jpg" alt="M5StickC Plus running the buddy firmware" width="500">
-</p>
+**Easiest: web flasher.** Open
+[the web installer](https://arikyeo.github.io/sticks3-buddy/) in desktop
+Chrome, Edge, or Opera, connect the StickS3 over USB-C, and click
+**Install firmware**. No toolchain needed.
 
-## Hardware
-
-The firmware targets ESP32 with the Arduino framework. As written, it
-depends on the M5StickCPlus library for its display, IMU, and button
-drivers—so you'll need that board, or a fork that swaps those drivers for
-your own pin layout.
-
-## Flashing
-
-Install
-[PlatformIO Core](https://docs.platformio.org/en/latest/core/installation/),
-then:
+**From source:**
 
 ```bash
 pio run -t upload
@@ -76,111 +56,50 @@ If you're starting from a previously-flashed device, wipe it first:
 pio run -t erase && pio run -t upload
 ```
 
-Once running, you can also wipe everything from the device itself: **hold A
-→ settings → reset → factory reset → tap twice**.
+**First-time flash:** the StickS3 has no GPIO-0 boot button. To enter
+download mode, long-press the side power button for ~6 seconds to power
+off, then plug in USB while holding **BOOT** until the green LED flashes.
 
-## Pairing
+### 2. Pair with Claude or Codex
 
-To pair your device with Claude, first enable developer mode (**Help →
-Troubleshooting → Enable Developer Mode**). Then, open the Hardware Buddy
-window in **Developer → Open Hardware Buddy…**, click **Connect**, and pick
-your device from the list. macOS will prompt for Bluetooth permission on
-first connect; grant it.
+Enable developer mode in the desktop app
+(**Help → Troubleshooting → Enable Developer Mode**), open
+**Developer → Open Hardware Buddy…**, click **Connect**, and pick your
+device from the scan list. Once paired, the bridge auto-reconnects
+whenever both sides are awake.
 
-<p align="center">
-  <img src="docs/menu.png" alt="Developer → Open Hardware Buddy… menu item" width="420">
-  <img src="docs/hardware-buddy-window.png" alt="Hardware Buddy window with Connect button and folder drop target" width="420">
-</p>
+### 3. Install the bridge
 
-Once paired, the bridge auto-reconnects whenever both sides are awake.
+The bridge speaks [REFERENCE.md](REFERENCE.md) (v1) with the optional v2
+additions in [PROTOCOL_V2.md](PROTOCOL_V2.md). See `host/` for the
+reference bridge implementation and its own setup instructions.
 
-If discovery isn't finding the stick:
+## Hardware
 
-- Make sure it's awake (any button press)
-- Check the stick's settings menu → bluetooth is on
+| | |
+| --- | --- |
+| **Board** | M5StickC Plus S3 |
+| **SoC** | ESP32-S3, 160 MHz dual-core |
+| **Flash** | 8 MB |
+| **PSRAM** | 8 MB, OPI |
+| **Display** | 1.14" 135×240 IPS |
+| **IMU** | BMI270 |
+| **Connectivity** | BLE (Nordic UART Service) |
+| **USB** | Native USB-CDC (no driver needed on Windows 11) |
+| **Battery** | 200 mAh Li-Po |
 
-## Controls
+## Building
 
-|                         | Normal               | Pet         | Info        | Approval    |
-| ----------------------- | -------------------- | ----------- | ----------- | ----------- |
-| **A** (front)           | next screen          | next screen | next screen | **approve** |
-| **B** (right)           | scroll transcript    | next page   | next page   | **deny**    |
-| **Hold A**              | menu                 | menu        | menu        | menu        |
-| **Power** (left, short) | toggle screen off    |             |             |             |
-| **Power** (left, ~6s)   | hard power off       |             |             |             |
-| **Shake**               | dizzy                |             |             | —           |
-| **Face-down**           | nap (energy refills) |             |             |             |
+Install [PlatformIO Core](https://docs.platformio.org/en/latest/core/installation/),
+then:
 
-The screen auto-powers-off after 30s of no interaction (kept on while an
-approval prompt is up). Any button press wakes it.
-
-## ASCII pets
-
-Eighteen pets, each with seven animations (sleep, idle, busy, attention,
-celebrate, dizzy, heart). Menu → "next pet" cycles them with a counter.
-Choice persists to NVS.
-
-## GIF pets
-
-If you want a custom GIF character instead of an ASCII buddy, drag a
-character pack folder onto the drop target in the Hardware Buddy window. The
-app streams it over BLE and the stick switches to GIF mode live. **Settings
-→ delete char** reverts to ASCII mode.
-
-A character pack is a folder with `manifest.json` and 96px-wide GIFs:
-
-```json
-{
-  "name": "bufo",
-  "colors": {
-    "body": "#6B8E23",
-    "bg": "#000000",
-    "text": "#FFFFFF",
-    "textDim": "#808080",
-    "ink": "#000000"
-  },
-  "states": {
-    "sleep": "sleep.gif",
-    "idle": ["idle_0.gif", "idle_1.gif", "idle_2.gif"],
-    "busy": "busy.gif",
-    "attention": "attention.gif",
-    "celebrate": "celebrate.gif",
-    "dizzy": "dizzy.gif",
-    "heart": "heart.gif"
-  }
-}
+```bash
+pio run -e m5stick-s3            # build
+pio run -e m5stick-s3 -t upload  # build and flash
 ```
 
-State values can be a single filename or an array. Arrays rotate: each
-loop-end advances to the next GIF, useful for an idle activity carousel so
-the home screen doesn't loop one clip forever.
-
-GIFs are 96px wide; height up to ~140px stays on a 135×240 portrait screen.
-Crop tight to the character — transparent margins waste screen and shrink
-the sprite. `tools/prep_character.py` handles the resize: feed it source
-GIFs at any sizes and it produces a 96px-wide set where the character is the
-same scale in every state.
-
-The whole folder must fit under 1.8MB —
-`gifsicle --lossy=80 -O3 --colors 64` typically cuts 40–60%.
-
-See `characters/bufo/` for a working example.
-
-If you're iterating on a character and would rather skip the BLE round-trip,
-`tools/flash_character.py characters/bufo` stages it into `data/` and runs
-`pio run -t uploadfs` directly over USB.
-
-## The seven states
-
-| State       | Trigger                     | Feel                        |
-| ----------- | --------------------------- | --------------------------- |
-| `sleep`     | bridge not connected        | eyes closed, slow breathing |
-| `idle`      | connected, nothing urgent   | blinking, looking around    |
-| `busy`      | sessions actively running   | sweating, working           |
-| `attention` | approval pending            | alert, **LED blinks**       |
-| `celebrate` | level up (every 50K tokens) | confetti, bouncing          |
-| `dizzy`     | you shook the stick         | spiral eyes, wobbling       |
-| `heart`     | approved in under 5s        | floating hearts             |
+CI builds and size-guards every push and PR to `main` and `track-*`
+branches; see `.github/workflows/ci.yml`.
 
 ## Project layout
 
@@ -195,11 +114,56 @@ src/
   xfer.h         — folder push receiver
   stats.h        — NVS-backed stats, settings, owner, species choice
 characters/      — example GIF character packs
-tools/           — generators and converters
+host/            — reference desktop bridge
+tools/           — generators, converters, release helpers
+web/             — GitHub Pages web flasher
 ```
 
-## Availability
+## Protocol
 
-The BLE API is only available when the desktop apps are in developer mode
-(**Help → Troubleshooting → Enable Developer Mode**). It's intended for
-makers and developers and isn't an officially supported product feature.
+- [REFERENCE.md](REFERENCE.md) — the v1 wire protocol: Nordic UART
+  Service UUIDs, JSON schemas, folder push transport, pairing and
+  security model. Any device that speaks this is compatible — you don't
+  need anything else from this repo.
+- [PROTOCOL_V2.md](PROTOCOL_V2.md) — optional v2 additions: capability
+  negotiation, multi-session heartbeats, structured `ask` questions,
+  prompt cancellation, and notification cards. Strictly additive; a v1
+  device keeps working unmodified.
+
+## Credits
+
+This repo merges upstream Anthropic firmware with an independent S3 port
+and fixes/features pulled from the wider fork community:
+
+| Contributor | Contribution |
+| --- | --- |
+| [anthropics](https://github.com/anthropics/claude-desktop-buddy) | Original firmware and BLE protocol (upstream) |
+| [openalchemy](https://github.com/openalchemy/claude-desktop-buddy-s3) | ESP32-S3 / M5StickC Plus S3 port |
+| [CharlexH](https://github.com/CharlexH/CodeBuddy) | CodeBuddy — independent buddy implementation |
+| [Swissola](https://github.com/Swissola/claude-desktop-buddy) | Multi-host bonding, brightness persistence, counter widening, scroll preservation, approval timeout, energy floor, RTC re-sync, buffer-overflow guard, BLE ring-buffer race fix, and more |
+| [yiduo](https://github.com/yiduo) | README updates for dual-board support (#48) |
+| [ttpears](https://github.com/ttpears/claude-desktop-buddy) | CI workflow |
+| [bjedwards](https://github.com/bjedwards/claude-desktop-buddy-s3) | S3 port contributions |
+| [JohnWong](https://github.com/JohnWong/claude-desktop-buddy-s3) | S3 port contributions |
+| [xavierforge](https://github.com/xavierforge/claude-desktop-buddy-s3) | S3 port contributions |
+| [MaikEight](https://github.com/MaikEight/claude-desktop-buddy) | Firmware contributions |
+| [greedypelican](https://github.com/greedypelican/claude-desktop-buddy-s3-vscode) | VS Code tooling integration |
+| [oh001738](https://github.com/oh001738/claude-desktop-buddy-for-tdisplay-s3) | T-Display S3 board port |
+| [conallob](https://github.com/conallob/claude-desktop-buddy-s3) | Release workflow, platform upgrade |
+| [23atomist](https://github.com/23atomist/claude-desktop-buddy-xorigin) | Cross-origin firmware contributions |
+| [srokaw](https://github.com/srokaw/terminal-claude-code-buddy-m5stack) | Terminal Claude Code buddy for M5Stack |
+| SnowWarri0r | Firmware contributions |
+| Yamiqu | Firmware contributions |
+
+## License
+
+This project inherits its license from upstream: see [LICENSE](LICENSE).
+The firmware is MIT-licensed. The bundled `characters/bufo/` GIF assets
+are third-party artwork from the community "bufo" emoji set
+([bufo.zone](https://bufo.zone)) and are **not** covered by the MIT
+license — see [characters/bufo/README.md](characters/bufo/README.md) and
+the notice at the bottom of [LICENSE](LICENSE) for details.
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md).

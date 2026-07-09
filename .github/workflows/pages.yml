@@ -1,0 +1,56 @@
+name: Pages
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Assemble site
+        run: |
+          mkdir -p site
+          cp web/index.html site/index.html
+          # The release workflow already published release/manifest.json
+          # with the latest tag's asset URLs baked in as a release asset.
+          # For Pages we point the install button at the "latest" alias so
+          # the flasher page always resolves to the newest release without
+          # needing a rebuild on every tag.
+          REPO="${{ github.repository }}"
+          VERSION="${{ github.event.release.tag_name }}"
+          if [ -z "$VERSION" ]; then
+            VERSION="latest"
+          fi
+          sed \
+            -e "s|__MERGED_BIN_URL__|https://github.com/${REPO}/releases/latest/download/buddy-sticks3-merged.bin|" \
+            -e "s|__VERSION__|${VERSION}|" \
+            web/manifest-template.json > site/manifest.json
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
