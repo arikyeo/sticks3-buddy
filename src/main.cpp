@@ -13,6 +13,9 @@
 #include "ble_bridge.h"
 #include "data.h"
 #include "buddy.h"
+#ifdef BUDDY_EXTRAS_FULL
+#include "audio/tunes.h"   // tune engine + slot registry (8MB boards only)
+#endif
 
 #ifdef BUDDY_DEBUG
 #include "esp_system.h"
@@ -140,6 +143,22 @@ static void beep(uint16_t freq, uint16_t dur) {
   if (settings().vol) board::beep(freq, dur);
 }
 
+#ifdef BUDDY_EXTRAS_FULL
+// Jingle wrapper: play a tune slot when the tunes setting is on, volume is
+// up and the slot has data; false = caller falls back to the classic beep.
+static bool tunesJingle(const Tune* t) {
+  if (!settings().tune || !settings().vol) return false;
+  if (!t || !(t->len || t->pcm)) return false;
+  jingleStart(t);
+  return true;
+}
+#define TUNE_OR_BEEP(slot, f, d) do { if (!tunesJingle(slot)) beep((f), (d)); } while (0)
+#else
+// Non-FULL boards keep the classic beep as the only sound engine; the
+// slot token is never expanded, so SLOT_* needn't exist here.
+#define TUNE_OR_BEEP(slot, f, d) beep((f), (d))
+#endif
+
 static void sendCmd(const char* json) {
   Serial.println(json);
   size_t n = strlen(json);
@@ -179,8 +198,15 @@ const uint8_t EXTRAS_N = 2;
 
 bool    settingsOpen = false;
 uint8_t settingsSel  = 0;
+#ifdef BUDDY_EXTRAS_FULL
+// FULL builds get a "tunes" row after volume; applySetting/drawSettings
+// remap the rows below it so the base indices stay board-independent.
+const char* settingsItems[] = { "brightness", "volume", "tunes", "pairing", "host mode", "bluetooth", "wifi", "led", "transcript", "clock rot", "ascii pet", "reset", "back" };
+const uint8_t SETTINGS_N = 13;
+#else
 const char* settingsItems[] = { "brightness", "volume", "pairing", "host mode", "bluetooth", "wifi", "led", "transcript", "clock rot", "ascii pet", "reset", "back" };
 const uint8_t SETTINGS_N = 12;
+#endif
 
 bool    resetOpen = false;
 uint8_t resetSel  = 0;
@@ -221,6 +247,15 @@ static bool askShowing() {
 
 static void applySetting(uint8_t idx) {
   Settings& s = settings();
+#ifdef BUDDY_EXTRAS_FULL
+  if (idx == 2) {   // "tunes" row, FULL builds only
+    s.tune = !s.tune;
+    settingsSave();
+    if (s.tune) tunesJingle(SLOT_APPROVE);   // preview
+    return;
+  }
+  if (idx > 2) idx--;   // map back to the base table for the switch below
+#endif
   switch (idx) {
     case 0:
       settings().bright = (settings().bright + 1) % 5;
@@ -373,24 +408,33 @@ static void drawSettings() {
     spr.print(settingsItems[i]);
     spr.setCursor(mx + mw - 36, my + 8 + i * 14);
     spr.setTextColor(p.textDim, PANEL);
-    if (i == 0) {
+    int vi = i;   // base-table index (see applySetting's remap)
+#ifdef BUDDY_EXTRAS_FULL
+    if (i == 2) {
+      spr.setTextColor(s.tune ? GREEN : p.textDim, PANEL);
+      spr.print(s.tune ? " on" : "off");
+      continue;
+    }
+    if (i > 2) vi = i - 1;
+#endif
+    if (vi == 0) {
       spr.printf("%u/4", settings().bright);
-    } else if (i == 1) {
+    } else if (vi == 1) {
       if (s.vol == 0) spr.print("mut");
       else spr.printf("%u/4", s.vol);
-    } else if (i == 2) {
+    } else if (vi == 2) {
       spr.print(s.pair ? " jw" : " pk");   // just-works / passkey
-    } else if (i == 3) {
+    } else if (vi == 3) {
       if (s.hostsel < 0) spr.print("auto");
       else spr.printf("%.5s", hostGlueGet((uint8_t)s.hostsel)
                                 ? hostGlueGet((uint8_t)s.hostsel)->name : "?");
-    } else if (i >= 4 && i <= 7) {
-      spr.setTextColor(vals[i-4] ? GREEN : p.textDim, PANEL);
-      spr.print(vals[i-4] ? " on" : "off");
-    } else if (i == 8) {
+    } else if (vi >= 4 && vi <= 7) {
+      spr.setTextColor(vals[vi-4] ? GREEN : p.textDim, PANEL);
+      spr.print(vals[vi-4] ? " on" : "off");
+    } else if (vi == 8) {
       static const char* const RN[] = { "auto", "port", "land" };
       spr.print(RN[s.clockRot]);
-    } else if (i == 9) {
+    } else if (vi == 9) {
       uint8_t total = buddySpeciesCount() + (gifAvailable ? 1 : 0);
       uint8_t pos   = buddyMode ? buddySpeciesIdx() + 1 : total;
       spr.printf("%u/%u", pos, total);
@@ -1711,6 +1755,9 @@ void setup() {
 void loop() {
   esp_task_wdt_reset();   // pet the watchdog; loop normally cycles <100ms
   board::update();
+#ifdef BUDDY_EXTRAS_FULL
+  tuneTick();   // async jingle sequencer; no-op while idle
+#endif
   t++;
   uint32_t now = millis();
 
@@ -1764,8 +1811,15 @@ void loop() {
   static PersonaState prevActiveState = P_SLEEP;
   static uint32_t chimeNote2At = 0;
   if (activeState == P_CELEBRATE && prevActiveState != P_CELEBRATE) {
-    beep(2000, 100);
-    chimeNote2At = now + 130;
+#ifdef BUDDY_EXTRAS_FULL
+    if (tunesJingle(SLOT_DONE)) {
+      chimeNote2At = 0;   // the tune replaces both notes
+    } else
+#endif
+    {
+      beep(2000, 100);
+      chimeNote2At = now + 130;
+    }
   }
   if (chimeNote2At && (int32_t)(now - chimeNote2At) >= 0) {
     beep(2800, 150);
@@ -1796,7 +1850,7 @@ void loop() {
     if (tama.promptId[0]) {
       promptArrivedMs = millis();
       wake();
-      beep(1200, 80);   // alert chirp
+      TUNE_OR_BEEP(SLOT_ALERT, 1200, 80);   // alert
       // Jump to the approval screen no matter what was open — drawApproval
       // only runs from drawHUD which only runs in DISP_NORMAL.
       displayMode = DISP_NORMAL;
@@ -1898,7 +1952,7 @@ void loop() {
         responseSent = true;
         uint32_t tookS = (millis() - promptArrivedMs) / 1000;
         statsOnApproval(tookS);
-        beep(2400, 60);
+        TUNE_OR_BEEP(SLOT_APPROVE, 2400, 60);
         if (tookS < 5) triggerOneShot(P_HEART, 2000);
       } else if (askShowing()) {
         beep(1800, 30);
@@ -1996,7 +2050,7 @@ void loop() {
       sendCmd(cmd);
       responseSent = true;
       statsOnDenial();
-      beep(600, 60);
+      TUNE_OR_BEEP(SLOT_DENY, 600, 60);
     } else if (askShowing()) {
       beep(2400, 30);
       askDismissed = true;   // read-only card — B just puts it away
