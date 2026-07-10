@@ -95,6 +95,8 @@ cards to sticks that advertise the `ntfy` capability:
 [cards]
 enabled = true
 github = true                      # unread gh notifications (needs gh CLI)
+update_check = true                # firmware update-check card (default on)
+firmware_repo = "arikyeo/sticks3-buddy"  # override to point at a fork
 repos = ["arikyeo/sticks3-buddy"]  # optional: CI conclusion cards per repo
 weather_lat = 1.3521               # optional: Open-Meteo current weather
 weather_lon = 103.8198
@@ -104,6 +106,16 @@ GitHub cards go through the `gh` CLI (missing/unauthenticated `gh` degrades
 gracefully); weather polls the keyless Open-Meteo API every 30 min. Cards
 are deduped by content for 6 h and appended to `~/.buddy-bridge/cards.log`
 (tiny, one rotation). Nothing does network I/O while `enabled = false`.
+
+`update_check` (on by default once `enabled = true`) polls
+`https://api.github.com/repos/<firmware_repo>/releases/latest` every 6 h
+(keyless GitHub REST API via `urllib`, no `gh` dependency) and compares
+the release tag against the connected device's advertised firmware
+version (the `hello` ack's `data.fw`). A strictly newer release pushes
+one `"update"` ntfy card (`fw <tag> available` / `menu > update to
+install`) that the firmware renders; the same tag is never carded twice,
+and nothing fires until a v2 device has completed the hello handshake
+(unknown firmware version = nothing to compare against).
 
 ## Permission gate (fail-open by design)
 

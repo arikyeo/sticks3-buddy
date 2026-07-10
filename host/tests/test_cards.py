@@ -327,4 +327,5 @@ async def test_card_pollers_started_only_when_enabled(home):
     for task in tasks:
         with contextlib.suppress(asyncio.CancelledError):
             await task
-    assert names == ["github-cards", "weather-cards"]
+    # update-cards defaults to enabled once [cards] enabled, same as github
+    assert names == ["github-cards", "update-cards", "weather-cards"]

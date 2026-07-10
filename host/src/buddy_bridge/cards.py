@@ -37,6 +37,7 @@ CARD_QUEUE_MAX = 16
 KIND_GITHUB = "gh"
 KIND_CI = "ci"
 KIND_WEATHER = "weather"
+KIND_UPDATE = "update"
 
 
 @dataclass(frozen=True)

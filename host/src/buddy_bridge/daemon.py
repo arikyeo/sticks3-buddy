@@ -679,6 +679,12 @@ class Daemon:
 
     # ---- info cards (extras: ntfy) ----
 
+    def device_fw_version(self) -> str:
+        """Firmware version string from the last hello ack (``""`` when no
+        v2 device has completed the handshake yet). Consumed by the
+        update-check card poller to compare against the latest release."""
+        return self.hello_ack.fw if self.hello_ack is not None else ""
+
     def submit_card(self, card: Card) -> bool:
         """Adapter entry point: dedupe + log + queue. Delivery happens from
         the pump whenever a v2 link with the ntfy capability is up."""
@@ -769,6 +775,15 @@ class Daemon:
                     lon=self.cfg.cards_weather_lon,
                 )
                 tasks.append(asyncio.create_task(weather.run(), name="weather-cards"))
+            if self.cfg.cards_update_check:
+                from .adapters.update_cards import UpdateCardsPoller
+
+                updates = UpdateCardsPoller(
+                    self.submit_card,
+                    get_device_fw=self.device_fw_version,
+                    repo=self.cfg.cards_firmware_repo,
+                )
+                tasks.append(asyncio.create_task(updates.run(), name="update-cards"))
         return tasks
 
     async def run(self) -> None:
