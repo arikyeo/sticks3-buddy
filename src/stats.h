@@ -32,8 +32,12 @@ static bool _dirty = false;
 // typing is strict — getUInt on a u16 entry returns the default, silently
 // zeroing a device's history. Re-key both as u32, and seed s_bright (added in
 // the same wave) if absent so brightness starts at the documented default.
-// Idempotent: sv=1 short-circuits every boot after the first.
-static const uint8_t NVS_SCHEMA_V = 1;
+// v1 → v2: the sound on/off bool becomes a 0..4 volume level (s_vol). Seed
+// from the old s_snd so a muted device stays muted (false → 0, else default
+// 3). s_snd itself is left in place — old firmware can still boot off it —
+// it just stops being written.
+// Idempotent: sv=N short-circuits every boot after the first.
+static const uint8_t NVS_SCHEMA_V = 2;
 
 inline void nvsMigrate() {
   _prefs.begin("buddy", false);
@@ -45,7 +49,13 @@ inline void nvsMigrate() {
     _prefs.putUInt("appr", appr);
     _prefs.putUInt("deny", deny);
     if (!_prefs.isKey("s_bright")) _prefs.putUChar("s_bright", 4);
-    _prefs.putUChar("sv", NVS_SCHEMA_V);
+    _prefs.putUChar("sv", 1);
+  }
+  if (_prefs.getUChar("sv", 0) < 2) {
+    if (!_prefs.isKey("s_vol")) {
+      _prefs.putUChar("s_vol", _prefs.getBool("s_snd", true) ? 3 : 0);
+    }
+    _prefs.putUChar("sv", 2);
   }
   _prefs.end();
 }
@@ -205,7 +215,7 @@ inline uint8_t statsFedProgress() {
 // --- Settings --------------------------------------------------------------
 
 struct Settings {
-  bool sound;
+  uint8_t vol;   // 0..4, 0 = mute (replaces the old sound on/off bool)
   bool bt;
   bool wifi;     // placeholder — no WiFi stack linked yet, just stores the pref
   bool led;
@@ -214,11 +224,14 @@ struct Settings {
   uint8_t bright;    // 0..4 → ScreenBreath 20..100
 };
 
-static Settings _settings = { true, true, false, true, true, 0, 4 };
+static Settings _settings = { 3, true, false, true, true, 0, 4 };
 
 inline void settingsLoad() {
+  nvsMigrate();   // idempotent; setup() calls settingsLoad before statsLoad,
+                  // and s_vol seeding (v2) must land before the read below
   _prefs.begin("buddy", true);
-  _settings.sound    = _prefs.getBool("s_snd",   true);
+  _settings.vol      = _prefs.getUChar("s_vol", 3);   // seeded by nvsMigrate v2
+  if (_settings.vol > 4) _settings.vol = 4;
   _settings.bt       = _prefs.getBool("s_bt",    true);
   _settings.wifi     = _prefs.getBool("s_wifi",  false);
   _settings.led      = _prefs.getBool("s_led",   true);
@@ -232,7 +245,7 @@ inline void settingsLoad() {
 
 inline void settingsSave() {
   _prefs.begin("buddy", false);
-  _prefs.putBool("s_snd",    _settings.sound);
+  _prefs.putUChar("s_vol",   _settings.vol);
   _prefs.putBool("s_bt",     _settings.bt);
   _prefs.putBool("s_wifi",   _settings.wifi);
   _prefs.putBool("s_led",    _settings.led);

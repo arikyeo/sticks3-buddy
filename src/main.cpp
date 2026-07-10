@@ -121,8 +121,17 @@ static void wake() {
 }
 bool     responseSent = false;
 
+// Volume level 0..4 -> speaker master volume. 0 mutes: beep() drops the
+// tone entirely rather than playing it at volume 0.
+static const uint8_t VOL_MAP[5] = { 0, 64, 128, 190, 255 };
+static void applyVolume() {
+  uint8_t v = settings().vol;
+  if (v > 4) v = 4;
+  board::setVolume(VOL_MAP[v]);
+}
+
 static void beep(uint16_t freq, uint16_t dur) {
-  if (settings().sound) board::beep(freq, dur);
+  if (settings().vol) board::beep(freq, dur);
 }
 
 static void sendCmd(const char* json) {
@@ -152,7 +161,7 @@ const uint8_t MENU_N = 6;
 
 bool    settingsOpen = false;
 uint8_t settingsSel  = 0;
-const char* settingsItems[] = { "brightness", "sound", "bluetooth", "wifi", "led", "transcript", "clock rot", "ascii pet", "reset", "back" };
+const char* settingsItems[] = { "brightness", "volume", "bluetooth", "wifi", "led", "transcript", "clock rot", "ascii pet", "reset", "back" };
 const uint8_t SETTINGS_N = 10;
 
 bool    resetOpen = false;
@@ -170,7 +179,12 @@ static void applySetting(uint8_t idx) {
       applyBrightness();
       settingsSave();
       return;
-    case 1: s.sound = !s.sound; break;
+    case 1:
+      s.vol = (s.vol + 1) % 5;   // 0=mute .. 4=max
+      applyVolume();
+      settingsSave();
+      if (s.vol) board::beep(1800, 60);   // preview the new level
+      return;
     case 2:
       // BT toggle is a stored preference only — BLE stays live. Turning
       // BLE off cleanly would require tearing down the BLE stack which
@@ -270,7 +284,7 @@ static void drawSettings() {
   spr.drawRoundRect(mx, my, mw, mh, 4, p.textDim);
   spr.setTextSize(1);
   Settings& s = settings();
-  bool vals[] = { s.sound, s.bt, s.wifi, s.led, s.hud };
+  bool vals[] = { s.bt, s.wifi, s.led, s.hud };
   for (int i = 0; i < SETTINGS_N; i++) {
     bool sel = (i == settingsSel);
     spr.setTextColor(sel ? p.text : p.textDim, PANEL);
@@ -281,9 +295,12 @@ static void drawSettings() {
     spr.setTextColor(p.textDim, PANEL);
     if (i == 0) {
       spr.printf("%u/4", settings().bright);
-    } else if (i >= 1 && i <= 5) {
-      spr.setTextColor(vals[i-1] ? GREEN : p.textDim, PANEL);
-      spr.print(vals[i-1] ? " on" : "off");
+    } else if (i == 1) {
+      if (s.vol == 0) spr.print("mut");
+      else spr.printf("%u/4", s.vol);
+    } else if (i >= 2 && i <= 5) {
+      spr.setTextColor(vals[i-2] ? GREEN : p.textDim, PANEL);
+      spr.print(vals[i-2] ? " on" : "off");
     } else if (i == 6) {
       static const char* const RN[] = { "auto", "port", "land" };
       spr.print(RN[s.clockRot]);
@@ -984,6 +1001,7 @@ void setup() {
   startBt();
   settingsLoad();
   applyBrightness();
+  applyVolume();
   lastInteractMs = millis();
   statsLoad();
   petNameLoad();
@@ -1065,7 +1083,8 @@ void loop() {
 
   // 'Task complete' chime: paired with the celebrate animation. The buddy is
   // the visual notification, but without an audio cue you miss it entirely
-  // when looking at another screen. Respects settings().sound via beep().
+  // when looking at another screen. Respects settings().vol via beep()
+  // (vol 0 = mute drops the tones entirely).
   //
   // Two-note ascending chime (2000 Hz → 2800 Hz, the universal "ta-da" of
   // completion sounds) so it doesn't collide with the existing single-tone
