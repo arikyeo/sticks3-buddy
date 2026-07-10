@@ -49,6 +49,10 @@ class Config:
     ble_mode: str = "exclusive"  # exclusive | ondemand | off
     ble_name_prefix: str = "Claude"
     ble_address: str = ""
+    # exclusive mode only: minutes of local idleness (no running/waiting
+    # session, no pending prompt, no queued card) after which the daemon
+    # gracefully disconnects so other hosts can grab the stick. 0 = never.
+    idle_yield_min: int = 0
     # [ipc]
     ipc_port: int = 0  # 0 = ephemeral
     # [claude]
@@ -146,6 +150,7 @@ def load_config(home: Path | None = None, create: bool = True) -> Config:
         cfg.ble_mode = "exclusive"
     cfg.ble_name_prefix = _get_str(ble, "name_prefix", "Claude") or "Claude"
     cfg.ble_address = _get_str(ble, "address", "")
+    cfg.idle_yield_min = max(0, _get_int(ble, "idle_yield_min", 0))
 
     cfg.ipc_port = _get_int(ipc, "port", 0)
 
@@ -209,6 +214,7 @@ def to_toml(cfg: Config) -> str:
         f"mode = {_toml_str(cfg.ble_mode)}\n"
         f"name_prefix = {_toml_str(cfg.ble_name_prefix)}\n"
         f"address = {_toml_str(cfg.ble_address)}\n"
+        f"idle_yield_min = {int(cfg.idle_yield_min)}\n"
         "\n[ipc]\n"
         f"port = {cfg.ipc_port}\n"
         "\n[claude]\n"

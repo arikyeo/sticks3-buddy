@@ -114,6 +114,12 @@ class Daemon:
         self._last_send_ts = 0.0
         self._last_timesync_ts = 0.0
         self._last_status_poll_ts = 0.0
+        # yield-when-idle ([ble] idle_yield_min, exclusive mode only): after
+        # N idle minutes the daemon frees the stick for other hosts and
+        # retries slowly; any local activity snaps it back to a normal
+        # reconnect burst.
+        self.yielding = False
+        self._idle_since = 0.0
         self._ondemand_lock = asyncio.Lock()  # one on-demand gate at a time
         self._wifi_lock = asyncio.Lock()  # one wifi provisioning request at a time
         self._wifi_ack_future: Optional[asyncio.Future] = None
@@ -250,6 +256,8 @@ class Daemon:
             "uptime_sec": int(time.time() - self.started_at),
             "ble_mode": self.cfg.ble_mode,
             "ble_connected": self.link.connected,
+            "ble_yielding": self.yielding,
+            "idle_yield_min": self.cfg.idle_yield_min,
             "device": self.last_device_status,
             "host_id": self.cfg.host_id,
             "sessions": {"total": total, "running": running, "waiting": waiting},
@@ -309,6 +317,10 @@ class Daemon:
         if mode != self.cfg.ble_mode:
             log.info("daemon: ble mode %s -> %s", self.cfg.ble_mode, mode)
         self.cfg.ble_mode = mode
+        if self.yielding and mode != "exclusive":
+            self.yielding = False  # yield is an exclusive-mode state only
+            self.link.backoff_floor = 0.0
+        self._idle_since = 0.0
         await self.link.set_mode(mode)
         if mode != "off":
             self._ensure_ble_task()
@@ -319,6 +331,7 @@ class Daemon:
             self._tasks.append(self._ble_task)
 
     def handle_hook_mirror(self, msg: dict[str, Any]) -> None:
+        self.wake_from_yield()  # any hook event is local activity
         agent = msg.get("agent")
         if agent == "claude" and self.cfg.claude_enabled:
             claude_cli.handle_event(self.registry, msg)
@@ -341,6 +354,7 @@ class Daemon:
         prompt takes over. That is the answer for SAFE_TOOLS, unmatched
         (default) invocations, an unreachable device, and timeouts.
         """
+        self.wake_from_yield()  # a prompt is the strongest activity signal
         agent = str(msg.get("agent") or "claude")
         sid = str(msg.get("session_id") or "")
         tool = str(msg.get("tool_name") or "")
@@ -468,6 +482,13 @@ class Daemon:
     async def _on_ble_connect(self) -> None:
         # Spec order: hello first (nothing non-v1 before it completes), then
         # the v1 one-shots (time sync, owner), then the first heartbeat.
+        if self.yielding:
+            # A slow yield retry won the stick back (nobody else wanted it):
+            # exit yield and restart the idle clock from scratch.
+            log.info("daemon: reconnected while yielding, holding the stick again")
+            self.yielding = False
+            self.link.backoff_floor = 0.0
+        self._idle_since = 0.0
         self.negotiated_proto = protocol.PROTO_V1
         self.hello_ack = None
         self.device_sel = True
@@ -541,6 +562,59 @@ class Daemon:
         )
         self.link.backoff_floor = SLOW_RETRY_SECS
         await self.link.drop_connection()
+
+    # ---- yield-when-idle (share the stick between machines) ----
+
+    def _local_busy(self) -> bool:
+        """Anything that should keep the stick held (or wake it from yield):
+        a running/waiting session, a pending gate decision, a queued card."""
+        _, running, waiting = self.registry.counts()
+        return bool(running or waiting or self.router.pending_count() or self.cards.queue)
+
+    async def _maybe_idle_yield(self) -> None:
+        """Tick-driven idle clock. Only exclusive mode yields: ondemand
+        drops the link by itself and off never holds one."""
+        if self.yielding or self.cfg.idle_yield_min <= 0 or self.cfg.ble_mode != "exclusive":
+            return
+        if not self.link.connected or self._local_busy():
+            self._idle_since = 0.0
+            return
+        now = time.monotonic()
+        if not self._idle_since:
+            self._idle_since = now
+            return
+        if now - self._idle_since >= self.cfg.idle_yield_min * 60.0:
+            await self._yield_now(f"idle {self.cfg.idle_yield_min}min")
+
+    async def _yield_now(self, reason: str) -> None:
+        """Gracefully free the stick for other hosts: push one last clean
+        snapshot (so no stale prompt lingers on the display), drop the link,
+        and slow the reconnect cadence to SLOW_RETRY_SECS. The stick's AUTO
+        host selection lets the next active machine grab it; if one does,
+        our slow retries keep failing and we stay patient."""
+        if self.yielding or not self.link.connected:
+            return
+        log.info(
+            "daemon: yielding BLE to other hosts (%s); retrying every %.0fs",
+            reason, SLOW_RETRY_SECS,
+        )
+        self.yielding = True
+        self._idle_since = 0.0
+        await self._send_snapshot(force=True)
+        self.link.backoff_floor = SLOW_RETRY_SECS
+        await self.link.drop_connection()
+
+    def wake_from_yield(self) -> None:
+        """Local activity while yielded -> instant reconnect attempt burst at
+        normal backoff. If another host holds the stick, the attempts fail
+        (or hello-ack sel:false re-raises the floor) and we go patient again."""
+        if not self.yielding:
+            return
+        log.info("daemon: local activity, waking from yield")
+        self.yielding = False
+        self._idle_since = 0.0
+        self.link.backoff_floor = 0.0
+        self.link.wake()
 
     # Device decision vocabulary per REFERENCE.md ("once" approves) mapped
     # onto the router's allow/deny/ask; unknown values fail open to ask.
@@ -688,7 +762,10 @@ class Daemon:
     def submit_card(self, card: Card) -> bool:
         """Adapter entry point: dedupe + log + queue. Delivery happens from
         the pump whenever a v2 link with the ntfy capability is up."""
-        return self.cards.submit(card)
+        accepted = self.cards.submit(card)
+        if accepted:
+            self.wake_from_yield()  # a queued card wants the link back
+        return accepted
 
     async def _flush_cards(self) -> None:
         if not self.cap_active("ntfy") or not self.link.connected:
@@ -728,6 +805,7 @@ class Daemon:
             log.info("ble: no hello-ack within %.0fs, staying in protocol v1",
                      protocol.HELLO_ACK_TIMEOUT_SECS)
         await self._rxack_watch()
+        await self._maybe_idle_yield()
 
     async def _rxack_watch(self) -> None:
         """Send-side dead-link detection (PROTOCOL_V2.md rxack): we have sent

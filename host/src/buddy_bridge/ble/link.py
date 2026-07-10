@@ -139,6 +139,7 @@ class LinkManager:
         self.address = address.strip()
         self.mode = mode
         self.backoff_floor = 0.0
+        self._backoff = BACKOFF_BASE_SECS
         self._client = None  # BleakClient | None
         self._assembler = LineAssembler()
         self._connected_evt = asyncio.Event()
@@ -184,6 +185,15 @@ class LinkManager:
         self._want_evt.clear()
         await self.drop_connection()
 
+    def wake(self) -> None:
+        """Reset the reconnect backoff to base and interrupt any backoff
+        sleep in progress so the next connect attempt happens immediately.
+        Used by the daemon's yield-when-idle wake path and the relay's
+        "holder released the stick" nudge. Does NOT touch ``backoff_floor``
+        (the daemon owns that: sel:false soft-pin and yield state)."""
+        self._backoff = BACKOFF_BASE_SECS
+        self._poke()
+
     async def ensure_connected(self, timeout: float) -> bool:
         """Arm an ondemand connection and wait for it. True when connected."""
         if self.mode == "off":
@@ -227,7 +237,7 @@ class LinkManager:
         every iteration so ``set_mode`` takes effect live; while the mode is
         'off' (or ondemand with nothing armed) this idles without ever
         importing bleak or touching the radio."""
-        backoff = BACKOFF_BASE_SECS
+        self._backoff = BACKOFF_BASE_SECS
         consecutive_misses = 0
         while not self._stop_evt.is_set():
             if self.mode == "off" or (self.mode == "ondemand" and not self._want_evt.is_set()):
@@ -242,14 +252,14 @@ class LinkManager:
                     consecutive_misses += 1
                     log.info(
                         "ble: no buddy found, retry in %.1fs (miss #%d)",
-                        backoff,
+                        self._backoff,
                         consecutive_misses,
                     )
                     if await self._cycler.maybe_cycle(consecutive_misses):
-                        backoff = BACKOFF_BASE_SECS  # cycle slept ~4s; fresh fast retry
+                        self._backoff = BACKOFF_BASE_SECS  # cycle slept ~4s; fresh fast retry
                         continue
-                    await self._sleep(max(backoff, self.backoff_floor))
-                    backoff = min(backoff * 2, BACKOFF_MAX_SECS)
+                    await self._sleep(max(self._backoff, self.backoff_floor))
+                    self._backoff = min(self._backoff * 2, BACKOFF_MAX_SECS)
                     continue
                 consecutive_misses = 0
                 self._cycler.reset()
@@ -288,13 +298,13 @@ class LinkManager:
                 if connect_ts is not None and (
                     time.monotonic() - connect_ts >= STABLE_CONNECTION_SECS
                 ):
-                    backoff = BACKOFF_BASE_SECS
+                    self._backoff = BACKOFF_BASE_SECS
                 if self.mode == "off" or (
                     self.mode == "ondemand" and not self._want_evt.is_set()
                 ):
                     continue  # released/switched off: idle instead of backing off
-                await self._sleep(max(backoff, self.backoff_floor))
-                backoff = min(backoff * 2, BACKOFF_MAX_SECS)
+                await self._sleep(max(self._backoff, self.backoff_floor))
+                self._backoff = min(self._backoff * 2, BACKOFF_MAX_SECS)
 
     async def stop(self) -> None:
         self._stop_evt.set()
@@ -324,8 +334,20 @@ class LinkManager:
                         await fut
 
     async def _sleep(self, secs: float) -> None:
-        with contextlib.suppress(asyncio.TimeoutError):
-            await asyncio.wait_for(self._stop_evt.wait(), secs)
+        """Backoff sleep, cut short by stop() or a poke (wake/mode change/
+        ondemand arm) so external state changes take effect immediately."""
+        poke = asyncio.ensure_future(self._poke_evt.wait())
+        stop = asyncio.ensure_future(self._stop_evt.wait())
+        try:
+            await asyncio.wait({poke, stop}, timeout=secs, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            if poke.done() and not poke.cancelled():
+                self._poke_evt.clear()  # consumed: this sleep ended early for it
+            for fut in (poke, stop):
+                if not fut.done():
+                    fut.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await fut
 
     async def _find_device(self):
         from bleak import BleakScanner
