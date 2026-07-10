@@ -179,6 +179,10 @@ bool        protoXferCommand(JsonDocument& doc);    // v1 cmd path; true = consu
 void        protoSetClock(uint32_t epoch, int32_t tzOffsetSec);
 void        protoTokens(uint32_t bridgeTotal);
 bool        protoHelloAccept(const ProtoHello& h);  // registry store; returns data.sel
+// Persist WiFi credentials for the OTA flow ({"cmd":"wifi"} post-hello).
+// Returns false when the store failed; the caller has already validated
+// presence + length. Implementations must never log or echo the pass.
+bool        protoWifiCreds(const char* ssid, const char* pass);
 const char* protoBoardName();
 const char* protoDeviceName();
 #ifdef BUDDY_DEBUG
@@ -320,6 +324,24 @@ inline bool protoApplyJson(const char* line, TamaState* out, ProtoState* ps) {
     if (ok) protoPromptClear(out);
     char b[56];
     snprintf(b, sizeof(b), "{\"ack\":\"prompt_cancel\",\"ok\":%s}", ok ? "true" : "false");
+    protoEmit(b);
+    _protoMaybeRxAck(ps);
+    return true;
+  }
+  // WiFi credential provisioning for the OTA flow. Post-hello only, like
+  // prompt_cancel — pre-hello it falls into the v1 unknown-cmd swallow, so
+  // v1 byte-identity holds. Reaches the device over the encrypted BLE link
+  // or USB serial (physical access). Limits are the 802.11 maxima (SSID 32
+  // bytes, WPA2-PSK passphrase 63). The ack never echoes the values, and
+  // neither does anything else (status, debug_state, logs) — see the hook
+  // contract above.
+  if (cmd && strcmp(cmd, "wifi") == 0 && ps->helloSeen && ps->effProto >= 2) {
+    const char* ssid = doc["ssid"];
+    const char* pass = doc["pass"] | "";
+    bool ok = ssid && ssid[0] && strlen(ssid) <= 32 && strlen(pass) <= 63 &&
+              protoWifiCreds(ssid, pass);
+    char b[40];
+    snprintf(b, sizeof(b), "{\"ack\":\"wifi\",\"ok\":%s}", ok ? "true" : "false");
     protoEmit(b);
     _protoMaybeRxAck(ps);
     return true;

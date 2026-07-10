@@ -9,6 +9,10 @@ Covers the Track F P5 wire behavior end-to-end:
   4. sessions ingest   - heartbeat sessions[] lands in the device table
   5. prompt sid/qn     - v2 prompt targeting fields stored + prompt_cancel
   6. ask               - ask event stored (first question), ask_cancel clears
+  7. wifi provisioning - {"cmd":"wifi"} validation acks; nothing echoes the
+                         credentials. The store-success case OVERWRITES the
+                         device's saved WiFi creds, so it only runs with
+                         --wifi SSID [PASS] (Track F P8, OTA provisioning)
 
 Checks 4-6 introspect the device with {"cmd":"debug_state"}, which only
 exists in debug builds. Flash one first, e.g.:
@@ -124,6 +128,9 @@ def main():
     ap.add_argument("--port")
     ap.add_argument("--skip-debug", action="store_true",
                     help="skip checks that need a -DBUDDY_DEBUG build")
+    ap.add_argument("--wifi", nargs="+", metavar=("SSID", "PASS"),
+                    help="also store real WiFi creds and expect ok:true "
+                         "(OVERWRITES the device's saved creds)")
     args = ap.parse_args()
 
     b = Buddy(find_port(args.port))
@@ -177,6 +184,27 @@ def main():
     n2 = acks[-1].get("n", -1) if acks else -1
     check("rx counter monotonic", isinstance(n1, int) and isinstance(n2, int) and n2 > n1 >= 0,
           f"n1={n1} n2={n2}")
+
+    # ---- 7. wifi provisioning ---------------------------------------------------
+    # Validation rejects never reach NVS, so they're safe on anyone's device.
+    # Note the pre-hello swallow of {"cmd":"wifi"} was already covered in [1]
+    # by proxy (same v1 catch-all path as prompt_cancel).
+    print("[7] wifi provisioning")
+    b.send({"cmd": "wifi"})   # no ssid
+    ack = b.expect_ack("wifi")
+    check("wifi without ssid -> ok:false", ack is not None and ack.get("ok") is False, str(ack))
+    check("ack doesn't echo fields", ack is not None and "ssid" not in ack and "pass" not in ack,
+          str(ack))
+    b.send({"cmd": "wifi", "ssid": "a" * 33})   # over the 802.11 32-byte cap
+    ack = b.expect_ack("wifi")
+    check("oversize ssid -> ok:false", ack is not None and ack.get("ok") is False, str(ack))
+    if args.wifi:
+        ssid, pw = args.wifi[0], (args.wifi[1] if len(args.wifi) > 1 else "")
+        b.send({"cmd": "wifi", "ssid": ssid, "pass": pw})
+        ack = b.expect_ack("wifi")
+        check("real creds stored ok:true", ack is not None and ack.get("ok") is True, str(ack))
+        leaks = [l for l in b.raw if (ssid in l or (pw and pw in l)) and "cmd" not in l]
+        check("creds never echoed back", len(leaks) == 0, str(leaks[:3]))
 
     if args.skip_debug:
         done(b)

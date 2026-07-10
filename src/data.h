@@ -114,6 +114,14 @@ bool protoHelloAccept(const ProtoHello& h) {
   return hostGlueOnHello(h.id, h.name, h.app, h.viaBle);
 }
 
+// NVS "wifi" namespace via stats.h (xfer.h pulled it in above). Stored on
+// every board tier — a plain build can be provisioned first and flashed
+// with an -ota env later — but only BUDDY_OTA builds ever read it back.
+// No logging here on purpose: the pass must not reach the serial port.
+bool protoWifiCreds(const char* ssid, const char* pass) {
+  return wifiCredsStore(ssid, pass);
+}
+
 const char* protoBoardName()  { return board::name(); }
 const char* protoDeviceName() { return petName(); }
 

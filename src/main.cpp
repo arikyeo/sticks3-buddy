@@ -402,13 +402,17 @@ static void applyReset(uint8_t idx) {
   } else {
     // factory reset: NVS namespace wipes + filesystem format + BLE bonds.
     // Clears stats, owner, petname, species, settings, the host registry,
-    // GIF characters, and any stored LTKs so the next desktop has to re-pair.
+    // WiFi credentials, GIF characters, and any stored LTKs so the next
+    // desktop has to re-pair. (Forget-host deliberately does NOT touch the
+    // WiFi creds — hosts and networks are unrelated concerns; only the
+    // full privacy wipe takes them.)
     _prefs.begin("buddy", false);
     _prefs.clear();
     _prefs.end();
     _prefs.begin("hosts", false);
     _prefs.clear();
     _prefs.end();
+    wifiCredsWipe();
     LittleFS.format();
     bleClearBonds();
   }
