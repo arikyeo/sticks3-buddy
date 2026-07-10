@@ -2446,6 +2446,17 @@ void loop() {
   if (pk && !lastPasskey) { wake(); beep(1800, 60); }
   lastPasskey = pk;
 
+  // The pet/GIF paths deliberately repaint only their own bands, so pixels
+  // from a just-closed overlay would otherwise linger. One full clear on the
+  // overlay-close transition keeps them honest.
+  static bool prevOverlayOpen = false;
+  bool overlayOpen = forgetOpen || hostsOpen || resetOpen || settingsOpen ||
+                     extrasOpen || menuOpen || pk != 0;
+  if (prevOverlayOpen && !overlayOpen) {
+    spr.fillSprite(characterPalette().bg);
+  }
+  prevOverlayOpen = overlayOpen;
+
   if (napping || screenOff || landscapeClock) {
     // skip sprite render — face-down, powered off, or landscape clock
     // (which draws direct-to-LCD below)

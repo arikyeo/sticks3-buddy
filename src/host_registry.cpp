@@ -272,12 +272,30 @@ bool hostGlueOnHello(const char* hostId, const char* name, const char* app,
     utf8Sanitize(_usbName, sizeof(_usbName), name ? name : "");
     return true;
   }
-  if (_connSlot >= 0) {
-    hostTabHello(&_hosts, _connSlot, hostId, name, app);
-    strncpy(_bleName, _hosts.h[_connSlot].name, sizeof(_bleName) - 1);
-    _bleName[sizeof(_bleName) - 1] = 0;
-    _save();
+  // Route by the LIVE peer address, never the cached slot: pairing-window
+  // link churn (the evicted host's gate-rejected reconnect retries) can
+  // leave _connSlot stale, and a stale-slot write puts the new host's hello
+  // into the old host's record — the "hosts list lost the first host" live
+  // defect. hostTabHelloRoute also adopts an unknown-but-encrypted peer,
+  // healing a missed secure-transition adopt as a side effect.
+  uint8_t bda[6];
+  if (blePeerBda(bda)) {
+    int idx = hostTabHelloRoute(&_hosts, bda, hostId, name, app);
+    if (idx >= 0) {
+      if (_connSlot >= 0 && _connSlot != idx)
+        Serial.printf("[hosts] hello re-routed stale slot %d -> %d\n",
+                      _connSlot, idx);
+      _connSlot = idx;
+      strncpy(_bleName, _hosts.h[idx].name, sizeof(_bleName) - 1);
+      _bleName[sizeof(_bleName) - 1] = 0;
+      _save();
+    } else if (name && name[0]) {
+      // Table full and peer unknown: display-only fallback, no eviction —
+      // the boot reconcile owns capacity truth.
+      utf8Sanitize(_bleName, sizeof(_bleName), name);
+    }
   } else if (name && name[0]) {
+    // No live peer info — never guess a slot; display-only.
     utf8Sanitize(_bleName, sizeof(_bleName), name);
   }
   if (!_connSelected) {
