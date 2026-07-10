@@ -37,12 +37,23 @@ void bleRemoveCurrentBond();
 void bleClearBonds();
 
 // --- multi-host (Track F P4) --------------------------------------------------
-// Anti drive-by-bonding: outside an explicit pairing window, a connection
-// from a peer with no stored bond is dropped in onConnect, before pairing
-// can start. Exception: a device with zero bonds stays open so the first
-// out-of-box pairing needs no menu trip.
+// Connection gate (decision table: logic/pairing_gate_logic.h).
+// Normal mode — anti drive-by-bonding: a connection from a peer with no
+// stored bond is dropped in onConnect, before pairing can start. Exception:
+// a device with zero bonds stays open so the first out-of-box pairing needs
+// no menu trip.
+// Pairing window — exclusive courting of NEW devices: opening it evicts the
+// currently connected host (bonded hosts auto-reconnect after the window)
+// and, while it is open, the gate inverts — bonded peers are dropped on
+// connect and only unbonded peers may proceed to SMP pairing. The window is
+// RAM-only state: a reboot always lands in normal policy.
 void bleAllowPairing(bool open, uint32_t windowMs);
 uint32_t blePairingRemainingMs();   // 0 = window closed
+// Pairing-window housekeeping; call once per main loop() pass. Handles the
+// natural-expiry close and the post-eviction advertising fallback (start
+// advertising 500ms after window-open eviction if the peer's disconnect
+// event never landed).
+void blePairingTick(uint32_t nowMs);
 // BD address of the currently connected peer (identity address once the
 // stack resolved it). False when nothing is connected.
 bool blePeerBda(uint8_t out[6]);

@@ -326,6 +326,21 @@ silent or loose — pinned here so hosts don't have to reverse-engineer them.
   (drive-by-bonding guard). Exception: a device with zero stored bonds is
   open, preserving the out-of-box flow. NUS characteristics stay
   encrypted-only in both pairing modes (passkey and just-works).
+- **Pairing window courts NEW hosts exclusively** (the gate inverts while
+  it is open): opening the window disconnects the currently connected host
+  — bonded hosts auto-reconnect on their own once the window is over — and
+  connections from already-bonded peers are dropped on connect for the
+  window's duration, so a host that auto-reconnects on a short backoff
+  (stock Claude Desktop retries ~7s after any disconnect) cannot re-occupy
+  the single BLE link before the new machine gets to pair. The first
+  successful new bond ends the window immediately and normal advertising +
+  selection policy (auto/pinned) resume. Consequences hosts should know:
+  a reconnect attempt during someone else's pairing window is dropped
+  without a hello exchange — keep retrying on your normal backoff; and a
+  host that deleted its own keys is still bonded on the device, so it
+  cannot re-pair through a window until the user forgets it on the device
+  (hosts > forget...). The window is never persisted — a reboot always
+  boots into normal policy.
 - **Replies are dual-written** to USB serial and BLE, like every v1 ack —
   a host may see acks for the other transport's traffic and must ignore
   unknown/unexpected acks (the v1 tolerance rule, applied to acks).

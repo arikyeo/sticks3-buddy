@@ -1,5 +1,6 @@
 #include "ble_bridge.h"
 #include "config.h"
+#include "logic/pairing_gate_logic.h"
 #include <BLEDevice.h>
 #include <BLEServer.h>
 #include <BLEUtils.h>
@@ -43,10 +44,20 @@ static volatile uint16_t  mtu = 23;
 static esp_bd_addr_t      peerAddr;
 static volatile bool      hasPeer = false;
 
-// Pairing window (Track F P4): while non-zero and in the future, unbonded
-// peers may connect and pair. Written from the main loop, read in the BLE
-// stack task's onConnect.
+// Pairing window (Track F P4): while non-zero and in the future, ONLY
+// unbonded peers may connect and pair — bonded hosts are evicted/rejected
+// for the window's duration so a new machine gets the link to itself (see
+// pairingGateDecision). Written from the main loop, read in the BLE stack
+// task's onConnect.
 static volatile uint32_t  pairWinUntil = 0;
+
+// Deadline for the advertising fallback after the window-open eviction:
+// normally the evicted peer's disconnect event lands within a connection
+// interval and onDisconnect restarts advertising, but if the event stalls
+// (peer vanished — supervision timeout still counting), blePairingTick()
+// force-starts advertising at this deadline so the window is never dark.
+// Cleared by onDisconnect (event landed) or on window close.
+static volatile uint32_t  pairWinAdvKickAt = 0;
 
 // Requested link mode (Track F P7): main.cpp latches the intent (relaxed on
 // screen-off, tight on wake); the wire update is (re)applied on every call
@@ -123,15 +134,27 @@ class ServerCallbacks : public BLEServerCallbacks {
   void onConnect(BLEServer* s, esp_ble_gatts_cb_param_t* param) override {
     memcpy((void*)peerAddr, param->connect.remote_bda, sizeof(esp_bd_addr_t));
     hasPeer = true;
-    // Anti drive-by-bonding gate: outside an explicit pairing window, only
-    // already-bonded peers may stay connected — drop unknowns here, before
-    // SMP pairing can even start. A device with zero bonds stays open so
-    // the first out-of-box pairing needs no menu trip. (Bonded peers using
-    // RPAs are resolved to their identity address by the stack before this
-    // event, since their IRKs sit in the controller resolving list.)
-    if (!_pairWindowOpen() && esp_ble_get_bond_device_num() > 0 &&
-        !_isBonded(peerAddr)) {
-      Serial.println("[ble] rejecting unbonded peer (pairing window closed)");
+    // Connection gate — decision table in logic/pairing_gate_logic.h.
+    // Normal mode: anti drive-by-bonding, drop unbonded peers before SMP
+    // can start (zero-bond device stays open for the out-of-box flow).
+    // Pairing window: INVERTED — the window courts new devices exclusively,
+    // so already-bonded hosts are dropped (they auto-retry after the window)
+    // and only unbonded peers proceed to SMP. (Bonded peers using RPAs are
+    // resolved to their identity address by the stack before this event,
+    // since their IRKs sit in the controller resolving list — so a host
+    // that deleted its own keys still gates as bonded here and must be
+    // forgotten on the device before it can re-pair through a window.)
+    bool win = _pairWindowOpen();
+    if (pairingGateDecision(win, _isBonded(peerAddr),
+                            esp_ble_get_bond_device_num()) == PAIRGATE_REJECT) {
+      if (win) {
+        Serial.printf("[ble] pairwin reject bonded peer "
+                      "%02x:%02x:%02x:%02x:%02x:%02x (window is for new hosts)\n",
+                      peerAddr[0], peerAddr[1], peerAddr[2],
+                      peerAddr[3], peerAddr[4], peerAddr[5]);
+      } else {
+        Serial.println("[ble] rejecting unbonded peer (pairing window closed)");
+      }
       hasPeer = false;
       s->disconnect(param->connect.conn_id);
       return;
@@ -150,6 +173,9 @@ class ServerCallbacks : public BLEServerCallbacks {
     passkey = 0;
     mtu = 23;
     hasPeer = false;
+    // The disconnect event landed — the advertising restart below covers the
+    // pairing-window eviction too, so the tick fallback can stand down.
+    pairWinAdvKickAt = 0;
     Serial.println("[ble] disconnected");
     // Restart advertising so the next client can find us.
     BLEDevice::startAdvertising();
@@ -248,11 +274,57 @@ void bleAllowPairing(bool open, uint32_t windowMs) {
   if (open) {
     uint32_t until = millis() + windowMs;
     pairWinUntil = until == 0 ? 1 : until;   // 0 means closed — dodge wraparound
-    Serial.printf("[ble] pairing window open for %lus\n",
+    Serial.printf("[ble] pairwin open %lus\n",
                   (unsigned long)(windowMs / 1000));
+    if (connected) {
+      // The window courts NEW devices exclusively, and we don't advertise
+      // while a link is up — so evict the current host first. It's bonded;
+      // it will auto-reconnect once the window closes (its retry backoff is
+      // its own). The window stamp is already set above, so even an instant
+      // reconnect race lands on the bonded-peer reject in onConnect.
+      // Advertising restarts in onDisconnect when the disconnect event
+      // lands; the 500ms deadline below is the fallback path in
+      // blePairingTick() for a stalled event.
+      Serial.println("[ble] pairwin evict connected peer");
+      pairWinAdvKickAt = millis() + 500;
+      bleDisconnect();
+    } else {
+      // Not connected — advertising should already be running (it restarts
+      // on every disconnect), but make sure the window never starts dark.
+      // Starting an already-started advertiser is a harmless no-op.
+      BLEDevice::startAdvertising();
+    }
   } else {
+    // Idempotent + quiet: the registry closes the window unconditionally on
+    // every fresh bond (also the windowless out-of-box pairing), so only
+    // log when a window was actually open.
+    if (pairWinUntil != 0) Serial.println("[ble] pairwin close");
     pairWinUntil = 0;
-    Serial.println("[ble] pairing window closed");
+    pairWinAdvKickAt = 0;
+  }
+}
+
+void blePairingTick(uint32_t nowMs) {
+  // Natural expiry: zero the stamp so "[ble] pairwin close" fires exactly
+  // once per window no matter how it ends. (The gate itself never needs
+  // this — _pairWindowOpen() is time-checked — it's for logs and so
+  // blePairingRemainingMs() consumers see a clean 0.)
+  uint32_t u = pairWinUntil;
+  if (u != 0 && (int32_t)(nowMs - u) >= 0) {
+    pairWinUntil = 0;
+    pairWinAdvKickAt = 0;
+    Serial.println("[ble] pairwin close (expired, nothing paired)");
+  }
+  // Eviction fallback: the disconnect event hasn't landed within 500ms of
+  // opening the window (peer vanished mid-air; supervision timeout can run
+  // seconds). Force advertising so the new device can find us — if the
+  // event did land, onDisconnect cleared this deadline and already
+  // restarted advertising.
+  uint32_t k = pairWinAdvKickAt;
+  if (k != 0 && (int32_t)(nowMs - k) >= 0) {
+    pairWinAdvKickAt = 0;
+    Serial.println("[ble] pairwin adv fallback (disconnect event late)");
+    BLEDevice::startAdvertising();
   }
 }
 

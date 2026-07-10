@@ -723,8 +723,13 @@ static void hostsConfirm() {
     hostGlueSetPin(-1);
     showToast("host: auto");
   } else if (hostsSel == n + 1) {
-    // add host: toggle the 60s open-pairing window. The passkey screen takes
-    // over automatically once a peer starts pairing (blePasskey() path).
+    // add host: toggle the 60s pairing window. Opening it evicts the
+    // currently connected host and rejects bonded peers for the duration —
+    // the window exclusively courts the NEW machine (see ble_bridge.h).
+    // The passkey screen takes over automatically once a peer starts
+    // pairing (blePasskey() path); a successful pairing ends the window
+    // early (the countdown row above flips back to "add host...") and
+    // toasts "paired: <name>" from loop().
     bool open = blePairingRemainingMs() > 0;
     hostGluePairWindow(!open);
     if (!open) showToast("pairing open 60s");
@@ -1971,7 +1976,19 @@ void loop() {
   t++;
   uint32_t now = millis();
 
+  blePairingTick(now); // pairing-window expiry + post-evict adv fallback
   hostGluePoll(now);   // multi-host policy engine (soft-pin, pairing window)
+  // A NEW host completed bonding (pairing window or out-of-box): confirm on
+  // screen. Name is the adopt-time placeholder (Host-N) until its hello
+  // lands and renames it in the registry.
+  {
+    char pairedName[24];
+    if (hostGlueTakePaired(pairedName, sizeof(pairedName))) {
+      char t[32];
+      snprintf(t, sizeof(t), "paired: %s", pairedName);
+      showToast(t, 2400);
+    }
+  }
   dataPoll(&tama);
   if (statsPollLevelUp()) triggerOneShot(P_CELEBRATE, 3000);
   baseState = derive(tama);

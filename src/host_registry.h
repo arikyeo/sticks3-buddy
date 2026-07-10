@@ -117,7 +117,11 @@ bool        hostGlueOnHello(const char* hostId, const char* name,
                             const char* app, bool viaBle);
 void        hostGlueSetPin(int8_t slot);    // -1 = auto; kicks a mismatched link
 int8_t      hostGluePin();
-void        hostGluePairWindow(bool open);  // 60s open-pairing window
+// 60s new-host pairing window: evicts the current link, rejects bonded
+// peers while open (ble_bridge gate), first new bond ends it early.
+void        hostGluePairWindow(bool open);
+// One-shot poll for the "paired: <name>" toast; true = out was filled.
+bool        hostGlueTakePaired(char* out, size_t cap);
 void        hostGlueForget(uint8_t slot);   // remove bond + registry entry
 void        hostGlueForgetAll();            // bonds + "hosts" namespace wipe
 uint8_t     hostGlueCount();
