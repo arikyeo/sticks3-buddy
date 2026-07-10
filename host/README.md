@@ -62,6 +62,21 @@ On Windows, 5 consecutive scan misses trigger an automatic Bluetooth radio
 power-cycle (max 3 attempts, 120 s cooldown) to unstick the WinRT scanner —
 this briefly drops *all* BT devices, so it is deliberately rationed.
 
+## WiFi provisioning
+
+```powershell
+buddy-bridge wifi <ssid>         # prompts for the password
+```
+
+Sends `{"cmd":"wifi","ssid":...,"pass":...}` to the connected buddy over
+the running daemon's IPC and waits up to 10 s for
+`{"ack":"wifi","ok":true|false}`. Requires protocol v2 — a stopped daemon,
+a disconnected link, or a v1-only stick all print a clear error and exit
+1, and the password is never requested in that case. The password is read
+with `getpass` (no terminal echo): it never appears on the command line
+or in shell history, and is never written to a log line, `audit.jsonl`,
+or `cards.log`.
+
 ## Protocol v2
 
 Every connection opens with a `hello`; a stick that acks `proto >= 2` gets

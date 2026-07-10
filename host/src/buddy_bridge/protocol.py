@@ -367,6 +367,20 @@ def build_prompt_cancel(wire_id: str) -> str:
     return dumps({"cmd": "prompt_cancel", "id": wire_id})
 
 
+def build_wifi_frame(ssid: str, password: str) -> str:
+    """{"cmd":"wifi","ssid":...,"pass":...} — WiFi provisioning, proto>=2 only.
+
+    Unlike every other builder here, ``ssid``/``password`` are NOT run
+    through :func:`sanitize`: that function is for *display* text
+    (glyph-maps dashes/quotes, drops control chars, folds non-latin1 to
+    '?') and would corrupt credential bytes that must round-trip exactly
+    for the AP handshake to succeed. ``dumps()`` still guarantees a
+    pure-ASCII wire via JSON's ``ensure_ascii`` \\uXXXX escaping, so line
+    framing is never at risk.
+    """
+    return dumps({"cmd": "wifi", "ssid": ssid, "pass": password})
+
+
 def build_ask_evt(
     ask_id: str,
     questions: Sequence[dict],

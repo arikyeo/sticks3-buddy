@@ -1,6 +1,6 @@
 """buddy-bridge CLI.
 
-Subcommands: daemon | status | probe | pair | mode | sessions |
+Subcommands: daemon | status | probe | pair | mode | wifi | sessions |
 hooks install/uninstall claude|codex | service install/uninstall | doctor | setup
 """
 
@@ -34,6 +34,8 @@ def main(argv: list[str] | None = None) -> int:
     p_pair.add_argument("--timeout", type=float, default=5.0)
     p_mode = sub.add_parser("mode", help="get or set BLE mode")
     p_mode.add_argument("value", nargs="?", choices=_BLE_MODES)
+    p_wifi = sub.add_parser("wifi", help="provision WiFi credentials on the connected buddy")
+    p_wifi.add_argument("ssid", help="WiFi network name (SSID); password is prompted")
     p_hooks = sub.add_parser("hooks", help="install/uninstall agent hooks")
     p_hooks.add_argument("action", choices=("install", "uninstall"))
     p_hooks.add_argument("agent", choices=("claude", "codex"))
@@ -50,6 +52,7 @@ def main(argv: list[str] | None = None) -> int:
         "probe": cmd_probe,
         "pair": cmd_pair,
         "mode": cmd_mode,
+        "wifi": cmd_wifi,
         "hooks": cmd_hooks,
         "service": cmd_service,
         "doctor": cmd_doctor,
@@ -159,6 +162,36 @@ def cmd_mode(args: argparse.Namespace) -> int:
         print(f"ble mode set to {cfg.ble_mode} (applied to the running daemon)")
     else:
         print(f"ble mode set to {cfg.ble_mode} (no running daemon; applies on next start)")
+    return 0
+
+
+_WIFI_REQUEST_TIMEOUT_SECS = 12.0  # > daemon's own 10s device-ack wait + IPC round-trip headroom
+
+
+def cmd_wifi(args: argparse.Namespace) -> int:
+    """Provision WiFi credentials on the connected buddy. The password is
+    never a CLI argument (so it never lands in shell history or a process
+    list) — it's read via getpass, sent to the daemon over the local IPC
+    socket, and never printed, logged, or written to audit.jsonl/cards.log."""
+    import getpass
+
+    home = bridge_home()
+    # Check liveness before prompting: no point asking for a password that
+    # has nowhere to go.
+    if load_live_endpoint(home) is None:
+        print("daemon: not running (start it with `buddy-bridge daemon`)")
+        return 1
+    password = getpass.getpass("WiFi password: ")
+    resp = _daemon_request(
+        {"event": "wifi", "ssid": args.ssid, "pass": password}, _WIFI_REQUEST_TIMEOUT_SECS
+    )
+    if resp is None:
+        print("daemon: not running")
+        return 1
+    if not resp.get("ok"):
+        print(f"wifi: {resp.get('error') or 'device rejected the credentials'}")
+        return 1
+    print(f"wifi: credentials sent to the buddy ({args.ssid!r})")
     return 0
 
 
