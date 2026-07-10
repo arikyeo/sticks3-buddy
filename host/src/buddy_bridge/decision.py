@@ -7,6 +7,13 @@ otherwise a deterministic short id ``p<counter>`` is minted. The router maps
 wire id -> (agent, sid, canonical tool_use_id) and holds one asyncio.Future
 per pending request. A timeout always resolves to "ask" (fail open to the
 native prompt).
+
+Federation (relay v2) adds a remote-route table: prompts mirrored from peer
+machines carry namespaced wire ids (``r<k>.<orig>``, see federation.py) that
+map to (peer host_id, origin wire id) here, so a device decision that isn't
+for a local pending can be relayed back to the machine that asked. Local
+wire ids never enter that namespace: a tool_use_id that *looks* namespaced
+gets a minted id instead.
 """
 
 from __future__ import annotations
@@ -14,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import itertools
 import json
+import re
 import time
 from dataclasses import dataclass
 from typing import Optional
@@ -24,6 +32,10 @@ ASK = "ask"
 DECISIONS = (ALLOW, DENY, ASK)
 
 WIRE_ID_MAX = 39
+
+# The remote namespace (federation.py): r<k>.<...> for prompt/ask ids and
+# r<k>:<...> for sids. Local wire ids must never be mistaken for it.
+_REMOTE_NS = re.compile(r"^r\d+[.:]")
 
 
 def _wire_safe(candidate: str) -> bool:
@@ -79,6 +91,7 @@ class DecisionRouter:
     def __init__(self) -> None:
         self._pending: dict[str, PendingDecision] = {}
         self._counter = itertools.count(1)
+        self._remote_routes: dict[str, tuple[str, str]] = {}  # wire -> (peer, orig)
 
     def create(
         self,
@@ -91,7 +104,12 @@ class DecisionRouter:
         detail: str = "",
     ) -> PendingDecision:
         canonical = str(tool_use_id or "")
-        if _wire_safe(canonical) and canonical not in self._pending:
+        if (
+            _wire_safe(canonical)
+            and canonical not in self._pending
+            and canonical not in self._remote_routes
+            and not _REMOTE_NS.match(canonical)
+        ):
             wire_id = canonical
         else:
             wire_id = f"p{next(self._counter)}"
@@ -156,3 +174,19 @@ class DecisionRouter:
 
     def pending_count(self) -> int:
         return len(self._pending)
+
+    # ---- remote routes (federation) ----
+
+    def register_remote(self, wire_id: str, peer: str, orig_id: str) -> None:
+        """Map a namespaced remote wire id to (peer host_id, origin wire id)."""
+        if wire_id and peer and orig_id:
+            self._remote_routes[wire_id] = (peer, orig_id)
+
+    def unregister_remote(self, wire_id: str) -> None:
+        self._remote_routes.pop(wire_id, None)
+
+    def remote_route(self, wire_id: str) -> Optional[tuple[str, str]]:
+        return self._remote_routes.get(wire_id)
+
+    def remote_route_count(self) -> int:
+        return len(self._remote_routes)
