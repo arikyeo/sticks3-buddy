@@ -18,6 +18,10 @@
 #include "audio/tunes.h"   // tune engine + slot registry (8MB boards only)
 #include "ir/ir_remote.h"  // raw RMT learn/replay (8MB boards only)
 #endif
+#ifdef BUDDY_OTA
+#include "ota/ota.h"       // WiFi OTA from GitHub releases (-ota envs only)
+#endif
+#include "esp_ota_ops.h"   // rollback mark-valid on healthy boot (all builds)
 
 #ifdef BUDDY_DEBUG
 #include "esp_system.h"
@@ -121,9 +125,45 @@ static bool isFaceDown() {
 static void screenBreath(uint8_t v0_100) { board::setBrightness((uint8_t)((uint16_t)v0_100 * 255 / 100)); }
 static void applyBrightness() { screenBreath(20 + settings().bright * 20); }
 
+// --- Screen-off power scaling (Track F P7, ttpears pattern) -----------------
+// While the screen is off, drop the core clock and relax the BLE connection
+// interval; wake() restores both. 80MHz is the radio-safe floor on every
+// supported die — the BT radio needs the APB at >=80MHz (ttpears bench: at
+// 40MHz the link goes dark while screen-off) — so the downclock never has to
+// differ per board. Overridable from a bench build. esp_pm/light-sleep is a
+// separate, deliberately-skipped lever (needs an IDF-tuned build; future).
+#ifndef BUDDY_SCREEN_OFF_CPU_MHZ
+#define BUDDY_SCREEN_OFF_CPU_MHZ 80
+#endif
+// Full clock to restore on wake. Captured at boot instead of hardcoding 240:
+// the m5stickc-plus env pins f_cpu to 160MHz for its power budget, and wake()
+// must not overclock past what the env configured.
+static uint32_t cpuFullMhz = 240;
+
+// True while something latency- or timing-critical is running that must veto
+// the screen-off downclock: a character transfer (flash writes + BLE
+// throughput), an IR learn (RMT capture), or an OTA update. OTA and IR-learn
+// only run with the screen on today, but the guard keeps that invariant
+// explicit rather than incidental.
+static bool powerBusyGuard() {
+  if (xferActive()) return true;
+#ifdef BUDDY_EXTRAS_FULL
+  if (irLearning()) return true;
+#endif
+#ifdef BUDDY_OTA
+  if (otaInProgress()) return true;
+#endif
+  return false;
+}
+
 static void wake() {
   lastInteractMs = millis();
   if (screenOff) {
+    // Order matters: full clock first (render + JSON parse speed), then the
+    // tight BLE link (prompt/transcript delivery), then light the panel —
+    // so by the time pixels appear the pipe behind them is already fast.
+    setCpuFrequencyMhz(cpuFullMhz);
+    bleConnParams(false);
     board::screenPower(true);
     applyBrightness();
     screenOff = false;
@@ -185,8 +225,15 @@ void applyDisplayMode() {
   characterInvalidate();  // redraws character on next tick (text mode path)
 }
 
+// OTA builds append an "update..." row (kept just above "close" so the
+// muscle-memory indices of everything else survive across build tiers).
+#ifdef BUDDY_OTA
+const char* menuItems[] = { "hosts", "settings", "extras", "turn off", "help", "about", "demo", "update...", "close" };
+const uint8_t MENU_N = 9;
+#else
 const char* menuItems[] = { "hosts", "settings", "extras", "turn off", "help", "about", "demo", "close" };
 const uint8_t MENU_N = 8;
+#endif
 
 // extras: pomodoro (and, on BUDDY_EXTRAS_FULL builds, more) live on a
 // screen parked OUTSIDE the A-press carousel — reached via menu > extras,
@@ -369,13 +416,17 @@ static void applyReset(uint8_t idx) {
   } else {
     // factory reset: NVS namespace wipes + filesystem format + BLE bonds.
     // Clears stats, owner, petname, species, settings, the host registry,
-    // GIF characters, and any stored LTKs so the next desktop has to re-pair.
+    // WiFi credentials, GIF characters, and any stored LTKs so the next
+    // desktop has to re-pair. (Forget-host deliberately does NOT touch the
+    // WiFi creds — hosts and networks are unrelated concerns; only the
+    // full privacy wipe takes them.)
     _prefs.begin("buddy", false);
     _prefs.clear();
     _prefs.end();
     _prefs.begin("hosts", false);
     _prefs.clear();
     _prefs.end();
+    wifiCredsWipe();
     LittleFS.format();
     bleClearBonds();
   }
@@ -473,6 +524,50 @@ static void drawReset() {
   drawMenuHints(p, mx, mw, my + mh - 12);
 }
 
+#ifdef BUDDY_OTA
+// OTA progress screen. The whole flow is blocking (otaRun), so this
+// callback is the only thing painting; the full-sprite redraw + single
+// pushSprite per change is inherently flicker-free (the oh001738 fix, but
+// on a sprite instead of per-glyph LCD writes), and the dedupe of repeat
+// (status,pct) pairs happens in ota.cpp.
+static void otaDrawProgress(const char* status, int pct) {
+  const Palette& p = characterPalette();
+  spr.fillSprite(p.bg);
+  spr.setTextSize(1);
+  spr.setTextColor(p.body, p.bg);
+  spr.setCursor(8, 56);  spr.print("FIRMWARE UPDATE");
+  spr.setTextColor(p.text, p.bg);
+  spr.setCursor(8, 96);  spr.printf("%.20s", status);
+  const int BX = 8, BW = W - 16, BH = 10, BY = 120;
+  spr.drawRect(BX, BY, BW, BH, p.textDim);
+  if (pct >= 0) {
+    int fill = (int)((int32_t)(BW - 2) * pct / 100);
+    if (fill > 0) spr.fillRect(BX + 1, BY + 1, fill, BH - 2, p.body);
+    spr.setTextColor(p.textDim, p.bg);
+    spr.setCursor(8, 138); spr.printf("%d%%", pct);
+  }
+  spr.setTextColor(p.textDim, p.bg);
+  spr.setCursor(8, 184);  spr.print("keep power on");
+  spr.setCursor(8, 194);  spr.print("ble stays paired");
+  spr.pushSprite(0, 0);
+}
+
+// menu > update... — the consent step. Blocks until flashed (device
+// reboots inside otaRun) or failed/up-to-date, which lands back here.
+static void otaStart() {
+  char err[64];
+  otaRun(otaDrawProgress, err, sizeof(err));
+  // Only failure paths return. Leave the message up long enough to read,
+  // then hand the screen back to the normal render loop.
+  otaDrawProgress(err[0] ? err : "update failed", -1);
+  delay(2500);
+  showToast(err[0] ? err : "update failed", 2600);
+  applyDisplayMode();
+  characterInvalidate();
+  if (buddyMode) buddyInvalidate();
+}
+#endif
+
 void menuConfirm() {
   switch (menuSel) {
     case 0: hostsOpen = true; menuOpen = false; hostsSel = 0; break;
@@ -488,7 +583,12 @@ void menuConfirm() {
       characterInvalidate();
       break;
     case 6: dataSetDemo(!dataDemo()); break;
+#ifdef BUDDY_OTA
+    case 7: menuOpen = false; otaStart(); break;
+    case 8: menuOpen = false; characterInvalidate(); break;
+#else
     case 7: menuOpen = false; characterInvalidate(); break;
+#endif
   }
 }
 
@@ -1594,6 +1694,10 @@ static uint16_t cardKindColor(const char* kind, const Palette& p) {
   if (strcmp(kind, "gh") == 0) return p.body;
   if (strcmp(kind, "ci") == 0) return GREEN;
   if (strcmp(kind, "weather") == 0 || strcmp(kind, "wx") == 0) return 0x07FF;
+  // firmware-update-available badge (bridge-pushed; see PROTOCOL_V2.md).
+  // Hot tag = "worth a look", but it's still just a card — updating stays
+  // a deliberate walk to menu > update... on OTA builds.
+  if (strcmp(kind, "update") == 0) return HOT;
   return p.textDim;   // unknown kinds render generic, per spec
 }
 
@@ -1744,6 +1848,9 @@ void drawHUD() {
 void setup() {
   board::begin();        // M5.begin + speaker + per-board power/LED setup
   board::serialInit();
+  // The env-configured full clock (S3/Plus2 240MHz, Plus 160MHz) — what
+  // wake() restores after the screen-off downclock.
+  cpuFullMhz = getCpuFrequencyMhz();
   M5.Display.setRotation(0);
   settingsLoad();                 // before startBt: bleInit needs s_pair
   startBt(settings().pair);
@@ -2371,6 +2478,35 @@ void loop() {
     board::screenPower(false);
     screenOff = true;
   }
+
+  // P7 power scaling, applied lazily so one site covers every path into
+  // screen-off (idle timeout above, the power-button toggle) AND the case
+  // where a busy guard (xfer / IR-learn / OTA) vetoed the downclock at the
+  // transition and cleared later. BLE keeps serving at 80MHz — its
+  // controller clock is the independent 40MHz XTAL — so prompts still
+  // arrive and double-tap/flip gestures still run; wake() restores.
+  if (screenOff && !powerBusyGuard() &&
+      getCpuFrequencyMhz() != BUDDY_SCREEN_OFF_CPU_MHZ) {
+    bleConnParams(true);   // relax link first — it's a queued radio request
+    setCpuFrequencyMhz(BUDDY_SCREEN_OFF_CPU_MHZ);
+  }
+
+#ifdef CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE
+  // OTA rollback safety: the arduino core ships with bootloader rollback
+  // on, so a slot written by OTA boots as PENDING_VERIFY and the bootloader
+  // reverts to the previous slot on the NEXT reboot unless the app marks
+  // itself valid. 15s of uptime with BLE up and the loop alive is the
+  // "healthy" bar — a boot-crash or a wedged loop trips the 12s TWDT first,
+  // and that reboot is exactly what triggers the fallback. Lives in ALL
+  // builds, not just -DBUDDY_OTA: an -ota device can flash a plain release
+  // image, and that image must self-validate too or it rolls back after
+  // its first reboot. No-op (state != pending-verify) on esptool flashes.
+  static bool otaSlotValidated = false;
+  if (!otaSlotValidated && now > 15000) {
+    otaSlotValidated = true;
+    esp_ota_mark_app_valid_cancel_rollback();
+  }
+#endif
 
   delay(screenOff ? 100 : 16);
 }

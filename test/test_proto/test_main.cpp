@@ -43,6 +43,13 @@ void protoSetClock(uint32_t epoch, int32_t tz) {
 }
 void protoTokens(uint32_t total) { g_tokens = total; g_tokenCalls++; }
 bool protoHelloAccept(const ProtoHello& h) { g_hello = h; g_helloCalls++; return g_helloSel; }
+static std::string g_wifiSsid, g_wifiPass;
+static int  g_wifiCalls = 0;
+static bool g_wifiStoreOk = true;
+bool protoWifiCreds(const char* ssid, const char* pass) {
+  g_wifiSsid = ssid; g_wifiPass = pass ? pass : ""; g_wifiCalls++;
+  return g_wifiStoreOk;
+}
 const char* protoBoardName()  { return "TestBoard"; }
 const char* protoDeviceName() { return "Buddy"; }
 
@@ -73,6 +80,7 @@ void setUp() {
   g_xferCalls = 0; g_clockCalls = 0; g_tokenCalls = 0; g_helloCalls = 0;
   g_clockEpoch = 0; g_clockTz = 0; g_tokens = 0;
   g_helloSel = true;
+  g_wifiSsid.clear(); g_wifiPass.clear(); g_wifiCalls = 0; g_wifiStoreOk = true;
   g_now = 1000;
 }
 void tearDown() {}
@@ -398,6 +406,44 @@ void test_no_rxack_without_host_cap() {
   TEST_ASSERT_EQUAL_INT(0, (int)g_emits.size());
 }
 
+// ---- wifi provisioning (Track F P8) ------------------------------------------
+void test_wifi_cmd_post_hello_stores_and_acks() {
+  doHello();
+  feed("{\"cmd\":\"wifi\",\"ssid\":\"HomeNet\",\"pass\":\"hunter22\"}");
+  TEST_ASSERT_EQUAL_INT(1, g_wifiCalls);
+  TEST_ASSERT_EQUAL_STRING("HomeNet", g_wifiSsid.c_str());
+  TEST_ASSERT_EQUAL_STRING("hunter22", g_wifiPass.c_str());
+  TEST_ASSERT_EQUAL_INT(1, emitsContaining("\"ack\":\"wifi\",\"ok\":true"));
+  // secrecy: neither value may appear in anything we emitted
+  TEST_ASSERT_EQUAL_INT(0, emitsContaining("HomeNet"));
+  TEST_ASSERT_EQUAL_INT(0, emitsContaining("hunter22"));
+  // open network: absent pass is legal and stored as ""
+  feed("{\"cmd\":\"wifi\",\"ssid\":\"CafeOpen\"}");
+  TEST_ASSERT_EQUAL_INT(2, g_wifiCalls);
+  TEST_ASSERT_EQUAL_STRING("", g_wifiPass.c_str());
+}
+
+void test_wifi_cmd_rejects_bad_input() {
+  doHello();
+  feed("{\"cmd\":\"wifi\"}");                            // no ssid
+  feed("{\"cmd\":\"wifi\",\"ssid\":\"\"}");              // empty ssid
+  // 33-byte ssid (limit 32)
+  feed("{\"cmd\":\"wifi\",\"ssid\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}");
+  TEST_ASSERT_EQUAL_INT(0, g_wifiCalls);                 // store never reached
+  TEST_ASSERT_EQUAL_INT(3, emitsContaining("\"ack\":\"wifi\",\"ok\":false"));
+  g_wifiStoreOk = false;                                 // NVS failure path
+  feed("{\"cmd\":\"wifi\",\"ssid\":\"HomeNet\"}");
+  TEST_ASSERT_EQUAL_INT(1, g_wifiCalls);
+  TEST_ASSERT_EQUAL_INT(4, emitsContaining("\"ack\":\"wifi\",\"ok\":false"));
+}
+
+void test_wifi_cmd_pre_hello_is_v1_swallowed() {
+  feed("{\"cmd\":\"wifi\",\"ssid\":\"HomeNet\",\"pass\":\"hunter22\"}");
+  TEST_ASSERT_EQUAL_INT(0, g_wifiCalls);                 // nothing stored
+  TEST_ASSERT_EQUAL_INT(0, (int)g_emits.size());         // no ack — v1 purity
+  TEST_ASSERT_EQUAL_STRING("wifi", g_lastXferCmd.c_str());  // v1 catch-all ate it
+}
+
 // debug_state without BUDDY_DEBUG compiles out: swallowed like any unknown
 // cmd, no ack — release builds can't leak introspection.
 void test_debug_state_swallowed_without_flag() {
@@ -440,6 +486,9 @@ int main(int, char**) {
   RUN_TEST(test_no_rxack_pre_hello);
   RUN_TEST(test_rxack_post_hello_with_cap);
   RUN_TEST(test_no_rxack_without_host_cap);
+  RUN_TEST(test_wifi_cmd_post_hello_stores_and_acks);
+  RUN_TEST(test_wifi_cmd_rejects_bad_input);
+  RUN_TEST(test_wifi_cmd_pre_hello_is_v1_swallowed);
   RUN_TEST(test_debug_state_swallowed_without_flag);
   return UNITY_END();
 }

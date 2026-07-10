@@ -54,6 +54,15 @@ void bleDisconnect();
 void bleWhitelistPin(const uint8_t* bda);   // nullptr = open advertising
 #endif
 
+// Renegotiate the BLE connection interval (Track F P7 power). relaxed=true →
+// long interval + slave latency (screen-off idle: the radio sleeps through
+// most connection events, prompt delivery lags up to ~1s); relaxed=false →
+// short interval, no latency (awake: snappy prompt + transcript delivery).
+// The requested mode is latched, so a peer that connects while the device is
+// already idle gets the relaxed parameters immediately. No-op on the wire
+// until a peer is connected. Call on screen on/off transitions.
+void bleConnParams(bool relaxed);
+
 size_t bleAvailable();
 int bleRead();
 size_t bleWrite(const uint8_t* data, size_t len);

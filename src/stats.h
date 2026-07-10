@@ -45,6 +45,13 @@ static bool _dirty = false;
 // engine on BUDDY_EXTRAS_FULL builds. Seeded on every board so the pref
 // survives moving a bond/NVS image between board tiers.
 // Idempotent: sv=N short-circuits every boot after the first.
+//
+// NOT part of the schema: the "wifi" namespace (OTA provisioning creds,
+// wifiCreds* below). A whole new namespace needs no key migration and no
+// seeding — absent reads as unconfigured — so it deliberately does NOT
+// bump sv. Lifecycle: written by the v2 {"cmd":"wifi"} command, read by
+// src/ota/ (BUDDY_OTA builds), wiped by factory reset only (forget-host
+// keeps it — hosts and networks are unrelated concerns).
 static const uint8_t NVS_SCHEMA_V = 4;
 
 inline void nvsMigrate() {
@@ -339,6 +346,29 @@ inline uint8_t speciesIdxLoad() {
 inline void speciesIdxSave(uint8_t idx) {
   _prefs.begin("buddy", false);
   _prefs.putUChar("species", idx);
+  _prefs.end();
+}
+
+// --- WiFi credentials (OTA provisioning) -------------------------------------
+// Own NVS namespace ("wifi", keys ssid/pass) so factory reset can wipe it in
+// one call and the "buddy" schema stays untouched (see the NVS note above).
+// Write path only — the OTA flow (src/ota/, its own translation unit) reads
+// the namespace with a local Preferences instance. The pass is a secret:
+// never log it, never echo it into an ack/status/debug_state line.
+inline bool wifiCredsStore(const char* ssid, const char* pass) {
+  if (!ssid || !ssid[0]) return false;
+  if (!_prefs.begin("wifi", false)) return false;
+  bool ok = _prefs.putString("ssid", ssid) > 0;
+  // Empty pass is legal (open network): putString("") returns 0, so treat
+  // the pass write as best-effort-with-clear rather than a success signal.
+  _prefs.putString("pass", pass ? pass : "");
+  _prefs.end();
+  return ok;
+}
+
+inline void wifiCredsWipe() {
+  _prefs.begin("wifi", false);
+  _prefs.clear();
   _prefs.end();
 }
 

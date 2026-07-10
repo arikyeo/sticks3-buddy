@@ -5,6 +5,7 @@
 #include <BLEUtils.h>
 #include <BLESecurity.h>
 #include <BLE2902.h>
+#include <esp_gap_ble_api.h>
 #include <Arduino.h>
 #include <string.h>
 
@@ -46,6 +47,37 @@ static volatile bool      hasPeer = false;
 // peers may connect and pair. Written from the main loop, read in the BLE
 // stack task's onConnect.
 static volatile uint32_t  pairWinUntil = 0;
+
+// Requested link mode (Track F P7): main.cpp latches the intent (relaxed on
+// screen-off, tight on wake); the wire update is (re)applied on every call
+// with a live peer AND on connect, so a host that reconnects while the
+// device is already idle lands straight on the battery-friendly interval.
+static volatile bool      linkRelaxed = false;
+
+// Push the latched link mode to the controller. Values follow the ttpears
+// power work, retuned to the P7 spec: relaxed = 120-200 ms interval with
+// slave latency 4 (worst-case ~1 s delivery lag, radio sleeps through idle
+// connection events), tight = 15-30 ms, no latency. Supervision timeouts
+// keep > 2x the effective interval so a missed event doesn't drop the link.
+// Units: interval 1.25 ms, timeout 10 ms. Safe from either core — the GAP
+// call just queues a controller request.
+static void _bleApplyConnParams() {
+  if (!connected || !hasPeer) return;
+  esp_ble_conn_update_params_t cp = {};
+  memcpy(cp.bda, (const void*)peerAddr, sizeof(cp.bda));
+  if (linkRelaxed) {
+    cp.min_int = 96;    // 120 ms
+    cp.max_int = 160;   // 200 ms
+    cp.latency = 4;     // effective worst ~1 s
+    cp.timeout = 600;   // 6 s supervision (> (1+4)*200ms*2)
+  } else {
+    cp.min_int = 12;    // 15 ms
+    cp.max_int = 24;    // 30 ms
+    cp.latency = 0;
+    cp.timeout = 400;   // 4 s
+  }
+  esp_ble_gap_update_conn_params(&cp);
+}
 
 static bool _pairWindowOpen() {
   uint32_t u = pairWinUntil;
@@ -105,6 +137,9 @@ class ServerCallbacks : public BLEServerCallbacks {
       return;
     }
     connected = true;
+    // Apply the latched link mode: tight if the device is awake, relaxed if
+    // it's reconnecting while the screen is off (P7 power).
+    _bleApplyConnParams();
     Serial.printf("[ble] connected %02x:%02x:%02x:%02x:%02x:%02x\n",
       peerAddr[0], peerAddr[1], peerAddr[2],
       peerAddr[3], peerAddr[4], peerAddr[5]);
@@ -203,6 +238,11 @@ void bleInit(const char* deviceName, uint8_t pairMode) {
 bool bleConnected() { return connected; }
 bool bleSecure()    { return secure; }
 uint32_t blePasskey() { return passkey; }
+
+void bleConnParams(bool relaxed) {
+  linkRelaxed = relaxed;
+  _bleApplyConnParams();
+}
 
 void bleAllowPairing(bool open, uint32_t windowMs) {
   if (open) {

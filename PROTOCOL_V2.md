@@ -329,3 +329,43 @@ silent or loose — pinned here so hosts don't have to reverse-engineer them.
 - **Replies are dual-written** to USB serial and BLE, like every v1 ack —
   a host may see acks for the other transport's traffic and must ignore
   unknown/unexpected acks (the v1 tolerance rule, applied to acks).
+
+### WiFi provisioning + OTA (firmware extension, Track F P8)
+
+Device-side additions for the optional WiFi OTA flow (`-DBUDDY_OTA`
+builds). These are firmware extensions, not part of the negotiated v2
+capability set — hosts don't need to know about them to be conformant.
+
+- **`{"cmd":"wifi","ssid":"...","pass":"..."}`** — store WiFi credentials
+  in the device's NVS for later OTA use. Post-hello only (pre-hello it
+  falls into the v1 unknown-cmd swallow, like `prompt_cancel`); accepted
+  over the encrypted BLE link or USB serial. `pass` is optional (open
+  network). Limits: `ssid` ≤ 32 bytes, `pass` ≤ 63 bytes (802.11 maxima).
+  Ack: `{"ack":"wifi","ok":true|false}` — `false` for a missing/oversize
+  field or an NVS write failure. **The credentials are never echoed** — not
+  in the ack, not in `status`, not in `debug_state`, not on the debug
+  serial log. Every board tier accepts and stores the command (creds can
+  be provisioned before flashing an `-ota` build); only `BUDDY_OTA` builds
+  read them back. Factory reset wipes them; forget-host does not.
+  Host-side senders: `buddy-bridge wifi <ssid>` (reference bridge,
+  password via getpass — see host/README.md), the
+  `tools/test_protocol.py --wifi SSID PASS` harness, or any raw JSON
+  line over serial/BLE.
+- **`ntfy` card kind `"update"`** — a host that watches this repo's
+  releases may push `{"evt":"ntfy","kind":"update","title":...,"body":...}`
+  when a newer firmware is published (the reference bridge does, via its
+  `[cards] update_check` adapter, comparing the release tag against the
+  hello ack's `data.fw`). The device renders it as a normal card (with
+  its own accent color); it is a *badge only*. The device never updates
+  on its own — consent is the user walking the on-device menu to
+  `update...`.
+- **OTA flow (on-device)** — menu `update...` → join WiFi with the stored
+  creds → `GET /repos/<origin>/releases/latest` → download the release
+  asset `firmware-<board>.bin` (`s3` / `plus2`), falling back to plain
+  `firmware.bin`, into the inactive OTA slot → reboot. On *any* outcome
+  the WiFi stack is torn down again (BLE is the device's only resident
+  radio). TLS uses `setInsecure()` in v1 of this flow — the GitHub asset
+  redirect chain is followed without certificate validation, so a
+  network-level MITM could substitute the binary; mitigated by rollback
+  (a broken slot reverts on the next reboot) and by consent being manual.
+  Pinning the GitHub root is future work.
