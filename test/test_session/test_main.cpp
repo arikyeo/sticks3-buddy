@@ -2,6 +2,7 @@
 // order-preserving ingest, sid-keyed selection that survives reorders, and
 // the focus pin.
 #include <unity.h>
+#include <stdio.h>
 #include <string.h>
 #include "session_table.h"
 
