@@ -2180,6 +2180,12 @@ void loop() {
     wake();
   }
 
+  // While the pairing passkey is on screen, swallow both buttons entirely:
+  // the menu overlays are hidden but their handlers would otherwise stay
+  // live, and a stray press mid-pairing could drive a hidden menu (worst
+  // case: forget-host). Pairing is answered on the desktop, not here.
+  if (blePasskey()) { swallowBtnA = true; swallowBtnB = true; }
+
   // Power button (left side): single click toggles the screen. On the S3
   // a double click powers off (its PMIC reserves the long hold for download
   // mode); AXP boards keep the hardware 6s hold as the off gesture.
