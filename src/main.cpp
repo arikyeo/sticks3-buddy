@@ -5,6 +5,7 @@
 #include "logic/persona_logic.h"
 #include "logic/clock_display_logic.h"
 #include "logic/clock_orient_logic.h"
+#include "logic/pomodoro_logic.h"
 #include <LittleFS.h>
 #include <stdarg.h>
 #include "esp_task_wdt.h"
@@ -160,8 +161,19 @@ void applyDisplayMode() {
   characterInvalidate();  // redraws character on next tick (text mode path)
 }
 
-const char* menuItems[] = { "hosts", "settings", "turn off", "help", "about", "demo", "close" };
-const uint8_t MENU_N = 7;
+const char* menuItems[] = { "hosts", "settings", "extras", "turn off", "help", "about", "demo", "close" };
+const uint8_t MENU_N = 8;
+
+// extras: pomodoro (and, on BUDDY_EXTRAS_FULL builds, more) live on a
+// screen parked OUTSIDE the A-press carousel — reached via menu > extras,
+// left with A-long. On it, A and B belong to the active extras page.
+const uint8_t DISP_EXTRAS = DISP_COUNT;
+bool      extrasOpen = false;   // the menu > extras submenu
+uint8_t   extrasSel  = 0;
+uint8_t   extrasPage = 0;       // 0 = pomodoro
+PomoState pomo;
+const char* extrasItems[] = { "pomodoro", "back" };
+const uint8_t EXTRAS_N = 2;
 
 bool    settingsOpen = false;
 uint8_t settingsSel  = 0;
@@ -202,7 +214,7 @@ static void showToast(const char* s, uint32_t ms = 1800) {
 static bool askShowing() {
   return tama.qAskId[0] && !askDismissed && displayMode == DISP_NORMAL &&
          !menuOpen && !settingsOpen && !resetOpen && !hostsOpen && !forgetOpen &&
-         !tama.promptId[0];
+         !extrasOpen && !tama.promptId[0];
 }
 
 static void applySetting(uint8_t idx) {
@@ -409,17 +421,18 @@ void menuConfirm() {
   switch (menuSel) {
     case 0: hostsOpen = true; menuOpen = false; hostsSel = 0; break;
     case 1: settingsOpen = true; menuOpen = false; settingsSel = 0; break;
-    case 2: board::powerOff(); break;
-    case 3:
+    case 2: extrasOpen = true; menuOpen = false; extrasSel = 0; break;
+    case 3: board::powerOff(); break;
     case 4:
+    case 5:
       menuOpen = false;
       displayMode = DISP_INFO;
-      infoPage = (menuSel == 3) ? INFO_PG_BUTTONS : INFO_PG_CREDITS;
+      infoPage = (menuSel == 4) ? INFO_PG_BUTTONS : INFO_PG_CREDITS;
       applyDisplayMode();
       characterInvalidate();
       break;
-    case 5: dataSetDemo(!dataDemo()); break;
-    case 6: menuOpen = false; characterInvalidate(); break;
+    case 6: dataSetDemo(!dataDemo()); break;
+    case 7: menuOpen = false; characterInvalidate(); break;
   }
 }
 
@@ -436,9 +449,39 @@ void drawMenu() {
     spr.setCursor(mx + 6, my + 8 + i * 14);
     spr.print(sel ? "> " : "  ");
     spr.print(menuItems[i]);
-    if (i == 5) spr.print(dataDemo() ? "  on" : "  off");
+    if (i == 6) spr.print(dataDemo() ? "  on" : "  off");
   }
   drawMenuHints(p, mx, mw, my + mh - 12);
+}
+
+// extras submenu: same panel pattern as the main menu.
+static void drawExtras() {
+  const Palette& p = characterPalette();
+  int mw = 118, mh = 16 + EXTRAS_N * 14 + MENU_HINT_H;
+  int mx = (W - mw) / 2, my = (H - mh) / 2;
+  spr.fillRoundRect(mx, my, mw, mh, 4, PANEL);
+  spr.drawRoundRect(mx, my, mw, mh, 4, p.textDim);
+  spr.setTextSize(1);
+  for (int i = 0; i < EXTRAS_N; i++) {
+    bool sel = (i == extrasSel);
+    spr.setTextColor(sel ? p.text : p.textDim, PANEL);
+    spr.setCursor(mx + 6, my + 8 + i * 14);
+    spr.print(sel ? "> " : "  ");
+    spr.print(extrasItems[i]);
+  }
+  drawMenuHints(p, mx, mw, my + mh - 12, "Next", "Select");
+}
+
+static void extrasConfirm() {
+  if (extrasSel == 0) {
+    extrasOpen = false;
+    extrasPage = 0;
+    displayMode = DISP_EXTRAS;
+    applyDisplayMode();
+  } else {   // back
+    extrasOpen = false;
+    characterInvalidate();
+  }
 }
 
 // Hosts panel: one row per registry entry (* = connected, > = pinned), then
@@ -739,6 +782,76 @@ static void drawClockScreen() {
   spr.setTextSize(1);                                     spr.drawString(dl, CX, 192);
   spr.setTextDatum(TL_DATUM);
   drawClockStrip(&spr, H - 14);
+}
+
+// DISP_EXTRAS page 0 — pomodoro. A = start/pause/resume, B = skip phase,
+// B-long = reset to idle, A-long = leave the screen. Big mm:ss remaining,
+// progress bar, one dot per completed focus of the 4-block cycle.
+static const char* const POMO_PHASE_NAME[] = { "idle", "focus", "break", "long break" };
+static void drawPomodoro() {
+  const Palette& p = characterPalette();
+  const int TOP = 70;
+  uint32_t now = millis();
+  spr.fillRect(0, TOP, W, H - TOP, p.bg);
+  spr.setTextSize(1);
+  spr.setTextColor(p.text, p.bg);
+  spr.setCursor(4, TOP + 2); spr.print("Extras");
+  spr.setTextColor(p.textDim, p.bg);
+  spr.setCursor(W - 52, TOP + 2); spr.print("pomodoro");
+
+  int y = TOP + 22;
+  uint16_t phCol = pomo.phase == POMO_FOCUS ? HOT
+                 : pomo.phase == POMO_IDLE  ? p.textDim : GREEN;
+  spr.setTextSize(2);
+  spr.setTextColor(phCol, p.bg);
+  spr.setCursor(6, y);
+  spr.print(POMO_PHASE_NAME[pomo.phase]);
+  if (pomo.paused) {
+    spr.setTextSize(1);
+    spr.setTextColor(p.textDim, p.bg);
+    spr.setCursor(W - 40, y + 4);
+    spr.print("paused");
+  }
+  y += 26;
+
+  // Remaining mm:ss. Idle previews the focus block a press of A buys.
+  uint32_t r = (pomo.phase == POMO_IDLE ? POMO_FOCUS_MS
+                                        : pomoRemainMs(pomo, now)) / 1000;
+  char rem[8];
+  snprintf(rem, sizeof(rem), "%02lu:%02lu",
+           (unsigned long)(r / 60), (unsigned long)(r % 60));
+  spr.setTextDatum(MC_DATUM);
+  spr.setTextSize(4);
+  spr.setTextColor(pomo.phase == POMO_IDLE ? p.textDim : p.text, p.bg);
+  spr.drawString(rem, CX, y + 16);
+  spr.setTextDatum(TL_DATUM);
+  spr.setTextSize(1);
+  y += 42;
+
+  const int BX = 8, BW = W - 16, BH = 8;
+  spr.drawRect(BX, y, BW, BH, p.textDim);
+  if (pomo.phase != POMO_IDLE) {
+    int fill = (int)((uint64_t)(BW - 2) * pomoElapsedMs(pomo, now)
+                     / pomoPhaseDurMs(pomo.phase));
+    if (fill > 0) spr.fillRect(BX + 1, y + 1, fill, BH - 2, phCol);
+  }
+  y += 18;
+
+  for (uint8_t i = 0; i < POMO_CYCLE_LEN; i++) {
+    int px = CX - 21 + i * 14;
+    if (i < pomo.focusDone)
+      spr.fillCircle(px, y + 3, 3, p.body);
+    else if (i == pomo.focusDone && pomo.phase == POMO_FOCUS)
+      spr.fillCircle(px, y + 3, 3, phCol);
+    else
+      spr.drawCircle(px, y + 3, 3, p.textDim);
+  }
+
+  spr.setTextColor(p.textDim, p.bg);
+  spr.setCursor(4, H - 10);
+  spr.print(pomo.phase == POMO_IDLE ? "A:start  hold-A:exit"
+          : pomo.paused             ? "A:resume B:skip"
+                                    : "A:pause B:skip");
 }
 
 // Persona base-state mapping extracted to logic/persona_logic.h; pack the
@@ -1466,6 +1579,7 @@ void setup() {
   }
   applyBrightness();
   applyVolume();
+  pomoInit(pomo);
   lastInteractMs = millis();
   statsLoad();
   petNameLoad();
@@ -1540,6 +1654,32 @@ void loop() {
   if (statsPollLevelUp()) triggerOneShot(P_CELEBRATE, 3000);
   baseState = derive(tama);
 
+  // Pomodoro tick. Phase transitions chime through beep() (vol 0 = mute):
+  // focus done = two-note descent into the break, break over = single
+  // nudge back to work. Note 2 is millis-scheduled — tone() one-at-a-time.
+  // No wake(): the chime is the notification, the screen can stay off.
+  static uint32_t pomoNote2At = 0;
+  PomoEvent pev = pomoTick(pomo, now);
+  if (pev == POMO_EV_FOCUS_DONE) {
+    beep(2000, 100);
+    pomoNote2At = now + 130;
+  } else if (pev == POMO_EV_BREAK_DONE) {
+    beep(1400, 180);
+  }
+  if (pomoNote2At && (int32_t)(now - pomoNote2At) >= 0) {
+    beep(1500, 150);
+    pomoNote2At = 0;
+  }
+
+  // Pomodoro focus: look busy while the timer runs and the desk is quiet.
+  // Real host state always wins — this only upgrades an otherwise-idle
+  // buddy (and skips the idle->sleep demotion below, on purpose).
+  if (pomo.phase == POMO_FOCUS && !pomo.paused && baseState == P_IDLE &&
+      tama.sessionsRunning == 0 && tama.sessionsWaiting == 0 &&
+      !tama.recentlyCompleted) {
+    baseState = P_BUSY;
+  }
+
   // After waking the screen, hold sleep for 12s so users see the wake-up
   // animation. Urgent states (attention, celebrate, busy) override this.
   if (baseState == P_IDLE && (int32_t)(now - wakeTransitionUntil) < 0) baseState = P_SLEEP;
@@ -1595,7 +1735,7 @@ void loop() {
       // Jump to the approval screen no matter what was open — drawApproval
       // only runs from drawHUD which only runs in DISP_NORMAL.
       displayMode = DISP_NORMAL;
-      menuOpen = settingsOpen = resetOpen = hostsOpen = forgetOpen = false;
+      menuOpen = settingsOpen = resetOpen = hostsOpen = forgetOpen = extrasOpen = false;
       applyDisplayMode();
       characterInvalidate();
       if (buddyMode) buddyInvalidate();
@@ -1662,6 +1802,12 @@ void loop() {
     else if (hostsOpen) { hostsOpen = false; characterInvalidate(); }
     else if (resetOpen) { resetOpen = false; }
     else if (settingsOpen) { settingsOpen = false; characterInvalidate(); }
+    else if (extrasOpen) { extrasOpen = false; characterInvalidate(); }
+    else if (displayMode == DISP_EXTRAS) {
+      // leave the extras screen (pomodoro keeps running in the background)
+      displayMode = DISP_NORMAL;
+      applyDisplayMode();
+    }
     else {
       menuOpen = !menuOpen;
       menuSel = 0;
@@ -1696,9 +1842,15 @@ void loop() {
       } else if (settingsOpen) {
         beep(1800, 30);
         settingsSel = (settingsSel + 1) % SETTINGS_N;
+      } else if (extrasOpen) {
+        beep(1800, 30);
+        extrasSel = (extrasSel + 1) % EXTRAS_N;
       } else if (menuOpen) {
         beep(1800, 30);
         menuSel = (menuSel + 1) % MENU_N;
+      } else if (displayMode == DISP_EXTRAS) {
+        beep(1800, 30);
+        pomoStartPause(pomo, millis());   // pomodoro page: A drives the timer
       } else {
         beep(1800, 30);
         // Skip screens with nothing to show: the session list while empty,
@@ -1723,13 +1875,19 @@ void loop() {
   // action on release (a held B during a prompt still denies, etc).
   if (M5.BtnB.pressedFor(600) && !btnBLong && !swallowBtnB &&
       !inPrompt && !menuOpen && !settingsOpen && !resetOpen &&
-      !hostsOpen && !forgetOpen && !askShowing()) {
+      !hostsOpen && !forgetOpen && !extrasOpen && !askShowing()) {
     if (displayMode == DISP_SESSIONS) {
       // pin/unpin focus on the selected session
       btnBLong = true;
       beep(800, 60);
       bool pinned = sessionTabTogglePin(&_sessions);
       showToast(pinned ? "focus pinned" : "focus cleared");
+    } else if (displayMode == DISP_EXTRAS) {
+      // pomodoro page: B-long resets the timer to idle
+      btnBLong = true;
+      beep(800, 60);
+      pomoStop(pomo);
+      showToast("pomodoro reset");
     } else if (displayMode == DISP_NORMAL) {
       btnBLong = true;
       beep(800, 60);
@@ -1766,9 +1924,15 @@ void loop() {
     } else if (settingsOpen) {
       beep(2400, 30);
       applySetting(settingsSel);
+    } else if (extrasOpen) {
+      beep(2400, 30);
+      extrasConfirm();
     } else if (menuOpen) {
       beep(2400, 30);
       menuConfirm();
+    } else if (displayMode == DISP_EXTRAS) {
+      beep(2400, 30);
+      pomoSkip(pomo, millis());   // pomodoro page: B skips the phase
     } else if (displayMode == DISP_INFO) {
       beep(2400, 30);
       infoPage = (infoPage + 1) % INFO_PAGES;
@@ -1878,6 +2042,7 @@ void loop() {
     if (blePasskey()) drawPasskey();
     else if (clocking) drawClock();
     else if (displayMode == DISP_CLOCK) drawClockScreen();
+    else if (displayMode == DISP_EXTRAS) drawPomodoro();
     else if (displayMode == DISP_INFO) drawInfo();
     else if (displayMode == DISP_PET) drawPet();
     else if (displayMode == DISP_SESSIONS) drawSessions();
@@ -1886,6 +2051,7 @@ void loop() {
     else if (hostsOpen) drawHosts();
     else if (resetOpen) drawReset();
     else if (settingsOpen) drawSettings();
+    else if (extrasOpen) drawExtras();
     else if (menuOpen) drawMenu();
     drawToast();
     spr.pushSprite(0, 0);
