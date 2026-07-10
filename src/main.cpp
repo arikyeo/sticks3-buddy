@@ -7,6 +7,7 @@
 #include "logic/clock_orient_logic.h"
 #include "logic/clock_time_logic.h"
 #include "logic/pomodoro_logic.h"
+#include "logic/gesture_logic.h"
 #include <LittleFS.h>
 #include <stdarg.h>
 #include "esp_task_wdt.h"
@@ -56,6 +57,7 @@ PersonaState activeState = P_SLEEP;
 uint32_t     oneShotUntil = 0;
 uint32_t     lastShakeCheck = 0;
 float        accelBaseline = 1.0f;
+GestureState gest;   // flip -> host switch, double-tap -> wake (gesture_logic.h)
 unsigned long t = 0;
 
 // Menu
@@ -1755,6 +1757,7 @@ void setup() {
   applyBrightness();
   applyVolume();
   pomoInit(pomo);
+  gestureInit(gest);
   lastInteractMs = millis();
   statsLoad();
   petNameLoad();
@@ -1923,6 +1926,34 @@ void loop() {
       wake();
       triggerOneShot(P_DIZZY, 2000);
       Serial.println("shake: dizzy");
+    }
+
+    // IMU gestures on the same 50ms cadence (checkShake keeps its own
+    // read + EMA; one extra I2C read here is noise next to the render).
+    // Gestures run even with the screen off — that's the whole point of
+    // double-tap-to-wake. NO gesture ever answers a prompt.
+    float gax, gay, gaz;
+    board::imuAccel(&gax, &gay, &gaz);
+    GestureEvent ge = gestureFeed(gest, gax, gay, gaz, now);
+    if (ge == GE_FLIP && !napping && !isFaceDown() && !tama.promptId[0] &&
+        hostGlueCount() > 0) {
+      // Flip = pin the next bonded host, same cycle as settings > host
+      // mode (auto -> h0 -> ... -> auto). The flat face-down pose is
+      // excluded — that gesture belongs to the nap.
+      int8_t next = settings().hostsel + 1;
+      if (next >= (int8_t)hostGlueCount()) next = -1;
+      settings().hostsel = next;
+      settingsSave();
+      hostGlueSetPin(next);
+      char tb[20];
+      snprintf(tb, sizeof(tb), "-> %.14s",
+               next < 0 ? "auto" : hostGlueGet((uint8_t)next)->name);
+      showToast(tb, 2600);   // long enough to survive flipping back over
+      beep(1800, 60);
+      wake();
+      Serial.printf("flip: host %s\n", next < 0 ? "auto" : hostGlueGet((uint8_t)next)->name);
+    } else if (ge == GE_DOUBLE_TAP && !napping) {
+      wake();   // tap-tap the desk to light the screen without a button
     }
   }
 
