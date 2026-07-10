@@ -121,9 +121,42 @@ static bool isFaceDown() {
 static void screenBreath(uint8_t v0_100) { board::setBrightness((uint8_t)((uint16_t)v0_100 * 255 / 100)); }
 static void applyBrightness() { screenBreath(20 + settings().bright * 20); }
 
+// --- Screen-off power scaling (Track F P7, ttpears pattern) -----------------
+// While the screen is off, drop the core clock and relax the BLE connection
+// interval; wake() restores both. 80MHz is the radio-safe floor on every
+// supported die — the BT radio needs the APB at >=80MHz (ttpears bench: at
+// 40MHz the link goes dark while screen-off) — so the downclock never has to
+// differ per board. Overridable from a bench build. esp_pm/light-sleep is a
+// separate, deliberately-skipped lever (needs an IDF-tuned build; future).
+#ifndef BUDDY_SCREEN_OFF_CPU_MHZ
+#define BUDDY_SCREEN_OFF_CPU_MHZ 80
+#endif
+// Full clock to restore on wake. Captured at boot instead of hardcoding 240:
+// the m5stickc-plus env pins f_cpu to 160MHz for its power budget, and wake()
+// must not overclock past what the env configured.
+static uint32_t cpuFullMhz = 240;
+
+// True while something latency- or timing-critical is running that must veto
+// the screen-off downclock: a character transfer (flash writes + BLE
+// throughput), an IR learn (RMT capture), or an OTA update. OTA and IR-learn
+// only run with the screen on today, but the guard keeps that invariant
+// explicit rather than incidental.
+static bool powerBusyGuard() {
+  if (xferActive()) return true;
+#ifdef BUDDY_EXTRAS_FULL
+  if (irLearning()) return true;
+#endif
+  return false;
+}
+
 static void wake() {
   lastInteractMs = millis();
   if (screenOff) {
+    // Order matters: full clock first (render + JSON parse speed), then the
+    // tight BLE link (prompt/transcript delivery), then light the panel —
+    // so by the time pixels appear the pipe behind them is already fast.
+    setCpuFrequencyMhz(cpuFullMhz);
+    bleConnParams(false);
     board::screenPower(true);
     applyBrightness();
     screenOff = false;
@@ -1744,6 +1777,9 @@ void drawHUD() {
 void setup() {
   board::begin();        // M5.begin + speaker + per-board power/LED setup
   board::serialInit();
+  // The env-configured full clock (S3/Plus2 240MHz, Plus 160MHz) — what
+  // wake() restores after the screen-off downclock.
+  cpuFullMhz = getCpuFrequencyMhz();
   M5.Display.setRotation(0);
   settingsLoad();                 // before startBt: bleInit needs s_pair
   startBt(settings().pair);
@@ -2370,6 +2406,18 @@ void loop() {
       && millis() - lastInteractMs > SCREEN_OFF_MS) {
     board::screenPower(false);
     screenOff = true;
+  }
+
+  // P7 power scaling, applied lazily so one site covers every path into
+  // screen-off (idle timeout above, the power-button toggle) AND the case
+  // where a busy guard (xfer / IR-learn / OTA) vetoed the downclock at the
+  // transition and cleared later. BLE keeps serving at 80MHz — its
+  // controller clock is the independent 40MHz XTAL — so prompts still
+  // arrive and double-tap/flip gestures still run; wake() restores.
+  if (screenOff && !powerBusyGuard() &&
+      getCpuFrequencyMhz() != BUDDY_SCREEN_OFF_CPU_MHZ) {
+    bleConnParams(true);   // relax link first — it's a queued radio request
+    setCpuFrequencyMhz(BUDDY_SCREEN_OFF_CPU_MHZ);
   }
 
   delay(screenOff ? 100 : 16);
