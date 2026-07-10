@@ -54,13 +54,43 @@ def _mirror_payload(name: str, data: dict) -> dict:
         payload["message"] = _text(data.get("message"))
     elif name == "PostToolUse":
         payload["tool_name"] = _text(data.get("tool_name"), 64)
+        payload["tool_use_id"] = _text(data.get("tool_use_id"), 64)
     return payload
+
+
+ASK_TOOL = "AskUserQuestion"
+ASK_MAX_QUESTIONS = 4
+
+
+def _forward_ask(data: dict, tool_input: dict) -> None:
+    """AskUserQuestion is NEVER gated (SAFE_TOOLS) and must never block —
+    but its tool_input carries the full question payload, which a v2 stick
+    can render. Forward it fire-and-forget; every failure is a no-op."""
+    questions = tool_input.get("questions")
+    if not isinstance(questions, list) or not questions:
+        return
+    first = questions[0] if isinstance(questions[0], dict) else {}
+    client.send_event(
+        {
+            "event": "ask_pending",
+            "agent": "claude",
+            "session_id": _text(data.get("session_id"), 64),
+            "tool_use_id": _text(data.get("tool_use_id"), 64),
+            "questions": questions[:ASK_MAX_QUESTIONS],
+            "multiSelect": bool(first.get("multiSelect")),
+        }
+    )
 
 
 def _handle_pretooluse(data: dict, stdout) -> None:
     if os.environ.get("BUDDY_BRIDGE_NOGATE") == "1":
         return
     tool_input = data.get("tool_input")
+    if not isinstance(tool_input, dict):
+        tool_input = {}
+    if _text(data.get("tool_name"), 64) == ASK_TOOL:
+        _forward_ask(data, tool_input)  # non-blocking: no request, no output
+        return
     request = {
         "event": "permission_request",
         "agent": "claude",
@@ -68,7 +98,7 @@ def _handle_pretooluse(data: dict, stdout) -> None:
         "cwd": _text(data.get("cwd"), 512),
         "tool_name": _text(data.get("tool_name"), 64),
         "tool_use_id": _text(data.get("tool_use_id"), 64),
-        "tool_input": tool_input if isinstance(tool_input, dict) else {},
+        "tool_input": tool_input,
     }
     response = client.request(request, GATE_WAIT_SECS)
     decision = response.get("decision") if isinstance(response, dict) else None

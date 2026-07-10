@@ -11,8 +11,12 @@ Requires Python >= 3.11. Runtime state lives in `~/.buddy-bridge/`
 
 ```powershell
 pipx install ./host              # or: pip install ./host
-pipx inject buddy-bridge "buddy-bridge[win32]"   # optional: BT radio auto-recovery
 ```
+
+On Windows the winrt packages (BT radio auto-recovery) install automatically
+as environment-marked core dependencies; `buddy-bridge[win32]` still works
+as an alias of the same thing. `buddy-bridge` and `python -m buddy_bridge`
+are equivalent entry points.
 
 From a source checkout for development:
 
@@ -25,7 +29,8 @@ python -m venv .venv
 
 ```powershell
 buddy-bridge setup               # writes ~/.buddy-bridge/config.toml, mints a host id
-buddy-bridge daemon              # run the bridge (foreground; service install = later phase)
+buddy-bridge daemon              # run the bridge (foreground)
+buddy-bridge service install     # optional: start it automatically at logon
 buddy-bridge probe               # confirm the buddy is advertising (name prefix "Claude")
 buddy-bridge pair                # optional: pin one device by address
 buddy-bridge hooks install claude
@@ -61,6 +66,94 @@ the next start:
 On Windows, 5 consecutive scan misses trigger an automatic Bluetooth radio
 power-cycle (max 3 attempts, 120 s cooldown) to unstick the WinRT scanner —
 this briefly drops *all* BT devices, so it is deliberately rationed.
+
+## Autostart (`service install`)
+
+`buddy-bridge service install` registers the daemon to start at logon;
+`service uninstall` removes it again. No admin rights needed:
+
+- **Windows** — tries a `schtasks` ONLOGON task first. Task creation is
+  denied on some locked-down accounts ("Access is denied"); the installer
+  then falls back to a `buddy-bridge.vbs` launcher in the user Startup
+  folder that runs the daemon with a hidden window. Uninstall removes
+  both, whichever half exists.
+- **macOS** — writes a launchd user agent
+  (`~/Library/LaunchAgents/com.buddy-bridge.daemon.plist`, RunAtLoad +
+  KeepAlive) and `launchctl load`s it.
+- **Linux/other** — unsupported; run `buddy-bridge daemon` from a systemd
+  user unit or similar.
+
+The launcher prefers `pythonw.exe` next to your interpreter so nothing
+flashes a console at logon.
+
+## Sharing one stick between machines
+
+BLE allows a single central, so only one bridge can hold the stick at a
+time — but the stick keeps up to 7 bonds, and in its AUTO host mode the
+first bonded host to connect wins. Two host-side features make several
+machines share it hands-free:
+
+### Yield when idle (`[ble] idle_yield_min`)
+
+```toml
+[ble]
+idle_yield_min = 5   # minutes; 0 (default) = never yield
+```
+
+Exclusive mode only: after N minutes with no running/waiting session, no
+pending prompt, and no queued card, the daemon pushes one last clean
+snapshot, disconnects, and drops to one reconnect attempt per minute —
+freeing the stick for whichever machine gets busy next. **Any** local
+activity (a hook event, a permission prompt, a new card) instantly exits
+yield with a normal fast reconnect burst; if another host has taken the
+stick meanwhile, the attempts stay patient at 60 s while your sessions
+keep mirroring locally. `buddy-bridge status` reports `ble_yielding`.
+
+### LAN relay federation (`[relay]`)
+
+Machines running buddy-bridge on the same trusted LAN can federate: the
+bridge currently holding the stick (the *holder*) shows cards for the
+other machines' pending prompts, and hands the stick over when a peer
+needs it. Two-machine example — on **both** `alpha` and `bravo`:
+
+```toml
+[ble]
+idle_yield_min = 5
+
+[relay]
+enabled = true
+port = 48901
+token = "pick-one-long-random-string"   # REQUIRED, same on every machine
+```
+
+Restart the daemons (`buddy-bridge status` shows the relay view). What
+you get:
+
+- Peers find each other via signed UDP broadcasts on `port` (every 30 s,
+  immediately on holder changes; a silent peer expires after 120 s).
+- While `alpha` holds the stick and a prompt waits on `bravo`, the stick
+  shows a dim `remote` card — `[bravo] approve: Bash` plus the hint —
+  rate-limited to 1 card per peer per 10 s and deduped. When `bravo`'s
+  prompt resolves, an undelivered card is retracted.
+- If `alpha` is idle when `bravo`'s prompt lands, `alpha` yields the
+  stick immediately (no need to wait out `idle_yield_min`) and `bravo`'s
+  reconnect grabs it — switchover typically 5–10 s.
+- **No remote decisions in v1**: the card is informational; you answer on
+  the machine that asked (its native CLI prompt, or its own stick session
+  once it holds the link). A future revision may relay decisions.
+
+Security model (trusted LAN, shared secret):
+
+- The `token` is a shared secret; **every** discovery datagram and TCP
+  frame is HMAC-SHA256 signed with it. Unsigned, tampered, wrong-token or
+  stale (>120 s skew) input is dropped silently — keep machine clocks
+  roughly in sync (NTP is fine).
+- No credentials, transcripts, or decisions ever ride the relay — only
+  host names, tool names, prompt hints (<= 80 chars), and session ids.
+- The relay binds `0.0.0.0` **only** while `enabled = true` *and* the
+  token is non-empty; otherwise zero sockets are opened (test-asserted).
+  Treat the LAN as the trust boundary: don't enable it on networks you
+  don't control, and rotate the token like any shared secret.
 
 ## WiFi provisioning
 
@@ -143,6 +236,12 @@ path, never take one away or block your CLI:
   native permission prompt appears exactly as if buddy-bridge weren't there.
 - Safe interaction tools (`AskUserQuestion`, `ExitPlanMode`, `TodoWrite`,
   `TaskCreate`, `TaskUpdate`, `TaskList`, `TaskGet`) are never gated.
+  `AskUserQuestion` gets special treatment: a non-blocking hook entry
+  (installed regardless of the gate setting) forwards the question payload
+  so a v2 stick with the `ask` capability *displays* the question —
+  header, text, and options — while you answer in the CLI as usual. The
+  display clears when you answer (or the turn/session ends); v1 sticks
+  and sticks without the capability see nothing new.
 - `BUDDY_BRIDGE_NOGATE=1` disables gating per invocation without uninstalling.
 - A device deny tells the agent: *"User denied on Hardware Buddy device. Do
   not retry with alternative phrasings."*

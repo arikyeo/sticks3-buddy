@@ -9,9 +9,12 @@ The hook command uses the current interpreter (sys.executable) with forward
 slashes so the JSON stays readable on Windows:
     "C:/path/to/python.exe" -m buddy_bridge.hooks.claude_hook
 
-The PreToolUse gate entry is written ONLY when [claude] gate=true, with the
-matcher taken from [claude] gate_tools and a 330s timeout (the hook itself
-gives up at 320s, the daemon decides by 300s).
+PreToolUse gets two kinds of entries:
+  * an always-present ``AskUserQuestion`` matcher (non-blocking: the hook
+    just forwards the question payload so a v2 stick can display it);
+  * the gate entry, written ONLY when [claude] gate=true, with the matcher
+    taken from [claude] gate_tools and a 330s timeout (the hook itself
+    gives up at 320s, the daemon decides by 300s).
 """
 
 from __future__ import annotations
@@ -56,19 +59,22 @@ def _desired_groups(gate: bool, gate_tools: str, python_exe: str | None) -> dict
         if event == "PostToolUse":
             group = {"matcher": "*", **group}
         desired[event] = [group]
-    # Always present in `desired` so gate=False actively removes a stale entry.
-    desired["PreToolUse"] = (
-        [
+    # Ask origination first (always installed, non-blocking), then the gate
+    # entry when enabled. `desired` always carries the full PreToolUse list
+    # so gate=False actively removes a stale gate entry.
+    pre: list[dict] = [
+        {"matcher": "AskUserQuestion", "hooks": [{"type": "command", "command": command}]}
+    ]
+    if gate:
+        pre.append(
             {
                 "matcher": gate_tools,
                 "hooks": [
                     {"type": "command", "command": command, "timeout": GATE_TIMEOUT_SECS}
                 ],
             }
-        ]
-        if gate
-        else []
-    )
+        )
+    desired["PreToolUse"] = pre
     return desired
 
 

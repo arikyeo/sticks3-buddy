@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import itertools
 import logging
 import os
 import secrets
@@ -36,10 +37,19 @@ from .audit import (
     SOURCE_TIMEOUT_FALLBACK,
     append_audit,
 )
-from .cards import CARDS_LOG_FILENAME, Card, CardDeduper, CardLog, CardPipeline, build_ntfy_line
+from .cards import (
+    CARDS_LOG_FILENAME,
+    Card,
+    CardDeduper,
+    CardLog,
+    CardPipeline,
+    build_ntfy_line,
+    clean_card,
+)
 from .config import Config
 from .ble.link import SLOW_RETRY_SECS, LinkManager
-from .decision import ALLOW, ASK, DENY, DecisionRouter, build_hint, extract_detail
+from .relay import EV_ATTENTION, EV_PROMPT_PENDING, EV_PROMPT_RESOLVED, RelayManager
+from .decision import ALLOW, ASK, DENY, DecisionRouter, _wire_safe, build_hint, extract_detail
 from .ipc.endpoint import remove_endpoint, write_endpoint
 from .ipc.server import IpcServer
 from .matchers import (
@@ -64,6 +74,52 @@ TICK_SECS = 1.0
 ONDEMAND_CONNECT_SECS = 5.0
 ONDEMAND_DEADLINE_MARGIN_SECS = 10.0
 WIFI_ACK_TIMEOUT_SECS = 10.0  # max wait for the device's {"ack":"wifi",...}
+RELAY_SYNC_SECS = 2.0  # cadence of mirroring local waits to the holder
+RELAY_CARD_RATE_SECS = 10.0  # max 1 remote card per peer per this window
+REMOTE_PENDING_TTL_SECS = 300.0  # forget a peer's pending we never saw resolved
+# Ask origination (AskUserQuestion display): per-field caps applied before
+# the protocol layer's own byte-safe truncation + line-budget cascade.
+ASK_MAX_QUESTIONS = 3
+ASK_MAX_OPTIONS = 4
+ASK_HEADER_MAX_CHARS = 24
+ASK_TEXT_MAX_CHARS = 200
+ASK_LABEL_MAX_CHARS = 44
+ASK_DESC_MAX_CHARS = 64
+
+
+def convert_ask_questions(raw: object) -> list[dict]:
+    """Claude's AskUserQuestion tool_input questions -> protocol ask shape.
+
+    Input items look like {"question","header","options":[{"label",
+    "description"}],"multiSelect"}; the wire wants {"header","text",
+    "options":[{"label","desc"}]}. Tolerates any malformed subset."""
+    if not isinstance(raw, (list, tuple)):
+        return []
+    out: list[dict] = []
+    for q in list(raw)[:ASK_MAX_QUESTIONS]:
+        if not isinstance(q, dict):
+            continue
+        options: list[dict] = []
+        raw_options = q.get("options")
+        if isinstance(raw_options, (list, tuple)):
+            for opt in list(raw_options)[:ASK_MAX_OPTIONS]:
+                if isinstance(opt, dict):
+                    options.append(
+                        {
+                            "label": str(opt.get("label") or "")[:ASK_LABEL_MAX_CHARS],
+                            "desc": str(opt.get("description") or "")[:ASK_DESC_MAX_CHARS],
+                        }
+                    )
+                elif isinstance(opt, str) and opt:
+                    options.append({"label": opt[:ASK_LABEL_MAX_CHARS], "desc": ""})
+        question = {
+            "header": str(q.get("header") or "")[:ASK_HEADER_MAX_CHARS],
+            "text": str(q.get("question") or q.get("text") or "")[:ASK_TEXT_MAX_CHARS],
+            "options": options,
+        }
+        if question["text"] or question["header"] or options:
+            out.append(question)
+    return out
 
 _BLE_MODES = ("exclusive", "ondemand", "off")
 
@@ -110,10 +166,25 @@ class Daemon:
         self._rx_last_ts = 0.0
         self._tx_since_rx = False
         self._sent_prompt_ids: set[str] = set()  # prompt ids shown on-device
+        # Live asks displayed on the device (ask cap): wire id -> origin.
+        self._live_asks: dict[str, dict[str, str]] = {}
+        self._ask_counter = itertools.count(1)
         self._last_sent_line = ""
         self._last_send_ts = 0.0
         self._last_timesync_ts = 0.0
         self._last_status_poll_ts = 0.0
+        # yield-when-idle ([ble] idle_yield_min, exclusive mode only): after
+        # N idle minutes the daemon frees the stick for other hosts and
+        # retries slowly; any local activity snaps it back to a normal
+        # reconnect burst.
+        self.yielding = False
+        self._idle_since = 0.0
+        # LAN relay federation (None unless [relay] enabled + token set)
+        self.relay: Optional[RelayManager] = None
+        self._remote_pending: dict[tuple[str, str], tuple[str, str, float]] = {}
+        self._remote_cards: dict[tuple[str, str], Card] = {}
+        self._remote_card_ts: dict[str, float] = {}  # peer id -> last card ts
+        self._last_relay_sync = 0.0
         self._ondemand_lock = asyncio.Lock()  # one on-demand gate at a time
         self._wifi_lock = asyncio.Lock()  # one wifi provisioning request at a time
         self._wifi_ack_future: Optional[asyncio.Future] = None
@@ -250,6 +321,9 @@ class Daemon:
             "uptime_sec": int(time.time() - self.started_at),
             "ble_mode": self.cfg.ble_mode,
             "ble_connected": self.link.connected,
+            "ble_yielding": self.yielding,
+            "idle_yield_min": self.cfg.idle_yield_min,
+            "relay": self.relay.status() if self.relay is not None else {"active": False},
             "device": self.last_device_status,
             "host_id": self.cfg.host_id,
             "sessions": {"total": total, "running": running, "waiting": waiting},
@@ -286,9 +360,13 @@ class Daemon:
             return {"ok": True}
         if event == "hook":
             self.handle_hook_mirror(msg)  # fire-and-forget: no reply line
+            await self._on_hook_followups(msg)
             return None
         if event == "permission_request":
             return await self.handle_permission_request(msg)
+        if event == "ask_pending":
+            await self.handle_ask_pending(msg)  # fire-and-forget: no reply line
+            return None
         if event == "set_mode":
             return await self.handle_set_mode(msg)
         if event == "wifi":
@@ -309,6 +387,10 @@ class Daemon:
         if mode != self.cfg.ble_mode:
             log.info("daemon: ble mode %s -> %s", self.cfg.ble_mode, mode)
         self.cfg.ble_mode = mode
+        if self.yielding and mode != "exclusive":
+            self.yielding = False  # yield is an exclusive-mode state only
+            self.link.backoff_floor = 0.0
+        self._idle_since = 0.0
         await self.link.set_mode(mode)
         if mode != "off":
             self._ensure_ble_task()
@@ -319,6 +401,7 @@ class Daemon:
             self._tasks.append(self._ble_task)
 
     def handle_hook_mirror(self, msg: dict[str, Any]) -> None:
+        self.wake_from_yield()  # any hook event is local activity
         agent = msg.get("agent")
         if agent == "claude" and self.cfg.claude_enabled:
             claude_cli.handle_event(self.registry, msg)
@@ -341,6 +424,7 @@ class Daemon:
         prompt takes over. That is the answer for SAFE_TOOLS, unmatched
         (default) invocations, an unreachable device, and timeouts.
         """
+        self.wake_from_yield()  # a prompt is the strongest activity signal
         agent = str(msg.get("agent") or "claude")
         sid = str(msg.get("session_id") or "")
         tool = str(msg.get("tool_name") or "")
@@ -468,6 +552,13 @@ class Daemon:
     async def _on_ble_connect(self) -> None:
         # Spec order: hello first (nothing non-v1 before it completes), then
         # the v1 one-shots (time sync, owner), then the first heartbeat.
+        if self.yielding:
+            # A slow yield retry won the stick back (nobody else wanted it):
+            # exit yield and restart the idle clock from scratch.
+            log.info("daemon: reconnected while yielding, holding the stick again")
+            self.yielding = False
+            self.link.backoff_floor = 0.0
+        self._idle_since = 0.0
         self.negotiated_proto = protocol.PROTO_V1
         self.hello_ack = None
         self.device_sel = True
@@ -475,6 +566,7 @@ class Daemon:
         self._rx_last_ts = time.monotonic()
         self._tx_since_rx = False
         self._sent_prompt_ids.clear()
+        self._live_asks.clear()  # a fresh connection means a fresh device screen
         if await self._send_line(protocol.build_hello(self.cfg)):
             self._hello_deadline = time.monotonic() + protocol.HELLO_ACK_TIMEOUT_SECS
         await self._send_timesync()
@@ -542,6 +634,160 @@ class Daemon:
         self.link.backoff_floor = SLOW_RETRY_SECS
         await self.link.drop_connection()
 
+    # ---- yield-when-idle (share the stick between machines) ----
+
+    def _local_busy(self) -> bool:
+        """Anything that should keep the stick held (or wake it from yield):
+        a running/waiting session, a pending gate decision, a queued card."""
+        _, running, waiting = self.registry.counts()
+        return bool(running or waiting or self.router.pending_count() or self.cards.queue)
+
+    async def _maybe_idle_yield(self) -> None:
+        """Tick-driven idle clock. Only exclusive mode yields: ondemand
+        drops the link by itself and off never holds one."""
+        if self.yielding or self.cfg.idle_yield_min <= 0 or self.cfg.ble_mode != "exclusive":
+            return
+        if not self.link.connected or self._local_busy():
+            self._idle_since = 0.0
+            return
+        now = time.monotonic()
+        if not self._idle_since:
+            self._idle_since = now
+            return
+        if now - self._idle_since >= self.cfg.idle_yield_min * 60.0:
+            await self._yield_now(f"idle {self.cfg.idle_yield_min}min")
+
+    async def _yield_now(self, reason: str) -> None:
+        """Gracefully free the stick for other hosts: push one last clean
+        snapshot (so no stale prompt lingers on the display), drop the link,
+        and slow the reconnect cadence to SLOW_RETRY_SECS. The stick's AUTO
+        host selection lets the next active machine grab it; if one does,
+        our slow retries keep failing and we stay patient."""
+        if self.yielding or not self.link.connected:
+            return
+        log.info(
+            "daemon: yielding BLE to other hosts (%s); retrying every %.0fs",
+            reason, SLOW_RETRY_SECS,
+        )
+        self.yielding = True
+        self._idle_since = 0.0
+        await self._send_snapshot(force=True)
+        self.link.backoff_floor = SLOW_RETRY_SECS
+        await self.link.drop_connection()
+
+    def wake_from_yield(self) -> None:
+        """Local activity while yielded -> instant reconnect attempt burst at
+        normal backoff. If another host holds the stick, the attempts fail
+        (or hello-ack sel:false re-raises the floor) and we go patient again."""
+        if not self.yielding:
+            return
+        log.info("daemon: local activity, waking from yield")
+        self.yielding = False
+        self._idle_since = 0.0
+        self.link.backoff_floor = 0.0
+        self.link.wake()
+
+    # ---- LAN relay federation (multi-machine, one stick) ----
+
+    async def _on_peer_event(self, payload: dict[str, Any]) -> None:
+        """A verified event frame arrived from a peer bridge (we hold the
+        stick). Card emission is rate-limited to 1/peer/RELAY_CARD_RATE_SECS
+        and deduped per (peer, sid) content, and a peer prompt prefers an
+        early yield when we are idle."""
+        ev = payload.get("ev")
+        peer = str(payload.get("host") or "")
+        if not peer:
+            return
+        name = protocol.sanitize(str(payload.get("name") or peer))[:12] or "peer"
+        if ev == EV_PROMPT_PENDING:
+            sid = str(payload.get("sid") or "")
+            tool = protocol.sanitize(str(payload.get("tool") or ""))[:32]
+            hint = str(payload.get("hint") or "")[:80]
+            key = (peer, sid)
+            known = self._remote_pending.get(key)
+            self._remote_pending[key] = (tool, hint, time.monotonic())
+            if known is None or known[:2] != (tool, hint):
+                title = f"[{name}] approve: {tool}" if tool else f"[{name}] approve"
+                self._emit_remote_card(peer, key, title, hint)
+            await self._maybe_peer_yield()
+        elif ev == EV_PROMPT_RESOLVED:
+            key = (peer, str(payload.get("sid") or ""))
+            self._remote_pending.pop(key, None)
+            card = self._remote_cards.pop(key, None)
+            if card is not None and card in self.cards.queue:
+                self.cards.queue.remove(card)  # not delivered yet: retract
+        elif ev == EV_ATTENTION:
+            n = payload.get("n")
+            if isinstance(n, int) and not isinstance(n, bool) and n > 0:
+                self._emit_remote_card(
+                    peer, (peer, "__attention__"), f"[{name}] {n} waiting", ""
+                )
+
+    def _emit_remote_card(self, peer: str, key: tuple[str, str], title: str, body: str) -> None:
+        now = time.monotonic()
+        if now - self._remote_card_ts.get(peer, -RELAY_CARD_RATE_SECS) < RELAY_CARD_RATE_SECS:
+            return
+        # Pre-cleaned with a pinned ts so the queued instance compares equal
+        # for retraction on prompt_resolved. force=True: the relay does its
+        # own dedupe/rate limit, the 6h content TTL must not swallow repeats.
+        card = clean_card(Card(kind="remote", title=title, body=body, ts=int(time.time())))
+        if self.cards.submit(card, force=True):
+            self._remote_card_ts[peer] = now
+            self._remote_cards[key] = card
+
+    async def _maybe_peer_yield(self) -> None:
+        """A peer announced a pending prompt. If we hold the stick but have
+        no local demand (sessions/prompts — queued cards don't count, they
+        are flushed below), yield right away instead of waiting out the
+        idle timer, so the peer's reconnect grabs the stick in seconds."""
+        if self.yielding or self.cfg.ble_mode != "exclusive" or not self.link.connected:
+            return
+        _, running, waiting = self.registry.counts()
+        if running or waiting or self.router.pending_count():
+            return
+        if not self._remote_pending:
+            return
+        for _ in range(len(self.cards.queue)):
+            await self._flush_cards()  # best effort: show the peer card first
+        await self._yield_now("peer prompt pending")
+
+    def _on_relay_holder_view(self) -> None:
+        """The peer holder-view changed. When the stick got freed and we
+        have local demand, snap the reconnect loop awake instead of waiting
+        out a backoff sleep (fast A-idle/B-prompts switchover)."""
+        if self.relay is None or self.link.connected:
+            return
+        if self.relay.peers.holder() is None and self._local_busy():
+            if self.yielding:
+                self.wake_from_yield()
+            else:
+                self.link.wake()
+
+    async def _relay_sync(self) -> None:
+        """Tick-driven: expire stale remote-pending markers and mirror local
+        waiting prompts to the current holder (no-op while we are it)."""
+        if self.relay is None:
+            return
+        now = time.monotonic()
+        if now - self._last_relay_sync < RELAY_SYNC_SECS:
+            return
+        self._last_relay_sync = now
+        holder_peer = self.relay.peers.holder()
+        for key in list(self._remote_pending):
+            expired = now - self._remote_pending[key][2] > REMOTE_PENDING_TTL_SECS
+            if expired or (holder_peer is not None and holder_peer.id == key[0]):
+                # Never resolved (peer died / became the holder itself):
+                # a holder-peer displays its own prompts natively.
+                self._remote_pending.pop(key, None)
+                self._remote_cards.pop(key, None)
+        prompts: dict[str, dict] = {}
+        for session in self.registry.waiting_fifo():
+            hint = session.pending_prompt()
+            if hint:
+                prompts[session.sid] = {"agent": session.agent, "tool": "", "hint": hint[:80]}
+        _, _, waiting = self.registry.counts()
+        await self.relay.sync_local(prompts, waiting)
+
     # Device decision vocabulary per REFERENCE.md ("once" approves) mapped
     # onto the router's allow/deny/ask; unknown values fail open to ask.
     _WIRE_DECISIONS = {"once": ALLOW, "allow": ALLOW, "deny": DENY}
@@ -600,10 +846,10 @@ class Daemon:
     ) -> bool:
         """Relay a structured read-only question to the device.
 
-        Gated on the negotiated ``ask`` capability. There is currently no
-        host-side origination source (the Claude hook set exposes no
-        AskUserQuestion payload; Codex request_user_input only folds to
-        state=wait), so this is a library path for adapters that have data.
+        Gated on the negotiated ``ask`` capability. Origination: the Claude
+        PreToolUse hook forwards AskUserQuestion payloads as "ask_pending"
+        IPC events (see handle_ask_pending); Codex has no source yet (its
+        request_user_input only folds to state=wait).
         """
         if not self.cap_active("ask"):
             return False
@@ -622,6 +868,67 @@ class Daemon:
         if not self.cap_active("ask"):
             return False
         return await self._send_line(protocol.build_ask_cancel(ask_id))
+
+    # ---- ask origination (Claude AskUserQuestion display) ----
+
+    async def handle_ask_pending(self, msg: dict[str, Any]) -> None:
+        """IPC "ask_pending" from the Claude PreToolUse hook: display the
+        structured question on a v2 stick with the ``ask`` capability.
+        Display-only (PROTOCOL_V2.md): the user still answers in the CLI;
+        no-cap/v1/disconnected links silently do nothing (stock behavior)."""
+        self.wake_from_yield()  # a question at the keyboard is local activity
+        if not self.cap_active("ask") or not self.link.connected:
+            return
+        agent = str(msg.get("agent") or "claude")
+        sid = str(msg.get("session_id") or "")
+        tool_use_id = str(msg.get("tool_use_id") or "")
+        questions = convert_ask_questions(msg.get("questions"))
+        if not questions:
+            return
+        if tool_use_id and any(
+            info["tool_use_id"] == tool_use_id for info in self._live_asks.values()
+        ):
+            return  # duplicate delivery (two matching hook groups): keep the first
+        if _wire_safe(tool_use_id) and tool_use_id not in self._live_asks:
+            ask_id = tool_use_id
+        else:
+            ask_id = f"a{next(self._ask_counter)}"
+        sent = await self.send_ask(
+            ask_id,
+            questions,
+            agent=agent,
+            sid=sid,
+            multi_select=msg.get("multiSelect") is True,
+        )
+        if sent:
+            self._live_asks[ask_id] = {
+                "agent": agent, "sid": sid, "tool_use_id": tool_use_id,
+            }
+
+    async def _on_hook_followups(self, msg: dict[str, Any]) -> None:
+        """Async follow-ups to a mirrored hook event (the sync registry
+        mutation already ran): clear displayed asks that the user answered
+        (PostToolUse of the same tool_use_id) or abandoned (new prompt,
+        turn end, session end)."""
+        agent = str(msg.get("agent") or "")
+        name = msg.get("name")
+        if name == "PostToolUse":
+            tool_use_id = str(msg.get("tool_use_id") or "")
+            if tool_use_id:
+                await self._cancel_asks(
+                    lambda info: info["tool_use_id"] == tool_use_id
+                )
+        elif name in ("UserPromptSubmit", "Stop", "SessionEnd"):
+            sid = str(msg.get("session_id") or "")
+            if sid:
+                await self._cancel_asks(
+                    lambda info: info["agent"] == agent and info["sid"] == sid
+                )
+
+    async def _cancel_asks(self, predicate) -> None:
+        for ask_id in [a for a, info in self._live_asks.items() if predicate(info)]:
+            del self._live_asks[ask_id]
+            await self.cancel_ask(ask_id)
 
     # ---- wifi provisioning ----
 
@@ -688,7 +995,10 @@ class Daemon:
     def submit_card(self, card: Card) -> bool:
         """Adapter entry point: dedupe + log + queue. Delivery happens from
         the pump whenever a v2 link with the ntfy capability is up."""
-        return self.cards.submit(card)
+        accepted = self.cards.submit(card)
+        if accepted:
+            self.wake_from_yield()  # a queued card wants the link back
+        return accepted
 
     async def _flush_cards(self) -> None:
         if not self.cap_active("ntfy") or not self.link.connected:
@@ -728,6 +1038,8 @@ class Daemon:
             log.info("ble: no hello-ack within %.0fs, staying in protocol v1",
                      protocol.HELLO_ACK_TIMEOUT_SECS)
         await self._rxack_watch()
+        await self._maybe_idle_yield()
+        await self._relay_sync()
 
     async def _rxack_watch(self) -> None:
         """Send-side dead-link detection (PROTOCOL_V2.md rxack): we have sent
@@ -749,8 +1061,29 @@ class Daemon:
     # ---- lifecycle ----
 
     async def start_background(self) -> list[asyncio.Task]:
-        """Extra long-running tasks (adapters)."""
+        """Extra long-running tasks (adapters, relay)."""
         tasks: list[asyncio.Task] = []
+        if self.cfg.relay_enabled and not self.cfg.relay_active:
+            log.warning(
+                "relay: [relay] enabled but token is empty — relay stays OFF "
+                "(set the same non-empty token on every machine)"
+            )
+        if self.cfg.relay_active:
+            self.relay = RelayManager(
+                host_id=self.cfg.host_id,
+                host_name=self.cfg.host_name,
+                port=self.cfg.relay_port,
+                token=self.cfg.relay_token,
+                is_holder=lambda: self.link.connected,
+                on_peer_event=self._on_peer_event,
+                on_holder_view=self._on_relay_holder_view,
+            )
+            try:
+                tasks.extend(await self.relay.start())
+            except OSError as exc:
+                log.warning("relay: disabled for this run (bind failed: %s)", exc)
+                await self.relay.stop()
+                self.relay = None
         if self.cfg.claude_enabled:
             tasks.append(asyncio.create_task(self.claude_tailer.run(), name="claude-jsonl"))
         if self.cfg.codex_enabled:
@@ -806,6 +1139,8 @@ class Daemon:
             for task in self._tasks:
                 with contextlib.suppress(asyncio.CancelledError, Exception):
                     await task
+            if self.relay is not None:
+                await self.relay.stop()
             await self.link.stop()
             await self.ipc.stop()
             with contextlib.suppress(Exception):

@@ -49,6 +49,10 @@ class Config:
     ble_mode: str = "exclusive"  # exclusive | ondemand | off
     ble_name_prefix: str = "Claude"
     ble_address: str = ""
+    # exclusive mode only: minutes of local idleness (no running/waiting
+    # session, no pending prompt, no queued card) after which the daemon
+    # gracefully disconnects so other hosts can grab the stick. 0 = never.
+    idle_yield_min: int = 0
     # [ipc]
     ipc_port: int = 0  # 0 = ephemeral
     # [claude]
@@ -69,12 +73,22 @@ class Config:
     cards_weather_lon: float | None = None
     cards_update_check: bool = True  # firmware update-check card (active once cards_enabled)
     cards_firmware_repo: str = "arikyeo/sticks3-buddy"  # repo polled for the latest release tag
+    # [relay] (LAN federation: off by default, zero sockets unless active)
+    relay_enabled: bool = False
+    relay_port: int = 48901
+    relay_token: str = ""  # shared secret; relay stays OFF while empty
 
     home: Path = field(default_factory=bridge_home)
 
     @property
     def path(self) -> Path:
         return self.home / CONFIG_FILENAME
+
+    @property
+    def relay_active(self) -> bool:
+        """The relay requires BOTH the enable flag and a non-empty shared
+        token — an unauthenticated LAN listener must be impossible."""
+        return self.relay_enabled and bool(self.relay_token.strip())
 
 
 def _get_str(table: dict, key: str, default: str) -> str:
@@ -136,6 +150,7 @@ def load_config(home: Path | None = None, create: bool = True) -> Config:
     codex = data.get("codex", {}) if isinstance(data.get("codex"), dict) else {}
     timeouts = data.get("timeouts", {}) if isinstance(data.get("timeouts"), dict) else {}
     cards = data.get("cards", {}) if isinstance(data.get("cards"), dict) else {}
+    relay = data.get("relay", {}) if isinstance(data.get("relay"), dict) else {}
 
     cfg.host_id = _get_str(host, "id", "")
     cfg.host_name = _get_str(host, "name", "")
@@ -146,6 +161,7 @@ def load_config(home: Path | None = None, create: bool = True) -> Config:
         cfg.ble_mode = "exclusive"
     cfg.ble_name_prefix = _get_str(ble, "name_prefix", "Claude") or "Claude"
     cfg.ble_address = _get_str(ble, "address", "")
+    cfg.idle_yield_min = max(0, _get_int(ble, "idle_yield_min", 0))
 
     cfg.ipc_port = _get_int(ipc, "port", 0)
 
@@ -168,6 +184,12 @@ def load_config(home: Path | None = None, create: bool = True) -> Config:
     cfg.cards_firmware_repo = (
         _get_str(cards, "firmware_repo", "arikyeo/sticks3-buddy") or "arikyeo/sticks3-buddy"
     )
+
+    cfg.relay_enabled = _get_bool(relay, "enabled", False)
+    cfg.relay_port = _get_int(relay, "port", 48901)
+    if not (0 < cfg.relay_port < 65536):
+        cfg.relay_port = 48901
+    cfg.relay_token = _get_str(relay, "token", "")
 
     changed = False
     if not cfg.host_id:
@@ -209,6 +231,7 @@ def to_toml(cfg: Config) -> str:
         f"mode = {_toml_str(cfg.ble_mode)}\n"
         f"name_prefix = {_toml_str(cfg.ble_name_prefix)}\n"
         f"address = {_toml_str(cfg.ble_address)}\n"
+        f"idle_yield_min = {int(cfg.idle_yield_min)}\n"
         "\n[ipc]\n"
         f"port = {cfg.ipc_port}\n"
         "\n[claude]\n"
@@ -228,6 +251,10 @@ def to_toml(cfg: Config) -> str:
         f"firmware_repo = {_toml_str(cfg.cards_firmware_repo)}\n"
         f"repos = [{repos}]\n"
         f"{weather}"
+        "\n[relay]\n"
+        f"enabled = {b(cfg.relay_enabled)}\n"
+        f"port = {cfg.relay_port}\n"
+        f"token = {_toml_str(cfg.relay_token)}\n"
     )
 
 
