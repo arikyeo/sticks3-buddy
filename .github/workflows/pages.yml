@@ -3,6 +3,12 @@ name: Pages
 on:
   release:
     types: [published]
+  # Releases created by release.yml use the default GITHUB_TOKEN, which never
+  # fires the `release` event for other workflows — chain off the workflow
+  # run instead (verified live: v0.1.0 release did not trigger this).
+  workflow_run:
+    workflows: [Release]
+    types: [completed]
   workflow_dispatch:
 
 permissions:
