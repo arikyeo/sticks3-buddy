@@ -21,11 +21,17 @@
 //         connected for the first 30s of an advertising cycle; after that,
 //         hostfb=1 (auto) accepts any bonded host until the next
 //         disconnect/pin change, hostfb=0 (stay) keeps holding out.
-//   Pairing window: while open (60s, menu-triggered), unknown peers may
-//         connect + bond; the soft-pin reject is suspended for them (the
-//         window is explicit user intent). The first successful new bond
-//         closes the window. Outside the window, ble_bridge.cpp's onConnect
-//         gate already dropped unbonded peers before pairing could start.
+//   Pairing window: while open (60s, menu-triggered), the device courts NEW
+//         machines exclusively: opening the window evicts the currently
+//         connected host, and ble_bridge.cpp's onConnect gate drops BONDED
+//         peers for the window's duration (they auto-reconnect once it
+//         ends) so an auto-reconnecting host can't re-occupy the single
+//         link before the new machine pairs. Unknown peers connect + bond;
+//         the soft-pin reject is suspended for them (the window is explicit
+//         user intent). The first successful new bond closes the window and
+//         normal advertising + policy (auto/pinned) resumes. Outside the
+//         window, the same gate drops UNbonded peers before pairing can
+//         start. Window state is RAM-only — a reboot lands in normal mode.
 
 static HostTable   _hosts;
 static Preferences _hprefs;   // separate instance from stats.h's _prefs
@@ -41,6 +47,7 @@ static char     _bleName[24]  = "";      // display name for the connected peer
 static char     _usbName[24]  = "";      // hello name of the USB host, if any
 static bool     _wasConn      = false;
 static bool     _wasSecure    = false;
+static char     _pairedName[24] = "";    // pending "paired:" toast for main.cpp
 
 // --- NVS ---------------------------------------------------------------------
 // Layout: "n" (U8 used-slot count), "seq" (U32 LRU counter), "h0".."h6"
@@ -198,8 +205,23 @@ void hostGluePoll(uint32_t now) {
           }
         }
         idx = hostTabAdopt(&_hosts, bda);
-        // A new host just joined through the pairing window — close it.
+        // A new host just bonded. End the pairing window immediately (also
+        // harmless for the windowless zero-bond out-of-box flow) so normal
+        // advertising + policy resume and the previously evicted hosts can
+        // reconnect on their own. The name here is the adopt-time
+        // placeholder (Host-N); the hello that follows on the now-encrypted
+        // link renames it moments later.
+        bool viaWindow = blePairingRemainingMs() > 0;
         bleAllowPairing(false, 0);
+        if (idx >= 0) {
+          if (viaWindow)
+            Serial.printf("[ble] pairwin paired '%s' %02x:%02x:%02x:%02x:%02x:%02x\n",
+                          _hosts.h[idx].name, bda[0], bda[1], bda[2],
+                          bda[3], bda[4], bda[5]);
+          // Queue the UI toast (window or out-of-box alike).
+          strncpy(_pairedName, _hosts.h[idx].name, sizeof(_pairedName) - 1);
+          _pairedName[sizeof(_pairedName) - 1] = 0;
+        }
         Serial.printf("[hosts] new host '%s'\n", idx >= 0 ? _hosts.h[idx].name : "?");
       }
       if (idx >= 0) {
@@ -230,6 +252,16 @@ void hostGluePoll(uint32_t now) {
     _fallback = true;
     Serial.println("[hosts] pinned host no-show, falling back to auto accept");
   }
+
+#ifdef BUDDY_BLE_WHITELIST
+  // Re-arm the controller whitelist when the pairing window ends — by any
+  // path (manual toggle, successful pairing, expiry). hostGluePairWindow
+  // lifted it on open so unknown peers could connect at all.
+  static bool wasWin = false;
+  bool win = blePairingRemainingMs() > 0;
+  if (wasWin && !win) bleWhitelistPin(_pin >= 0 ? _hosts.h[_pin].bda : nullptr);
+  wasWin = win;
+#endif
 }
 
 // --- hello glue ----------------------------------------------------------------
@@ -274,7 +306,25 @@ void hostGlueSetPin(int8_t slot) {
 int8_t hostGluePin() { return _pin; }
 
 void hostGluePairWindow(bool open) {
+#ifdef BUDDY_BLE_WHITELIST
+  // The window courts unknown peers, which a controller whitelist would
+  // block at the radio layer — lift it for the window's duration. The
+  // restore on close (any close: manual, paired, expired) happens in
+  // hostGluePoll's window-transition check.
+  if (open) bleWhitelistPin(nullptr);
+#endif
   bleAllowPairing(open, 60000);
+}
+
+// One-shot: copy out the display name of a host that just completed a NEW
+// bond (pairing window or out-of-box) and clear the pending flag. main.cpp
+// polls this from loop() to toast "paired: <name>".
+bool hostGlueTakePaired(char* out, size_t cap) {
+  if (!_pairedName[0] || !out || cap == 0) return false;
+  strncpy(out, _pairedName, cap - 1);
+  out[cap - 1] = 0;
+  _pairedName[0] = 0;
+  return true;
 }
 
 void hostGlueForget(uint8_t slot) {
