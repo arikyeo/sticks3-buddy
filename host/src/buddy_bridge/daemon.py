@@ -48,8 +48,26 @@ from .cards import (
 )
 from .config import Config
 from .ble.link import SLOW_RETRY_SECS, LinkManager
-from .relay import EV_ATTENTION, EV_PROMPT_PENDING, EV_PROMPT_RESOLVED, RelayManager
-from .decision import ALLOW, ASK, DENY, DecisionRouter, _wire_safe, build_hint, extract_detail
+from .federation import Federation
+from .relay import (
+    EV_ATTENTION,
+    EV_DECISION,
+    EV_PROMPT_PENDING,
+    EV_PROMPT_RESOLVED,
+    EV_STATE_SYNC,
+    RelayManager,
+)
+from .decision import (
+    ALLOW,
+    ASK,
+    DECISIONS,
+    DENY,
+    DecisionRouter,
+    PendingDecision,
+    _wire_safe,
+    build_hint,
+    extract_detail,
+)
 from .ipc.endpoint import remove_endpoint, write_endpoint
 from .ipc.server import IpcServer
 from .matchers import (
@@ -77,6 +95,7 @@ WIFI_ACK_TIMEOUT_SECS = 10.0  # max wait for the device's {"ack":"wifi",...}
 RELAY_SYNC_SECS = 2.0  # cadence of mirroring local waits to the holder
 RELAY_CARD_RATE_SECS = 10.0  # max 1 remote card per peer per this window
 REMOTE_PENDING_TTL_SECS = 300.0  # forget a peer's pending we never saw resolved
+FED_STATE_MAX_SESSIONS = 8  # sessions per state_sync (waiting-first, so waits survive)
 # Ask origination (AskUserQuestion display): per-field caps applied before
 # the protocol layer's own byte-safe truncation + line-budget cascade.
 ASK_MAX_QUESTIONS = 3
@@ -185,6 +204,15 @@ class Daemon:
         self._remote_cards: dict[tuple[str, str], Card] = {}
         self._remote_card_ts: dict[str, float] = {}  # peer id -> last card ts
         self._last_relay_sync = 0.0
+        # Federation v2 (merged remote sessions/prompts/asks on our stick
+        # while we hold it, and our full state streamed out while we don't).
+        self.federation = Federation(self.router)
+        self._fed_prompt_ids: set[str] = set()  # remote prompt wire ids offered
+        self._fed_answered: set[str] = set()  # ...that the stick answered
+        self._remote_live_asks: set[str] = set()  # remote ask ids on-device
+        self._fed_ask: Optional[dict[str, Any]] = None  # our ask riding state_sync
+        self._relay_force_sync = False  # holder changed: full resync next tick
+        self._fed_tasks: set[asyncio.Task] = set()  # decision relays in flight
         self._ondemand_lock = asyncio.Lock()  # one on-demand gate at a time
         self._wifi_lock = asyncio.Lock()  # one wifi provisioning request at a time
         self._wifi_ack_future: Optional[asyncio.Future] = None
@@ -220,14 +248,29 @@ class Daemon:
         """(lifetime, today) output-token totals from the persistent ledger."""
         return self.ledger.totals()
 
-    def headline(self) -> str:
+    def _fed_active(self) -> bool:
+        """Remote state is merged into the device view only while the relay
+        runs and at least one peer streams state_sync."""
+        return self.relay is not None and self.federation.peer_count() > 0
+
+    def merged_counts(self) -> tuple[int, int, int]:
+        """(total, running, waiting) across this machine plus every
+        federated peer (the device-facing aggregates)."""
         total, running, waiting = self.registry.counts()
+        if self._fed_active():
+            ft, fr, fw = self.federation.counts()
+            total, running, waiting = total + ft, running + fr, waiting + fw
+        return total, running, waiting
+
+    def headline(self) -> str:
+        total, running, waiting = self.merged_counts()
         if waiting:
             # Attention hints (Notification messages) are not actionable
             # prompts (no wire id), so they surface here instead: per
             # REFERENCE.md the snapshot "prompt" only appears when a
             # permission decision is needed.
-            if self.router.pending_count() == 0:
+            no_remote_pending = not self._fed_active() or self.federation.pending_total() == 0
+            if self.router.pending_count() == 0 and no_remote_pending:
                 hint = self.registry.pending_prompt()
                 if hint:
                     return hint
@@ -259,35 +302,59 @@ class Daemon:
             return protocol.v2_line_budget(self.hello_ack.max_line)
         return protocol.LINE_BUDGET
 
-    def pending_prompt_obj(self) -> Optional[dict]:
-        """Wire prompt object for the heartbeat: the oldest-waiting session's
-        pending gate decision first, else the oldest pending overall. v2 adds
-        sid (pinned wire sid) and qn (how many more prompts this session has
-        queued behind the shown one, capped at PROMPT_QN_CAP)."""
-        pending = None
+    def _oldest_local_pending(self) -> Optional[PendingDecision]:
+        """The oldest-waiting session's pending gate decision first, else the
+        oldest pending overall."""
         for session in self.registry.waiting_fifo():
             pending = self.router.oldest_for(session.agent, session.sid)
             if pending is not None:
-                break
-        if pending is None:
-            pending = self.router.oldest()
+                return pending
+        return self.router.oldest()
+
+    def _merged_qn(self, shown_session_count: int) -> int:
+        """Queue depth behind the shown prompt. Local-only view keeps the v2
+        per-session semantics; with federated peers it becomes the merged
+        depth across every machine (spec: cap PROMPT_QN_CAP)."""
+        if not self._fed_active():
+            return min(protocol.PROMPT_QN_CAP, max(0, shown_session_count - 1))
+        merged = self.router.pending_count() + self.federation.pending_total()
+        return min(protocol.PROMPT_QN_CAP, max(0, merged - 1))
+
+    def pending_prompt_obj(self) -> Optional[dict]:
+        """Wire prompt object for the heartbeat: the oldest-waiting decision
+        across this machine AND every federated peer (remote age = first
+        seen here, same monotonic clock as local ``created``). v2 adds sid
+        (pinned/namespaced wire sid) and qn (queue depth behind the shown
+        prompt — merged across machines once peers federate)."""
+        pending = self._oldest_local_pending()
+        remote = self.federation.oldest_remote_prompt() if self._fed_active() else None
+        # <= tiebreak: a remote first-seen is already LATE by the relay hop,
+        # so an equal holder-clock stamp means the remote asked first (and
+        # Windows' ~16ms monotonic granularity makes ties common).
+        if remote is not None and (pending is None or remote[0] <= pending.created):
+            first_seen, obj = remote
+            prompt: dict[str, Any] = {"id": obj["id"], "tool": obj["tool"], "hint": obj["hint"]}
+            if self.v2_active:
+                if obj.get("sid"):
+                    prompt["sid"] = obj["sid"]
+                prompt["qn"] = self._merged_qn(1 + int(obj.get("qn") or 0))
+            return prompt
         if pending is None:
             return None
-        obj: dict[str, Any] = {
+        obj = {
             "id": pending.wire_id,
             "tool": pending.tool,
             "hint": pending.detail or pending.hint,
         }
         if self.v2_active:
             obj["sid"] = self.registry.wire_sid(pending.agent, pending.sid)
-            obj["qn"] = min(
-                protocol.PROMPT_QN_CAP,
-                max(0, self.router.session_pending_count(pending.agent, pending.sid) - 1),
+            obj["qn"] = self._merged_qn(
+                self.router.session_pending_count(pending.agent, pending.sid)
             )
         return obj
 
     def _compose_state_line(self, prompt_obj: Optional[dict]) -> str:
-        total, running, waiting = self.registry.counts()
+        total, running, waiting = self.merged_counts()
         tokens, tokens_today = self.tokens_totals()
         sessions = None
         if self.v2_active and self.cap_active("sessions") and self.hello_ack is not None:
@@ -296,6 +363,10 @@ class Daemon:
                 wire_sid=self.registry.wire_sid,
                 max_sessions=self.hello_ack.max_sessions,
             )
+            if self._fed_active():
+                sessions = self.federation.merged_entries(
+                    sessions, self.hello_ack.max_sessions
+                )
         return protocol.build_snapshot(
             total=total,
             running=running,
@@ -324,6 +395,11 @@ class Daemon:
             "ble_yielding": self.yielding,
             "idle_yield_min": self.cfg.idle_yield_min,
             "relay": self.relay.status() if self.relay is not None else {"active": False},
+            "federation": {
+                "peers": self.federation.peer_count(),
+                "remote_sessions": self.federation.counts()[0],
+                "remote_pending": self.federation.pending_total(),
+            },
             "device": self.last_device_status,
             "host_id": self.cfg.host_id,
             "sessions": {"total": total, "running": running, "waiting": waiting},
@@ -457,9 +533,19 @@ class Daemon:
             return {"decision": ASK}  # default: native prompt handles it
 
         if self.cfg.ble_mode == "ondemand":
-            return await self._gate_ondemand(msg, agent, sid, tool, tool_input, hint, audit)
+            result = await self._gate_ondemand(msg, agent, sid, tool, tool_input, hint, audit)
+            if result is not None:
+                return result
+            # No local device (connect failed / pinned elsewhere): fall
+            # through to the remote holder if the federation has one.
+            if self._remote_gate_available():
+                return await self._gate_remote(msg, agent, sid, tool, tool_input, hint, audit)
+            audit(ASK, SOURCE_DAEMON_DOWN)
+            return {"decision": ASK}
 
         if self.cfg.ble_mode == "off" or not self.link.connected:
+            if self._remote_gate_available():
+                return await self._gate_remote(msg, agent, sid, tool, tool_input, hint, audit)
             audit(ASK, SOURCE_DAEMON_DOWN)
             return {"decision": ASK}
 
@@ -489,21 +575,52 @@ class Daemon:
             detail=protocol.sanitize(extract_detail(tool_input)),
         )
 
-    async def _gate_ondemand(self, msg, agent, sid, tool, tool_input, hint, audit) -> dict:
+    def _remote_gate_available(self) -> bool:
+        """A federated v2 holder is on the air: gates can be answered from
+        the stick on ANOTHER machine, so it's worth waiting for a decision
+        instead of failing straight open to the native prompt."""
+        return self.relay is not None and self.relay.holder_target() is not None
+
+    async def _gate_remote(self, msg, agent, sid, tool, tool_input, hint, audit) -> dict:
+        """Gate via the federation: the prompt rides state_sync to the v2
+        holder, whose stick answer comes back as a relayed decision that
+        resolves our pending future exactly like a local button press.
+
+        Our own clock still rules: the wait is the same decision timeout as
+        a local gate, and anything but a relayed allow/deny fails open to
+        the native prompt (relay hop adds <~1s when healthy; if the holder
+        vanishes mid-wait we simply time out). On exit the origin-side
+        prompt_resolved (with pid) clears any leftover holder display."""
+        pending = self._create_pending(msg, agent, sid, tool, tool_input, hint)
+        await self._relay_sync(force=True)  # surface the prompt immediately
+        decision = ASK
+        try:
+            decision = await self.router.wait(pending, self._decision_timeout(agent))
+        finally:
+            if self.relay is not None:
+                await self.relay.send_to_holder(
+                    {"ev": EV_PROMPT_RESOLVED, "sid": sid, "pid": pending.wire_id}
+                )
+            await self._relay_sync(force=True)  # and clear it again
+        if decision in (ALLOW, DENY):
+            audit(decision, SOURCE_DEVICE)
+        else:
+            audit(ASK, SOURCE_TIMEOUT_FALLBACK)
+        return {"decision": decision}
+
+    async def _gate_ondemand(self, msg, agent, sid, tool, tool_input, hint, audit) -> Optional[dict]:
         """Ondemand gating: no persistent link. Acquire the lock, connect,
         (hello runs via the connect callback), push one focused snapshot with
         the prompt, wait for a decision up to the gate deadline minus a
         margin, clear the prompt, disconnect. A connect that fails fast
-        fails open ("ask")."""
+        returns None so the caller can try the federation (or fail open)."""
         async with self._ondemand_lock:
             if not await self.link.ensure_connected(timeout=ONDEMAND_CONNECT_SECS):
-                audit(ASK, SOURCE_DAEMON_DOWN)
-                return {"decision": ASK}
+                return None
             await self._await_hello()
             if not self.device_sel:  # soft-pinned to another host
-                audit(ASK, SOURCE_DAEMON_DOWN)
                 await self.link.release()
-                return {"decision": ASK}
+                return None
             pending = self._create_pending(msg, agent, sid, tool, tool_input, hint)
             await self._send_snapshot(force=True)
             timeout = max(0.05, self._decision_timeout(agent) - ONDEMAND_DEADLINE_MARGIN_SECS)
@@ -567,6 +684,11 @@ class Daemon:
         self._tx_since_rx = False
         self._sent_prompt_ids.clear()
         self._live_asks.clear()  # a fresh connection means a fresh device screen
+        self._remote_live_asks.clear()  # remote asks re-forward on the next fed change
+        if self.relay is not None:
+            # We are (becoming) the holder: nothing of ours to mirror out,
+            # and if we lose the stick later the first sync is a full push.
+            self.relay.reset_state_sync()
         if await self._send_line(protocol.build_hello(self.cfg)):
             self._hello_deadline = time.monotonic() + protocol.HELLO_ACK_TIMEOUT_SECS
         await self._send_timesync()
@@ -621,6 +743,7 @@ class Daemon:
             return
         self.link.backoff_floor = 0.0  # selected again: normal reconnect cadence
         await self._send_snapshot(force=True)
+        await self._sync_remote_asks()  # re-forward federated asks to the fresh screen
 
     async def _on_unselected(self) -> None:
         """hello ack said sel:false — the device is soft-pinned to another
@@ -638,9 +761,12 @@ class Daemon:
 
     def _local_busy(self) -> bool:
         """Anything that should keep the stick held (or wake it from yield):
-        a running/waiting session, a pending gate decision, a queued card."""
+        a running/waiting session, a pending gate decision, a queued card —
+        or a federated peer's prompt currently displayed through us."""
         _, running, waiting = self.registry.counts()
-        return bool(running or waiting or self.router.pending_count() or self.cards.queue)
+        if running or waiting or self.router.pending_count() or self.cards.queue:
+            return True
+        return self._fed_active() and self.federation.pending_total() > 0
 
     async def _maybe_idle_yield(self) -> None:
         """Tick-driven idle clock. Only exclusive mode yields: ondemand
@@ -690,16 +816,31 @@ class Daemon:
     # ---- LAN relay federation (multi-machine, one stick) ----
 
     async def _on_peer_event(self, payload: dict[str, Any]) -> None:
-        """A verified event frame arrived from a peer bridge (we hold the
-        stick). Card emission is rate-limited to 1/peer/RELAY_CARD_RATE_SECS
-        and deduped per (peer, sid) content, and a peer prompt prefers an
-        early yield when we are idle."""
+        """A verified event frame arrived from a peer bridge.
+
+        v2 federation: state_sync folds the peer's full state into the
+        merge layer (we are, or are about to be, the holder) and decision
+        resolves one of OUR pending gates (we are the origin). The v1 card
+        events remain the fallback for peers that never sent state_sync;
+        a federated peer's card events are suppressed as redundant."""
         ev = payload.get("ev")
         peer = str(payload.get("host") or "")
         if not peer:
             return
+        if ev == EV_STATE_SYNC:
+            # No early yield here (unlike v1 prompt_pending): federation's
+            # whole point is showing + answering the peer's prompt on OUR
+            # stick, so holding the link is the feature.
+            if self.federation.update(peer, payload):
+                await self._fed_view_changed()
+            return
+        if ev == EV_DECISION:
+            self._on_remote_decision(peer, payload)
+            return
         name = protocol.sanitize(str(payload.get("name") or peer))[:12] or "peer"
         if ev == EV_PROMPT_PENDING:
+            if self.federation.has_peer(peer):
+                return  # federated peer: its prompts ride state_sync
             sid = str(payload.get("sid") or "")
             tool = protocol.sanitize(str(payload.get("tool") or ""))[:32]
             hint = str(payload.get("hint") or "")[:80]
@@ -716,12 +857,76 @@ class Daemon:
             card = self._remote_cards.pop(key, None)
             if card is not None and card in self.cards.queue:
                 self.cards.queue.remove(card)  # not delivered yet: retract
+            # v2: the origin resolved a prompt some other way (timeout /
+            # native answer) — drop it from the merged view right away.
+            pid = str(payload.get("pid") or "")
+            if pid and self.federation.drop_prompt_by_orig(peer, pid):
+                await self._fed_view_changed()
         elif ev == EV_ATTENTION:
+            if self.federation.has_peer(peer):
+                return  # federated peer: its waits ride state_sync
             n = payload.get("n")
             if isinstance(n, int) and not isinstance(n, bool) and n > 0:
                 self._emit_remote_card(
                     peer, (peer, "__attention__"), f"[{name}] {n} waiting", ""
                 )
+
+    def _on_remote_decision(self, peer: str, payload: dict[str, Any]) -> None:
+        """The holder relayed a stick decision for one of OUR prompts: it
+        resolves the pending future exactly as a local button press would
+        (handle_permission_request then audits it as a device decision).
+        Unknown/late ids are ignored — the gate has already fallen open."""
+        orig_id = str(payload.get("id") or "")
+        decision = str(payload.get("decision") or "")
+        if decision not in DECISIONS:
+            decision = ASK
+        if orig_id and self.router.resolve(orig_id, decision):
+            log.info("relay: decision %r for %r arrived from holder %s",
+                     decision, orig_id, peer)
+        else:
+            log.info("relay: stale/unknown remote decision %r -> %r", orig_id, decision)
+
+    async def _fed_view_changed(self) -> None:
+        """The merged remote view changed (state_sync fold, TTL prune,
+        answered/resolved prompt): retract on-device displays that no
+        longer exist, forward newly arrived remote asks, and refresh the
+        heartbeat (content-deduped, so an unchanged line stays quiet)."""
+        current = self.federation.prompt_ids()
+        for wire_id in self._fed_prompt_ids - current:
+            answered = wire_id in self._fed_answered
+            self._fed_answered.discard(wire_id)
+            await self._cancel_displayed_prompt(wire_id, decision_from_device=answered)
+        self._fed_prompt_ids = current
+        self._fed_answered &= current
+        await self._sync_remote_asks()
+        if self.link.connected:
+            await self._send_snapshot()
+
+    async def _sync_remote_asks(self) -> None:
+        """Mirror federated peers' live asks onto the stick (ask cap only).
+        Display-only, like local asks: the [NAME] header prefix tells the
+        user which machine's CLI is waiting for the real answer."""
+        if not self.cap_active("ask") or not self.link.connected:
+            return
+        wanted = self.federation.remote_asks()
+        for ask_id in [a for a in self._remote_live_asks if a not in wanted]:
+            self._remote_live_asks.discard(ask_id)
+            await self._send_line(protocol.build_ask_cancel(ask_id))
+        for ask_id, ask in wanted.items():
+            if ask_id in self._remote_live_asks:
+                continue
+            questions = [dict(q) for q in ask["questions"]]
+            header = f"[{ask['name']}] {questions[0].get('header') or ''}".strip()
+            questions[0]["header"] = header
+            line = protocol.build_ask_evt(
+                ask_id,
+                questions,
+                sid=ask.get("sid") or None,
+                multi_select=ask.get("multiSelect") is True,
+                budget=self.line_budget,
+            )
+            if await self._send_line(line):
+                self._remote_live_asks.add(ask_id)
 
     def _emit_remote_card(self, peer: str, key: tuple[str, str], title: str, body: str) -> None:
         now = time.monotonic()
@@ -752,10 +957,16 @@ class Daemon:
         await self._yield_now("peer prompt pending")
 
     def _on_relay_holder_view(self) -> None:
-        """The peer holder-view changed. When the stick got freed and we
+        """The peer holder-view changed. Schedule a full state resync (the
+        new holder starts from nothing — every peer pushes immediately on
+        the holder-change datagram), and when the stick got freed while we
         have local demand, snap the reconnect loop awake instead of waiting
         out a backoff sleep (fast A-idle/B-prompts switchover)."""
-        if self.relay is None or self.link.connected:
+        if self.relay is None:
+            return
+        self.relay.reset_state_sync()
+        self._relay_force_sync = True  # picked up by the next 1s tick
+        if self.link.connected:
             return
         if self.relay.peers.holder() is None and self._local_busy():
             if self.yielding:
@@ -763,15 +974,19 @@ class Daemon:
             else:
                 self.link.wake()
 
-    async def _relay_sync(self) -> None:
-        """Tick-driven: expire stale remote-pending markers and mirror local
-        waiting prompts to the current holder (no-op while we are it)."""
+    async def _relay_sync(self, force: bool = False) -> None:
+        """Tick-driven (and forced at prompt/ask edges): expire stale
+        holder-side remote state, then mirror our local state out — full
+        state_sync when the holder speaks v2, the v1 card events otherwise."""
         if self.relay is None:
             return
         now = time.monotonic()
-        if now - self._last_relay_sync < RELAY_SYNC_SECS:
+        if not force and now - self._last_relay_sync < RELAY_SYNC_SECS:
             return
         self._last_relay_sync = now
+        # holder-side v2: a silent peer's sessions/prompts/asks vanish
+        if self.federation.prune():
+            await self._fed_view_changed()
         holder_peer = self.relay.peers.holder()
         for key in list(self._remote_pending):
             expired = now - self._remote_pending[key][2] > REMOTE_PENDING_TTL_SECS
@@ -780,6 +995,10 @@ class Daemon:
                 # a holder-peer displays its own prompts natively.
                 self._remote_pending.pop(key, None)
                 self._remote_cards.pop(key, None)
+        if self.relay.holder_target() is not None:
+            # v2 holder: stream the full state; the v1 mirror stays quiet.
+            await self.relay.sync_state(self._fed_state(), force=force)
+            return
         prompts: dict[str, dict] = {}
         for session in self.registry.waiting_fifo():
             hint = session.pending_prompt()
@@ -788,6 +1007,53 @@ class Daemon:
         _, _, waiting = self.registry.counts()
         await self.relay.sync_local(prompts, waiting)
 
+    # ---- federation origin side (we stream state to the holder) ----
+
+    def _relay_short_name(self) -> str:
+        name = self.cfg.relay_name_short or self.cfg.host_name or self.cfg.host_id
+        return protocol.truncate_utf8_bytes(protocol.sanitize(name), 6) or "peer"
+
+    def _fed_prompt_obj(self) -> Optional[dict]:
+        """Our oldest pending gate as a state_sync prompt: like the local
+        wire prompt but always with sid/qn (the holder decides what its
+        stick can render), qn = OUR total queue depth behind it."""
+        pending = self._oldest_local_pending()
+        if pending is None:
+            return None
+        return {
+            "id": pending.wire_id,
+            "tool": pending.tool,
+            "hint": (pending.detail or pending.hint)[:80],
+            "sid": self.registry.wire_sid(pending.agent, pending.sid),
+            "qn": min(protocol.PROMPT_QN_CAP, max(0, self.router.pending_count() - 1)),
+        }
+
+    def _fed_state(self) -> dict[str, Any]:
+        """Everything the holder needs to represent us: the same wire
+        session entries the v2 heartbeat composer would build, our oldest
+        pending prompt, and our live ask. Sanitized/capped here at the
+        origin (the holder re-sanitizes anyway — token holders are trusted
+        to approve, not to inject display bytes)."""
+        state: dict[str, Any] = {
+            "name": self._relay_short_name(),
+            "sessions": protocol.build_session_entries(
+                self.registry.sessions_sorted(),
+                wire_sid=self.registry.wire_sid,
+                max_sessions=FED_STATE_MAX_SESSIONS,
+            ),
+        }
+        prompt = self._fed_prompt_obj()
+        if prompt is not None:
+            state["prompt"] = prompt
+        if self._fed_ask is not None:
+            state["ask"] = {
+                "id": self._fed_ask["id"],
+                "sid": self._fed_ask["sid"],
+                "questions": self._fed_ask["questions"],
+                "multiSelect": self._fed_ask["multiSelect"],
+            }
+        return state
+
     # Device decision vocabulary per REFERENCE.md ("once" approves) mapped
     # onto the router's allow/deny/ask; unknown values fail open to ask.
     _WIRE_DECISIONS = {"once": ALLOW, "allow": ALLOW, "deny": DENY}
@@ -795,8 +1061,27 @@ class Daemon:
     async def handle_device_permission(self, obj: dict[str, Any]) -> None:
         wire_id = str(obj.get("id") or "")
         decision = self._WIRE_DECISIONS.get(str(obj.get("decision") or ""), ASK)
-        if not self.router.resolve(wire_id, decision):
-            log.info("ble: stale/unknown permission decision %r -> %r", wire_id, decision)
+        if self.router.resolve(wire_id, decision):
+            return
+        route = self.router.remote_route(wire_id)
+        if route is not None and self.relay is not None:
+            # A federated peer's prompt: relay the decision home. The relay
+            # retries in the background (2s spacing must not stall the BLE
+            # inbound loop); the merged view advances to the next prompt
+            # right away, and if delivery ultimately fails the origin's 5s
+            # state_sync keepalive re-offers the prompt.
+            peer_id, orig_id = route
+            self._fed_answered.add(wire_id)
+            self.federation.drop_prompt(peer_id)
+            self._spawn_fed_task(self.relay.send_decision(peer_id, orig_id, decision))
+            await self._fed_view_changed()  # display advances to the next prompt
+            return
+        log.info("ble: stale/unknown permission decision %r -> %r", wire_id, decision)
+
+    def _spawn_fed_task(self, coro) -> None:
+        task = asyncio.create_task(coro)
+        self._fed_tasks.add(task)
+        task.add_done_callback(self._fed_tasks.discard)
 
     async def _send_line(self, line: str) -> bool:
         """All outbound protocol lines funnel through here so the rxack
@@ -873,11 +1158,14 @@ class Daemon:
 
     async def handle_ask_pending(self, msg: dict[str, Any]) -> None:
         """IPC "ask_pending" from the Claude PreToolUse hook: display the
-        structured question on a v2 stick with the ``ask`` capability.
-        Display-only (PROTOCOL_V2.md): the user still answers in the CLI;
-        no-cap/v1/disconnected links silently do nothing (stock behavior)."""
+        structured question on a v2 stick with the ``ask`` capability —
+        ours when we hold it, the federation holder's otherwise (the ask
+        rides state_sync). Display-only (PROTOCOL_V2.md): the user still
+        answers in the CLI; with no stick anywhere, silently do nothing."""
         self.wake_from_yield()  # a question at the keyboard is local activity
-        if not self.cap_active("ask") or not self.link.connected:
+        local_ok = self.cap_active("ask") and self.link.connected
+        fed_ok = self._remote_gate_available()
+        if not local_ok and not fed_ok:
             return
         agent = str(msg.get("agent") or "claude")
         sid = str(msg.get("session_id") or "")
@@ -893,13 +1181,20 @@ class Daemon:
             ask_id = tool_use_id
         else:
             ask_id = f"a{next(self._ask_counter)}"
-        sent = await self.send_ask(
-            ask_id,
-            questions,
-            agent=agent,
-            sid=sid,
-            multi_select=msg.get("multiSelect") is True,
-        )
+        multi = msg.get("multiSelect") is True
+        if local_ok:
+            sent = await self.send_ask(
+                ask_id, questions, agent=agent, sid=sid, multi_select=multi
+            )
+        else:  # federated: ride state_sync to the holder's stick
+            self._fed_ask = {
+                "id": ask_id,
+                "sid": self.registry.wire_sid(agent, sid) if agent and sid else "",
+                "questions": questions,
+                "multiSelect": multi,
+            }
+            await self._relay_sync(force=True)
+            sent = True
         if sent:
             self._live_asks[ask_id] = {
                 "agent": agent, "sid": sid, "tool_use_id": tool_use_id,
@@ -928,7 +1223,13 @@ class Daemon:
     async def _cancel_asks(self, predicate) -> None:
         for ask_id in [a for a, info in self._live_asks.items() if predicate(info)]:
             del self._live_asks[ask_id]
-            await self.cancel_ask(ask_id)
+            if self._fed_ask is not None and self._fed_ask.get("id") == ask_id:
+                # Riding state_sync: drop it and let the next (forced) sync
+                # clear the holder's display.
+                self._fed_ask = None
+                self._relay_force_sync = True
+            else:
+                await self.cancel_ask(ask_id)
 
     # ---- wifi provisioning ----
 
@@ -1039,7 +1340,9 @@ class Daemon:
                      protocol.HELLO_ACK_TIMEOUT_SECS)
         await self._rxack_watch()
         await self._maybe_idle_yield()
-        await self._relay_sync()
+        force = self._relay_force_sync
+        self._relay_force_sync = False
+        await self._relay_sync(force=force)
 
     async def _rxack_watch(self) -> None:
         """Send-side dead-link detection (PROTOCOL_V2.md rxack): we have sent
@@ -1077,6 +1380,7 @@ class Daemon:
                 is_holder=lambda: self.link.connected,
                 on_peer_event=self._on_peer_event,
                 on_holder_view=self._on_relay_holder_view,
+                static_peers=self.cfg.relay_peers,
             )
             try:
                 tasks.extend(await self.relay.start())
@@ -1134,9 +1438,9 @@ class Daemon:
         try:
             await self._stop_evt.wait()
         finally:
-            for task in self._tasks:
+            for task in list(self._tasks) + list(self._fed_tasks):
                 task.cancel()
-            for task in self._tasks:
+            for task in list(self._tasks) + list(self._fed_tasks):
                 with contextlib.suppress(asyncio.CancelledError, Exception):
                     await task
             if self.relay is not None:
