@@ -227,7 +227,7 @@ async def test_start_binds_stubs_and_announces(monkeypatch):
         (data, addr) = sent[0]
         assert addr == ("255.255.255.255", 48901)
         payload = parse_frame(data, TOKEN)
-        assert payload == {"bb": 1, "id": "me", "name": "alpha", "port": 48901,
+        assert payload == {"bb": 1, "v": 2, "id": "me", "name": "alpha", "port": 48901,
                            "holder": True, "ts": payload["ts"]}
     finally:
         for task in tasks:
