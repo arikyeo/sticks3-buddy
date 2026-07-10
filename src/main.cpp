@@ -3,6 +3,8 @@
 #include "hal/hal.h"
 #include "logic/wrap_text_logic.h"
 #include "logic/persona_logic.h"
+#include "logic/clock_display_logic.h"
+#include "logic/clock_orient_logic.h"
 #include <LittleFS.h>
 #include <stdarg.h>
 #include "esp_task_wdt.h"
@@ -57,7 +59,7 @@ uint8_t menuSel     = 0;
 bool    btnALong    = false;
 bool    btnBLong    = false;
 
-enum DisplayMode { DISP_NORMAL, DISP_SESSIONS, DISP_PET, DISP_INFO, DISP_COUNT };
+enum DisplayMode { DISP_NORMAL, DISP_SESSIONS, DISP_PET, DISP_CLOCK, DISP_INFO, DISP_COUNT };
 uint8_t displayMode = DISP_NORMAL;
 uint8_t infoPage = 0;
 uint8_t petPage = 0;
@@ -572,9 +574,10 @@ static void drawToast() {
 //   0 = portrait (sprite path, pet sleeps underneath)
 //   1 = landscape, BtnA-side down (M5.Lcd rotation 1)
 //   3 = landscape, USB-side down (M5.Lcd rotation 3)
-static uint8_t clockOrient   = 0;
-static int8_t  orientFrames  = 0;
-static uint8_t paintedOrient = 0;
+static uint8_t clockOrient     = 0;
+static int8_t  orientFrames    = 0;
+static int8_t  clockSwapFrames = 0;
+static uint8_t paintedOrient   = 0;
 // RTC and IMU share an I2C bus. Reading the RTC at 60fps starves the IMU
 // reads in clockUpdateOrient — orientation detection gets noisy. Cache the
 // time once per second; mood logic and drawClock both read from here.
@@ -594,57 +597,55 @@ static void clockRefreshRtc() {
 static void clockUpdateOrient() {
   float ax, ay, az;
   board::imuAccel(&ax, &ay, &az);
-  uint8_t lock = settings().clockRot;
-  if (lock == 1) { clockOrient = 0; return; }
-  if (lock == 2) {
-    // Locked landscape: never drop to 0, but still pick 1 vs 3 from
-    // gravity so the cradle works either way up. Need a strong tilt
-    // for the 1↔3 swap so handling jitter doesn't flip it; otherwise
-    // hold whatever we last had (or 1 from boot).
-    if (clockOrient == 0) clockOrient = (ax >= 0) ? 1 : 3;
-    if      (ax >  0.5f && clockOrient != 1) clockOrient = 1;
-    else if (ax < -0.5f && clockOrient != 3) clockOrient = 3;
-    return;
+  // State machine extracted to logic/clock_orient_logic.h (unit-tested
+  // natively); ax is the in-plane long axis on every supported board.
+  clockOrientUpdate(&clockOrient, &orientFrames, &clockSwapFrames,
+                    ax, ay, az, settings().clockRot);
+}
+
+// Clock face: shown when charging on USB with nothing else going on, and
+// as the carousel DISP_CLOCK screen (withStrip adds the host/session row).
+// Portrait paints the lower area of the sprite; pet renders above.
+// Landscape draws direct to LCD with rotation — sprite stays untouched.
+// Month/weekday labels + placeholder-hardened formatting live in
+// logic/clock_display_logic.h.
+
+static uint8_t clockDow() { return (uint8_t)_clk.tm_wday % 7; }
+
+// Host/session status strip: connected host's name (or "no host") on the
+// left, one pip per session on the right — wait pips hot, running green,
+// idle/done dim outlines. Same vocabulary as the HUD badge line. Draws to
+// either surface (portrait sprite / landscape LCD) via the TFT_eSPI base.
+static void drawClockStrip(TFT_eSPI* g, int y) {
+  const Palette& p = characterPalette();
+  g->setTextSize(1);
+  g->setCursor(4, y);
+  g->setTextColor(p.textDim, p.bg);
+  if (!tama.connected) {
+    g->print("no host");
+  } else {
+    const char* hn = hostGlueActiveName();
+    char row[16];
+    snprintf(row, sizeof(row), "%.13s", hn[0] ? hn : "host");
+    g->print(row);
   }
-  // Dual threshold: strict to enter (must be clearly sideways), loose to
-  // stay (tolerate ~65° of tilt). With one shared threshold a slight lean
-  // while sitting on the long edge puts ax right at the boundary and the
-  // counter ratchets down in ~half a second.
-  bool side = (clockOrient == 0)
-    ? fabsf(ax) > 0.7f && fabsf(ay) < 0.5f && fabsf(az) < 0.5f
-    : fabsf(ax) > 0.4f;
-  if (side) { if (orientFrames < 20) orientFrames++; }
-  else      { if (orientFrames > -10) orientFrames--; }
-  if (clockOrient == 0 && orientFrames >= 15) {
-    clockOrient = (ax > 0) ? 1 : 3;
-  } else if (clockOrient != 0 && orientFrames <= -8) {
-    clockOrient = 0;
-  } else if (clockOrient != 0 && side) {
-    // Direct 1↔3: a fast flip keeps |ax|>0.7 (just changes sign), so
-    // `side` never drops and the exit-via-0 path can't fire. Watch for
-    // ax sign disagreeing with the stored orientation.
-    static int8_t swapFrames = 0;
-    uint8_t want = (ax > 0) ? 1 : 3;
-    if (want != clockOrient) { if (++swapFrames >= 8) { clockOrient = want; swapFrames = 0; } }
-    else swapFrames = 0;
+  int wpx = g->width();
+  for (uint8_t i = 0; i < _sessions.count; i++) {
+    uint16_t c = _sessions.s[i].state == SES_WAIT ? HOT
+               : _sessions.s[i].state == SES_RUN  ? GREEN : p.textDim;
+    int px = wpx - 8 - (int)(_sessions.count - 1 - i) * 7;
+    if (_sessions.s[i].state == SES_RUN || _sessions.s[i].state == SES_WAIT)
+      g->fillCircle(px, y + 3, 2, c);
+    else
+      g->drawCircle(px, y + 3, 2, c);
   }
 }
 
-// Clock face: shown when charging on USB with nothing else going on.
-// Portrait paints the upper ~110px to the sprite; pet renders below.
-// Landscape draws direct to LCD with rotation — sprite stays untouched.
-static const char* const MON[] = {
-  "Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"
-};
-static const char* const DOW[] = {"Sun","Mon","Tue","Wed","Thu","Fri","Sat"};
-
-static uint8_t clockDow() { return (uint8_t)_clk.tm_wday % 7; }
-static void drawClock() {
+static void drawClock(bool withStrip = false) {
   const Palette& p = characterPalette();
-  char hm[6]; snprintf(hm, sizeof(hm), "%02u:%02u", (unsigned)_clk.tm_hour, (unsigned)_clk.tm_min);
-  char ss[4]; snprintf(ss, sizeof(ss), ":%02u", (unsigned)_clk.tm_sec);
-  uint8_t mi = (_clk.tm_mon >= 0 && _clk.tm_mon < 12) ? (uint8_t)_clk.tm_mon : 0;
-  char dl[8]; snprintf(dl, sizeof(dl), "%s %02u", MON[mi], (unsigned)_clk.tm_mday);
+  char hm[8]; clockFormatHm(hm, sizeof(hm), _clk.tm_hour, _clk.tm_min);
+  char ss[8]; clockFormatSeconds(ss, sizeof(ss), _clk.tm_sec);
+  char dl[12]; clockFormatDateLine(dl, sizeof(dl), _clk.tm_mon + 1, _clk.tm_mday);
 
   if (clockOrient == 0) {
     paintedOrient = 0;
@@ -656,6 +657,7 @@ static void drawClock() {
     spr.setTextSize(2); spr.setTextColor(p.textDim, p.bg); spr.drawString(ss, CX, 175);
     spr.setTextSize(1);                                     spr.drawString(dl, CX, 200);
     spr.setTextDatum(TL_DATUM);
+    if (withStrip) drawClockStrip(&spr, H - 14);
     return;
   }
 
@@ -671,14 +673,22 @@ static void drawClock() {
   // for nothing. Gate on the second changing (or full repaint).
   if (repaint || (uint8_t)_clk.tm_sec != lastSec) {
     lastSec = (uint8_t)_clk.tm_sec;
-    char wdl[12]; snprintf(wdl, sizeof(wdl), "%s %s %02u", DOW[clockDow()], MON[mi], (unsigned)_clk.tm_mday);
-    char ssl[3]; snprintf(ssl, sizeof(ssl), "%02u", (unsigned)_clk.tm_sec);
+    char wdl[14];
+    clockFormatWeekDateLine(wdl, sizeof(wdl), clockDow(), _clk.tm_mon + 1, _clk.tm_mday);
+    // bare seconds, no colon — historic landscape layout
+    char ssl[4]; snprintf(ssl, sizeof(ssl), "%.2s", ss + 1);
     M5.Lcd.setTextDatum(MC_DATUM);
     M5.Lcd.setTextSize(3); M5.Lcd.setTextColor(p.text, p.bg);    M5.Lcd.drawString(hm, 170, 42);
     M5.Lcd.setTextSize(2); M5.Lcd.setTextColor(p.textDim, p.bg); M5.Lcd.drawString(ssl, 170, 72);
                                                                   M5.Lcd.drawString(wdl, 170, 102);
     M5.Lcd.setTextDatum(TL_DATUM);
     M5.Lcd.setTextSize(1);
+    if (withStrip) {
+      // Pips don't self-clear when a session drops off — wipe the row.
+      // 1Hz + 12px tall: no visible tear.
+      M5.Lcd.fillRect(0, 121, M5.Lcd.width(), 12, p.bg);
+      drawClockStrip(&M5.Lcd, 123);
+    }
   }
 
   // Pet on left at 5 fps. Clear includes the overlay-particle zone above
@@ -704,6 +714,31 @@ static void drawClock() {
     }
   }
   M5.Lcd.setRotation(0);
+}
+
+// DISP_CLOCK portrait: carousel clock screen. Header row like PET/INFO
+// (title left, weekday right), big HH:MM, seconds + date, host/session
+// strip pinned at the bottom. Landscape reuses drawClock's face (identical
+// layout) with the strip enabled — the loop routes there directly.
+static void drawClockScreen() {
+  const Palette& p = characterPalette();
+  const int TOP = 70;
+  spr.fillRect(0, TOP, W, H - TOP, p.bg);
+  spr.setTextSize(1);
+  spr.setTextColor(p.text, p.bg);
+  spr.setCursor(4, TOP + 2); spr.print("Clock");
+  spr.setTextColor(p.textDim, p.bg);
+  spr.setCursor(W - 22, TOP + 2); spr.print(clockWeekdayLabel(clockDow()));
+
+  char hm[8]; clockFormatHm(hm, sizeof(hm), _clk.tm_hour, _clk.tm_min);
+  char ss[8]; clockFormatSeconds(ss, sizeof(ss), _clk.tm_sec);
+  char dl[12]; clockFormatDateLine(dl, sizeof(dl), _clk.tm_mon + 1, _clk.tm_mday);
+  spr.setTextDatum(MC_DATUM);
+  spr.setTextSize(4); spr.setTextColor(p.text, p.bg);    spr.drawString(hm, CX, 132);
+  spr.setTextSize(2); spr.setTextColor(p.textDim, p.bg); spr.drawString(ss, CX, 166);
+  spr.setTextSize(1);                                     spr.drawString(dl, CX, 192);
+  spr.setTextDatum(TL_DATUM);
+  drawClockStrip(&spr, H - 14);
 }
 
 // Persona base-state mapping extracted to logic/persona_logic.h; pack the
@@ -1666,11 +1701,13 @@ void loop() {
         menuSel = (menuSel + 1) % MENU_N;
       } else {
         beep(1800, 30);
-        displayMode = (displayMode + 1) % DISP_COUNT;
-        // Session list is pointless while empty — skip it in the cycle.
-        if (displayMode == DISP_SESSIONS && _sessions.count == 0) {
+        // Skip screens with nothing to show: the session list while empty,
+        // the clock until a time source exists. DISP_NORMAL is never
+        // skipped, so the walk always terminates.
+        do {
           displayMode = (displayMode + 1) % DISP_COUNT;
-        }
+        } while ((displayMode == DISP_SESSIONS && _sessions.count == 0) ||
+                 (displayMode == DISP_CLOCK && !board::clockValid()));
         applyDisplayMode();
       }
     }
@@ -1764,9 +1801,16 @@ void loop() {
                && !hostsOpen && !forgetOpen && !askShowing()
                && tama.sessionsRunning == 0 && tama.sessionsWaiting == 0
                && dataRtcValid() && _onUsb;
-  if (clocking) clockUpdateOrient();
-  else { clockOrient = 0; orientFrames = 0; paintedOrient = 0; }
-  bool landscapeClock = clocking && clockOrient != 0;
+  // User-selected clock screen (DISP_CLOCK): same face and orientation
+  // machinery as the charging clock, but picked from the carousel. Any
+  // overlay (menus, prompt, passkey) drops it back to the portrait sprite
+  // path so the overlay stays visible; landscape draws direct to LCD.
+  bool clockScreen = displayMode == DISP_CLOCK && !menuOpen && !settingsOpen
+                  && !resetOpen && !hostsOpen && !forgetOpen && !inPrompt
+                  && !blePasskey();
+  if (clocking || clockScreen) clockUpdateOrient();
+  else { clockOrient = 0; orientFrames = 0; clockSwapFrames = 0; paintedOrient = 0; }
+  bool landscapeClock = (clocking || clockScreen) && clockOrient != 0;
 
   static bool wasClocking = false;
   static bool wasLandscape = false;
@@ -1829,10 +1873,11 @@ void loop() {
     }
   }
   if (landscapeClock) {
-    drawClock();
+    drawClock(clockScreen);   // strip on the user screen, not while charging
   } else if (!napping && !screenOff) {
     if (blePasskey()) drawPasskey();
     else if (clocking) drawClock();
+    else if (displayMode == DISP_CLOCK) drawClockScreen();
     else if (displayMode == DISP_INFO) drawInfo();
     else if (displayMode == DISP_PET) drawPet();
     else if (displayMode == DISP_SESSIONS) drawSessions();
