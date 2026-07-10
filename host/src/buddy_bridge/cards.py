@@ -138,9 +138,15 @@ class CardPipeline:
     log: CardLog
     queue: list[Card] = field(default_factory=list)
 
-    def submit(self, card: Card) -> bool:
-        """Adapter-facing entry: dedupe, log, and queue. False if suppressed."""
-        if not self.deduper.accept(card):
+    def submit(self, card: Card, *, force: bool = False) -> bool:
+        """Adapter-facing entry: dedupe, log, and queue. False if suppressed.
+
+        ``force`` skips the content deduper (still logged + queued) — for
+        callers that run their own dedupe/rate-limit policy, like the LAN
+        relay's remote cards where the 6h content TTL would wrongly swallow
+        a legitimately recurring prompt.
+        """
+        if not force and not self.deduper.accept(card):
             return False
         cleaned = clean_card(card)
         self.log.append(cleaned)
