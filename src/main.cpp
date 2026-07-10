@@ -15,6 +15,7 @@
 #include "buddy.h"
 #ifdef BUDDY_EXTRAS_FULL
 #include "audio/tunes.h"   // tune engine + slot registry (8MB boards only)
+#include "ir/ir_remote.h"  // raw RMT learn/replay (8MB boards only)
 #endif
 
 #ifdef BUDDY_DEBUG
@@ -191,10 +192,17 @@ const uint8_t MENU_N = 8;
 const uint8_t DISP_EXTRAS = DISP_COUNT;
 bool      extrasOpen = false;   // the menu > extras submenu
 uint8_t   extrasSel  = 0;
-uint8_t   extrasPage = 0;       // 0 = pomodoro
+uint8_t   extrasPage = 0;       // 0 = pomodoro, 1 = IR remote (FULL builds)
 PomoState pomo;
+#ifdef BUDDY_EXTRAS_FULL
+const char* extrasItems[] = { "pomodoro", "ir remote", "back" };
+const uint8_t EXTRAS_N = 3;
+uint8_t  irSel = 0;             // IR page slot cursor
+uint32_t irLearnDeadline = 0;   // learn session timeout tick
+#else
 const char* extrasItems[] = { "pomodoro", "back" };
 const uint8_t EXTRAS_N = 2;
+#endif
 
 bool    settingsOpen = false;
 uint8_t settingsSel  = 0;
@@ -519,9 +527,10 @@ static void drawExtras() {
 }
 
 static void extrasConfirm() {
-  if (extrasSel == 0) {
+  uint8_t pages = EXTRAS_N - 1;   // every row but "back" opens a page
+  if (extrasSel < pages) {
     extrasOpen = false;
-    extrasPage = 0;
+    extrasPage = extrasSel;
     displayMode = DISP_EXTRAS;
     applyDisplayMode();
   } else {   // back
@@ -898,6 +907,63 @@ static void drawPomodoro() {
   spr.print(pomo.phase == POMO_IDLE ? "A:start  hold-A:exit"
           : pomo.paused             ? "A:resume B:skip"
                                     : "A:pause B:skip");
+}
+
+#ifdef BUDDY_EXTRAS_FULL
+// DISP_EXTRAS page 1 — IR remote (FULL builds only). Four learned-code
+// slots: A = next slot, B = blast the slot, B-long = learn (captures the
+// next burst from a real remote), A-long = leave. Codes are raw timings —
+// no protocol decoding, so any 38 kHz remote works.
+static void drawIrPage() {
+  const Palette& p = characterPalette();
+  const int TOP = 70;
+  spr.fillRect(0, TOP, W, H - TOP, p.bg);
+  spr.setTextSize(1);
+  spr.setTextColor(p.text, p.bg);
+  spr.setCursor(4, TOP + 2); spr.print("Extras");
+  spr.setTextColor(p.textDim, p.bg);
+  spr.setCursor(W - 58, TOP + 2); spr.print("ir remote");
+
+  int y = TOP + 20;
+  for (uint8_t i = 0; i < IR_SLOTS; i++) {
+    bool sel = i == irSel;
+    spr.setTextColor(sel ? p.text : p.textDim, p.bg);
+    spr.setCursor(6, y);
+    spr.printf("%s slot %u", sel ? ">" : " ", i + 1);
+    spr.setCursor(66, y);
+    if (irLearning() && irLearnSlot() == (int8_t)i) {
+      spr.setTextColor(HOT, p.bg);
+      spr.print("listening");
+    } else {
+      uint16_t n = irSlotEdges(i);
+      if (n) { spr.setTextColor(GREEN, p.bg); spr.printf("%u edges", n); }
+      else spr.print("empty");
+    }
+    y += 14;
+  }
+  y += 8;
+  spr.setTextColor(p.textDim, p.bg);
+  if (irLearning()) {
+    uint32_t leftMs = (int32_t)(irLearnDeadline - millis()) > 0
+                    ? irLearnDeadline - millis() : 0;
+    spr.setCursor(6, y);      spr.print("point remote at rx,");
+    spr.setCursor(6, y + 10); spr.printf("press a key... %lus",
+                                         (unsigned long)((leftMs + 999) / 1000));
+  } else {
+    spr.setCursor(6, y);      spr.print("hold B: learn slot");
+    spr.setCursor(6, y + 10); spr.printf("tx G%d  rx G%d", IR_TX_GPIO, IR_RX_GPIO);
+  }
+  spr.setCursor(4, H - 10);
+  spr.print("A:slot  B:send");
+}
+#endif
+
+// DISP_EXTRAS router: page 0 pomodoro everywhere; page 1 IR on FULL builds.
+static void drawExtrasScreen() {
+#ifdef BUDDY_EXTRAS_FULL
+  if (extrasPage == 1) { drawIrPage(); return; }
+#endif
+  drawPomodoro();
 }
 
 // Persona base-state mapping extracted to logic/persona_logic.h; pack the
@@ -1783,6 +1849,25 @@ void loop() {
     pomoNote2At = 0;
   }
 
+#ifdef BUDDY_EXTRAS_FULL
+  // IR learn session: poll the capture (non-blocking), time it out, and
+  // drop it if the user leaves the page — the RX driver only lives while
+  // a learn is actually armed.
+  if (irLearning()) {
+    if (displayMode != DISP_EXTRAS || extrasPage != 1) {
+      irLearnCancel();
+    } else {
+      int r = irLearnPoll();
+      if (r == 1)       { showToast("learned"); beep(2400, 60); }
+      else if (r == -1) { showToast("no signal"); beep(600, 60); }
+      else if ((int32_t)(now - irLearnDeadline) >= 0) {
+        irLearnCancel();
+        showToast("learn timeout");
+      }
+    }
+  }
+#endif
+
   // Pomodoro focus: look busy while the timer runs and the desk is quiet.
   // Real host state always wins — this only upgrades an otherwise-idle
   // buddy (and skips the idle->sleep demotion below, on purpose).
@@ -1978,6 +2063,10 @@ void loop() {
         menuSel = (menuSel + 1) % MENU_N;
       } else if (displayMode == DISP_EXTRAS) {
         beep(1800, 30);
+#ifdef BUDDY_EXTRAS_FULL
+        if (extrasPage == 1) irSel = (uint8_t)((irSel + 1) % IR_SLOTS);
+        else
+#endif
         pomoStartPause(pomo, millis());   // pomodoro page: A drives the timer
       } else {
         beep(1800, 30);
@@ -2013,11 +2102,22 @@ void loop() {
       bool pinned = sessionTabTogglePin(&_sessions);
       showToast(pinned ? "focus pinned" : "focus cleared");
     } else if (displayMode == DISP_EXTRAS) {
-      // pomodoro page: B-long resets the timer to idle
       btnBLong = true;
       beep(800, 60);
-      pomoStop(pomo);
-      showToast("pomodoro reset");
+#ifdef BUDDY_EXTRAS_FULL
+      if (extrasPage == 1) {
+        // IR page: B-long arms a learn session on the selected slot
+        if (!irLearning() && irLearnStart(irSel)) {
+          irLearnDeadline = millis() + 8000;
+          showToast("listening 8s");
+        }
+      } else
+#endif
+      {
+        // pomodoro page: B-long resets the timer to idle
+        pomoStop(pomo);
+        showToast("pomodoro reset");
+      }
     } else if (displayMode == DISP_CARDS) {
       // dismiss the shown card; an empty ring drops us back home
       btnBLong = true;
@@ -2074,6 +2174,12 @@ void loop() {
       menuConfirm();
     } else if (displayMode == DISP_EXTRAS) {
       beep(2400, 30);
+#ifdef BUDDY_EXTRAS_FULL
+      if (extrasPage == 1) {
+        if (irLearning()) { irLearnCancel(); showToast("learn cancelled"); }
+        else showToast(irBlast(irSel) ? "sent" : "empty");
+      } else
+#endif
       pomoSkip(pomo, millis());   // pomodoro page: B skips the phase
     } else if (displayMode == DISP_INFO) {
       beep(2400, 30);
@@ -2188,7 +2294,7 @@ void loop() {
     else if (clocking) drawClock();
     else if (displayMode == DISP_CLOCK) drawClockScreen();
     else if (displayMode == DISP_CARDS) drawCards();
-    else if (displayMode == DISP_EXTRAS) drawPomodoro();
+    else if (displayMode == DISP_EXTRAS) drawExtrasScreen();
     else if (displayMode == DISP_INFO) drawInfo();
     else if (displayMode == DISP_PET) drawPet();
     else if (displayMode == DISP_SESSIONS) drawSessions();
