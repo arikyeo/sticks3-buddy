@@ -1845,15 +1845,45 @@ void drawHUD() {
   }
 }
 
+// Boot-stage tracing for bring-up debugging: build with -DBUDDY_BOOT_TRACE
+// (plus -DCORE_DEBUG_LEVEL=3 for the M5GFX autodetect log) to get per-stage
+// serial checkpoints and an early red test-fill. Compiles away otherwise.
+#ifdef BUDDY_BOOT_TRACE
+#define BOOT_TRACE(tag) do { \
+    Serial.printf("[boot] %-12s t=%lums heap=%u\n", tag, \
+                  (unsigned long)millis(), (unsigned)ESP.getFreeHeap()); \
+    Serial.flush(); \
+  } while (0)
+#else
+#define BOOT_TRACE(tag)
+#endif
+
 void setup() {
   board::begin();        // M5.begin + speaker + per-board power/LED setup
   board::serialInit();
+#ifdef BUDDY_BOOT_TRACE
+  { uint32_t t0 = millis(); while (!Serial && millis() - t0 < 3000) delay(10); }
+  Serial.printf("[boot] board=%d disp=%dx%d rot=%d\n",
+                (int)M5.getBoard(), M5.Display.width(), M5.Display.height(),
+                (int)M5.Display.getRotation());
+  M5.Display.fillScreen(0xF800 /* red test fill */);
+  delay(400);
+  BOOT_TRACE("m5+serial");
+#endif
   // The env-configured full clock (S3/Plus2 240MHz, Plus 160MHz) — what
   // wake() restores after the screen-off downclock.
   cpuFullMhz = getCpuFrequencyMhz();
   M5.Display.setRotation(0);
   settingsLoad();                 // before startBt: bleInit needs s_pair
+  BOOT_TRACE("settings");
+#ifdef BUDDY_BOOT_TRACE
+  M5.Display.fillScreen(0xFFE0 /* yellow: settings loaded, entering BT */); delay(700);
+#endif
   startBt(settings().pair);
+  BOOT_TRACE("bt");
+#ifdef BUDDY_BOOT_TRACE
+  M5.Display.fillScreen(0xF81F /* magenta: BT up */); delay(700);
+#endif
   // Registry after bleInit (the Bluedroid bond store must be up for the
   // boot reconcile), then mirror any pin remap back into settings.
   hostGlueInit(settings().hostsel, settings().hostfb);
@@ -1861,6 +1891,7 @@ void setup() {
     settings().hostsel = hostGluePin();
     settingsSave();
   }
+  BOOT_TRACE("hosts");
   applyBrightness();
   applyVolume();
   pomoInit(pomo);
@@ -1869,11 +1900,14 @@ void setup() {
   statsLoad();
   petNameLoad();
   buddyInit();
+  BOOT_TRACE("stats+buddy");
 
   // BLE stays always-on; s.bt is stored as a preference only.
   spr.setColorDepth(16);
   spr.createSprite(W, H);
+  BOOT_TRACE("sprite");
   characterInit(nullptr);
+  BOOT_TRACE("character");
   gifAvailable = characterLoaded();
   // species NVS: 0..N-1 = ASCII species, 0xFF = use GIF (also the default,
   // so a fresh install lands on the GIF). With no GIF installed, 0xFF falls

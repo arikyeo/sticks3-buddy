@@ -65,8 +65,13 @@ void serialInit() {
 #endif
   // Drain whatever arrived before we were ready (boot noise, half a line
   // from a bridge that never noticed the reboot) so the first JSON line
-  // parsed is a whole one.
-  while (Serial.available()) Serial.read();
+  // parsed is a whole one. Never trust available() here: on the S3's
+  // native USB-CDC it can report data forever (the PR #48 discovery, and
+  // a boot hang on real hardware) — bound the drain and stop on the
+  // read() empty sentinel instead.
+  for (int budget = 2048; budget > 0; --budget) {
+    if (Serial.read() < 0) break;
+  }
 }
 
 }  // namespace board

@@ -8,9 +8,20 @@
 namespace board {
 
 void begin() {
+#ifdef BUDDY_BOOT_TRACE
+  Serial.printf("[hal] pre M5.begin t=%lu\n", (unsigned long)millis()); Serial.flush();
+#endif
   auto cfg = M5.config();
   M5.begin(cfg);
+#ifdef BUDDY_BOOT_TRACE
+  Serial.printf("[hal] post M5.begin board=%d t=%lu\n", (int)M5.getBoard(), (unsigned long)millis()); Serial.flush();
+  M5.Display.fillScreen(0x07E0 /* green: M5.begin returned */); delay(700);
+#endif
   M5.Speaker.begin();
+#ifdef BUDDY_BOOT_TRACE
+  Serial.printf("[hal] post Speaker.begin t=%lu\n", (unsigned long)millis()); Serial.flush();
+  M5.Display.fillScreen(0x001F /* blue: Speaker.begin returned */); delay(700);
+#endif
   M5.Speaker.setVolume(160);
   // BMI270 IMU is configured by M5.begin(); no AXP-style extras to set up.
 }
