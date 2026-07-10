@@ -77,6 +77,24 @@ inline void hostTabHello(HostTable* t, int idx, const char* hostId,
   r.lastSeen = ++t->seq;
 }
 
+// Route a hello to the record owning this link's bda. NEVER trust a cached
+// slot index across link churn: during the pairing window the evicted
+// host's gate-rejected reconnect retries can tear links down between polls,
+// and a stale slot writes the NEW host's hello into the OLD host's record
+// (live 2026-07-11: the hosts list showed only the newly paired Mac — its
+// hello had renamed the Windows record in place). A hello only arrives on
+// an encrypted link, so an unknown bda here is a bonded peer whose adopt
+// was missed — adopt it now. Full table: no write, returns -1 (boot
+// reconcile owns capacity truth; a hello never evicts).
+inline int hostTabHelloRoute(HostTable* t, const uint8_t bda[6],
+                             const char* hostId, const char* name,
+                             const char* app) {
+  int idx = hostTabFindBda(t, bda);
+  if (idx < 0) idx = hostTabAdopt(t, bda);
+  if (idx >= 0) hostTabHello(t, idx, hostId, name, app);
+  return idx;
+}
+
 // Least-recently-seen used slot; -1 when the table is empty.
 inline int hostTabLru(const HostTable* t) {
   int best = -1;

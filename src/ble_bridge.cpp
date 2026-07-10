@@ -132,8 +132,14 @@ class RxCallbacks : public BLECharacteristicCallbacks {
 class ServerCallbacks : public BLEServerCallbacks {
   // Use the extended overload to capture the peer BD address.
   void onConnect(BLEServer* s, esp_ble_gatts_cb_param_t* param) override {
-    memcpy((void*)peerAddr, param->connect.remote_bda, sizeof(esp_bd_addr_t));
-    hasPeer = true;
+    // Gate on a LOCAL copy of the address — commit to the shared peerAddr
+    // only on ACCEPT. Committing before the decision let a gate-rejected
+    // reconnect retry (the evicted host redials ~7s apart for the whole
+    // pairing window) clobber the ACCEPTED link's identity mid-SMP, which
+    // is how the new host's hello later landed in the old host's registry
+    // record (live 2026-07-11 "hosts list lost the first host").
+    esp_bd_addr_t who;
+    memcpy(who, param->connect.remote_bda, sizeof(esp_bd_addr_t));
     // Connection gate — decision table in logic/pairing_gate_logic.h.
     // Normal mode: anti drive-by-bonding, drop unbonded peers before SMP
     // can start (zero-bond device stays open for the out-of-box flow).
@@ -145,20 +151,20 @@ class ServerCallbacks : public BLEServerCallbacks {
     // that deleted its own keys still gates as bonded here and must be
     // forgotten on the device before it can re-pair through a window.)
     bool win = _pairWindowOpen();
-    if (pairingGateDecision(win, _isBonded(peerAddr),
+    if (pairingGateDecision(win, _isBonded(who),
                             esp_ble_get_bond_device_num()) == PAIRGATE_REJECT) {
       if (win) {
         Serial.printf("[ble] pairwin reject bonded peer "
                       "%02x:%02x:%02x:%02x:%02x:%02x (window is for new hosts)\n",
-                      peerAddr[0], peerAddr[1], peerAddr[2],
-                      peerAddr[3], peerAddr[4], peerAddr[5]);
+                      who[0], who[1], who[2], who[3], who[4], who[5]);
       } else {
         Serial.println("[ble] rejecting unbonded peer (pairing window closed)");
       }
-      hasPeer = false;
       s->disconnect(param->connect.conn_id);
       return;
     }
+    memcpy((void*)peerAddr, who, sizeof(esp_bd_addr_t));
+    hasPeer = true;
     connected = true;
     // Apply the latched link mode: tight if the device is awake, relaxed if
     // it's reconnecting while the screen is off (P7 power).
@@ -167,7 +173,19 @@ class ServerCallbacks : public BLEServerCallbacks {
       peerAddr[0], peerAddr[1], peerAddr[2],
       peerAddr[3], peerAddr[4], peerAddr[5]);
   }
-  void onDisconnect(BLEServer* s) override {
+  // Extended overload (both are dispatched by BLEServer) so the event can
+  // be attributed to a specific link. A gate-rejected link's teardown MUST
+  // NOT clobber the accepted link's state: during the pairing window the
+  // evicted host's ~7s reconnect retries each ended here and yanked
+  // connected/secure to false while the NEW host was mid-SMP — its adopt
+  // transition was lost and advertising restarted on top of a live link
+  // (inviting a second central onto the single-link design).
+  void onDisconnect(BLEServer* s, esp_ble_gatts_cb_param_t* param) override {
+    if (connected && hasPeer &&
+        memcmp(param->disconnect.remote_bda, (const void*)peerAddr, 6) != 0) {
+      Serial.println("[ble] foreign-link disconnect ignored (gate reject)");
+      return;
+    }
     connected = false;
     secure = false;
     passkey = 0;
@@ -199,6 +217,14 @@ class SecCallbacks : public BLESecurityCallbacks {
     Serial.printf("[ble] passkey %06lu\n", (unsigned long)pk);
   }
   void onAuthenticationComplete(esp_ble_auth_cmpl_t cmpl) override {
+    // No accepted link -> this event belongs to a gate-rejected bonded
+    // peer whose LTK re-encryption raced our disconnect. Latching secure
+    // here would fire a premature registry adopt the moment the next peer
+    // connects (before its own SMP has run).
+    if (!connected) {
+      Serial.println("[ble] stray auth event ignored (no accepted link)");
+      return;
+    }
     passkey = 0;
     secure = cmpl.success;
     Serial.printf("[ble] auth %s\n", cmpl.success ? "ok" : "FAIL");
@@ -323,8 +349,13 @@ void blePairingTick(uint32_t nowMs) {
   uint32_t k = pairWinAdvKickAt;
   if (k != 0 && (int32_t)(nowMs - k) >= 0) {
     pairWinAdvKickAt = 0;
-    Serial.println("[ble] pairwin adv fallback (disconnect event late)");
-    BLEDevice::startAdvertising();
+    // Only if the link is actually still down: advertising on top of a live
+    // accepted link would invite a second central onto the single-link
+    // design (the new host may already have connected by this deadline).
+    if (!connected) {
+      Serial.println("[ble] pairwin adv fallback (disconnect event late)");
+      BLEDevice::startAdvertising();
+    }
   }
 }
 
