@@ -7,6 +7,7 @@
 // app) must see byte-identical behavior from a v2 device — no rx acks, no
 // hello ack, no v2 parsing side effects.
 #include <unity.h>
+#include <stdio.h>
 #include <string.h>
 #include <string>
 #include <vector>
