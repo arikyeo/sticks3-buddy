@@ -5,6 +5,7 @@
 #include "logic/persona_logic.h"
 #include "logic/clock_display_logic.h"
 #include "logic/clock_orient_logic.h"
+#include "logic/clock_time_logic.h"
 #include "logic/pomodoro_logic.h"
 #include <LittleFS.h>
 #include <stdarg.h>
@@ -60,8 +61,9 @@ uint8_t menuSel     = 0;
 bool    btnALong    = false;
 bool    btnBLong    = false;
 
-enum DisplayMode { DISP_NORMAL, DISP_SESSIONS, DISP_PET, DISP_CLOCK, DISP_INFO, DISP_COUNT };
+enum DisplayMode { DISP_NORMAL, DISP_SESSIONS, DISP_PET, DISP_CLOCK, DISP_CARDS, DISP_INFO, DISP_COUNT };
 uint8_t displayMode = DISP_NORMAL;
+uint8_t cardSel = 0;    // DISP_CARDS view index, 0 = newest
 uint8_t infoPage = 0;
 uint8_t petPage = 0;
 const uint8_t PET_PAGES = 3;
@@ -1471,6 +1473,69 @@ static void drawAsk() {
   spr.print("B:ok");
 }
 
+// DISP_CARDS: ntfy notification cards — auto-inserted in the carousel
+// while the ring holds any. One card per view: kind tag + local HH:MM
+// header, title, wrapped body. B = next card, B-long = dismiss. Rendering
+// the screen clears the HUD unread badge (cards stay until dismissed or
+// rung out by newer ones).
+static uint16_t cardKindColor(const char* kind, const Palette& p) {
+  if (strcmp(kind, "gh") == 0) return p.body;
+  if (strcmp(kind, "ci") == 0) return GREEN;
+  if (strcmp(kind, "weather") == 0 || strcmp(kind, "wx") == 0) return 0x07FF;
+  return p.textDim;   // unknown kinds render generic, per spec
+}
+
+static void drawCards() {
+  const Palette& p = characterPalette();
+  const int TOP = 70;
+  spr.fillRect(0, TOP, W, H - TOP, p.bg);
+  spr.setTextSize(1);
+  int y = TOP + 2;
+  _ntfy.unread = 0;                       // viewed — badge clears
+  if (cardSel >= _ntfy.count) cardSel = 0;
+  const NtfyCard* c = ntfyCardAt(&_ntfy, cardSel);
+
+  spr.setTextColor(p.text, p.bg);
+  spr.setCursor(4, y); spr.print("Cards");
+  spr.setTextColor(p.textDim, p.bg);
+  spr.setCursor(W - 28, y); spr.printf("%u/%u", cardSel + 1, _ntfy.count);
+  y += 14;
+  if (!c) {   // ring emptied under us — carousel will skip next cycle
+    spr.setTextColor(p.textDim, p.bg);
+    spr.setCursor(4, y); spr.print("no cards");
+    return;
+  }
+
+  spr.setTextColor(cardKindColor(c->kind, p), p.bg);
+  spr.setCursor(4, y);
+  spr.printf("[%.6s]", c->kind[0] ? c->kind : "*");
+  if (c->ts && dataRtcValid()) {
+    // Bridge epoch (UTC) + its tz offset -> local wall time for the stamp.
+    struct tm ct;
+    clockEpochToTmUtc((time_t)((int64_t)c->ts + dataTzOffset()), &ct);
+    char hm[8]; clockFormatHm(hm, sizeof(hm), ct.tm_hour, ct.tm_min);
+    spr.setTextColor(p.textDim, p.bg);
+    spr.setCursor(W - 34, y);
+    spr.print(hm);
+  }
+  y += 12;
+
+  char rows[2][24];
+  uint8_t nR = wrapInto(c->title, rows, 2, 21);
+  spr.setTextColor(p.text, p.bg);
+  for (uint8_t i = 0; i < nR; i++) { spr.setCursor(4, y); spr.print(rows[i]); y += 9; }
+  y += 4;
+
+  char brows[8][24];
+  uint8_t nB = wrapInto(c->body, brows, 8, 21);
+  spr.setTextColor(p.textDim, p.bg);
+  for (uint8_t i = 0; i < nB; i++) { spr.setCursor(4, y); spr.print(brows[i]); y += 9; }
+
+  spr.setTextColor(p.textDim, p.bg);
+  spr.setCursor(4, H - 10);
+  spr.print("B:next  hold:dismiss");
+}
+
 void drawHUD() {
   if (tama.promptId[0]) { drawApproval(); return; }
   if (tama.qAskId[0] && !askDismissed) { drawAsk(); return; }
@@ -1499,9 +1564,9 @@ void drawHUD() {
       spr.setTextColor(p.textDim, p.bg);
       spr.printf("%.11s", hn[0] ? hn : "host");
     }
-    if (_ntfy.count) {
+    if (_ntfy.unread) {   // clears once the cards screen is viewed
       char nb[6];
-      snprintf(nb, sizeof(nb), "n%u", _ntfy.count);
+      snprintf(nb, sizeof(nb), "n%u", _ntfy.unread);
       spr.setTextColor(p.body, p.bg);
       spr.setCursor(W - 8 - (int)_sessions.count * 7 - (int)strlen(nb) * 6, by);
       spr.print(nb);
@@ -1742,6 +1807,15 @@ void loop() {
     }
   }
 
+  // ntfy card arrival: short chirp (vol-gated via beep) and deliberately
+  // NO wake() — attention without screen burn. If the screen is off it
+  // stays off; the unread badge and carousel pick it up later.
+  static uint32_t seenNtfyTotal = 0;
+  if (_ntfy.total > seenNtfyTotal) {
+    seenNtfyTotal = _ntfy.total;
+    beep(1600, 50);
+  }
+
   // Ask arrival (v2, read-only): chirp + re-arm the overlay for the new id.
   // Unlike prompts it doesn't hijack the display mode — it renders when the
   // HUD is visible and waits its turn behind a pending approval.
@@ -1859,7 +1933,9 @@ void loop() {
         do {
           displayMode = (displayMode + 1) % DISP_COUNT;
         } while ((displayMode == DISP_SESSIONS && _sessions.count == 0) ||
-                 (displayMode == DISP_CLOCK && !board::clockValid()));
+                 (displayMode == DISP_CLOCK && !board::clockValid()) ||
+                 (displayMode == DISP_CARDS && _ntfy.count == 0));
+        if (displayMode == DISP_CARDS) cardSel = 0;   // land on the newest
         applyDisplayMode();
       }
     }
@@ -1888,6 +1964,18 @@ void loop() {
       beep(800, 60);
       pomoStop(pomo);
       showToast("pomodoro reset");
+    } else if (displayMode == DISP_CARDS) {
+      // dismiss the shown card; an empty ring drops us back home
+      btnBLong = true;
+      beep(800, 60);
+      if (ntfyDismiss(&_ntfy, cardSel)) {
+        if (cardSel >= _ntfy.count) cardSel = 0;
+        showToast("dismissed");
+        if (_ntfy.count == 0) {
+          displayMode = DISP_NORMAL;
+          applyDisplayMode();
+        }
+      }
     } else if (displayMode == DISP_NORMAL) {
       btnBLong = true;
       beep(800, 60);
@@ -1943,6 +2031,9 @@ void loop() {
     } else if (displayMode == DISP_SESSIONS) {
       beep(2400, 30);
       sessionTabSelectNext(&_sessions);
+    } else if (displayMode == DISP_CARDS) {
+      beep(2400, 30);
+      if (_ntfy.count) cardSel = (uint8_t)((cardSel + 1) % _ntfy.count);
     } else {
       beep(2400, 30);
       msgScroll = (msgScroll >= 30) ? 0 : msgScroll + 1;
@@ -2042,6 +2133,7 @@ void loop() {
     if (blePasskey()) drawPasskey();
     else if (clocking) drawClock();
     else if (displayMode == DISP_CLOCK) drawClockScreen();
+    else if (displayMode == DISP_CARDS) drawCards();
     else if (displayMode == DISP_EXTRAS) drawPomodoro();
     else if (displayMode == DISP_INFO) drawInfo();
     else if (displayMode == DISP_PET) drawPet();
