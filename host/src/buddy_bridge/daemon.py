@@ -36,6 +36,7 @@ from .audit import (
     SOURCE_TIMEOUT_FALLBACK,
     append_audit,
 )
+from .cards import CARDS_LOG_FILENAME, Card, CardDeduper, CardLog, CardPipeline, build_ntfy_line
 from .config import Config
 from .ble.link import SLOW_RETRY_SECS, LinkManager
 from .decision import ALLOW, ASK, DENY, DecisionRouter, build_hint, extract_detail
@@ -90,6 +91,9 @@ class Daemon:
         self.codex_scanner = CodexSessionScanner(
             root=codex_sessions_root(),
             on_session=self._on_codex_session,
+        )
+        self.cards = CardPipeline(
+            deduper=CardDeduper(), log=CardLog(cfg.home / CARDS_LOG_FILENAME)
         )
         self.started_at = time.time()
         self.last_device_status: dict[str, Any] = {}
@@ -611,6 +615,23 @@ class Daemon:
             return False
         return await self._send_line(protocol.build_ask_cancel(ask_id))
 
+    # ---- info cards (extras: ntfy) ----
+
+    def submit_card(self, card: Card) -> bool:
+        """Adapter entry point: dedupe + log + queue. Delivery happens from
+        the pump whenever a v2 link with the ntfy capability is up."""
+        return self.cards.submit(card)
+
+    async def _flush_cards(self) -> None:
+        if not self.cap_active("ntfy") or not self.link.connected:
+            return
+        card = self.cards.pop()
+        if card is None:
+            return
+        line = build_ntfy_line(card, budget=self.line_budget)
+        if not await self._send_line(line):
+            self.cards.queue.insert(0, card)  # send failed: retry next tick
+
     async def _pump(self) -> None:
         """Periodic outbound traffic: heartbeat/dedupe, status poll, daily timesync."""
         while not self._stop_evt.is_set():
@@ -621,6 +642,7 @@ class Daemon:
                     continue
                 now = time.monotonic()
                 await self._send_snapshot()  # sends on change or 10s keepalive
+                await self._flush_cards()  # one queued ntfy card per tick
                 if now - self._last_status_poll_ts >= STATUS_POLL_SECS:
                     if await self._send_line(protocol.build_status_poll()):
                         self._last_status_poll_ts = now
@@ -659,12 +681,32 @@ class Daemon:
     # ---- lifecycle ----
 
     async def start_background(self) -> list[asyncio.Task]:
-        """Extra long-running tasks (adapters); extended in later phases."""
+        """Extra long-running tasks (adapters)."""
         tasks: list[asyncio.Task] = []
         if self.cfg.claude_enabled:
             tasks.append(asyncio.create_task(self.claude_tailer.run(), name="claude-jsonl"))
         if self.cfg.codex_enabled:
             tasks.append(asyncio.create_task(self.codex_scanner.run(), name="codex-sessions"))
+        # Card pollers are the only network-touching tasks in the daemon and
+        # exist solely behind [cards] enabled (default off).
+        if self.cfg.cards_enabled:
+            if self.cfg.cards_github:
+                from .adapters.github_cards import GithubCardsPoller
+
+                poller = GithubCardsPoller(self.submit_card, repos=self.cfg.cards_repos)
+                tasks.append(asyncio.create_task(poller.run(), name="github-cards"))
+            if (
+                self.cfg.cards_weather_lat is not None
+                and self.cfg.cards_weather_lon is not None
+            ):
+                from .adapters.weather_cards import WeatherCardsPoller
+
+                weather = WeatherCardsPoller(
+                    self.submit_card,
+                    lat=self.cfg.cards_weather_lat,
+                    lon=self.cfg.cards_weather_lon,
+                )
+                tasks.append(asyncio.create_task(weather.run(), name="weather-cards"))
         return tasks
 
     async def run(self) -> None:
