@@ -31,8 +31,10 @@ log = logging.getLogger(__name__)
 SCAN_TIMEOUT_SECS = 3.0 if sys.platform == "win32" else 10.0
 BACKOFF_BASE_SECS = 3.0
 BACKOFF_MAX_SECS = 60.0
+SLOW_RETRY_SECS = 60.0  # sel:false soft-pin: retry cadence until sel flips
 STABLE_CONNECTION_SECS = 30.0
 SEND_TIMEOUT_SECS = 2.0
+CONNECTED_POLL_SECS = 1.0  # cadence of the connected-state watch loop
 CHUNK_FLOOR = 20
 _ASSEMBLY_CAP = 64 * 1024
 
@@ -105,11 +107,17 @@ def _codepoint_size(lead: int) -> int:
 class LinkManager:
     """Owns the BLE connection lifecycle. One instance per daemon.
 
-    mode:
+    mode (live-switchable via ``set_mode``):
       exclusive — hold the connection open whenever the device is around.
       ondemand  — connect only while there is outbound traffic wanted
-                  (``ensure_connected`` arms it), drop after IDLE_DISCONNECT_SECS.
-      off       — never touch the radio; ``run()`` returns immediately.
+                  (``ensure_connected`` arms it), drop after IDLE_DISCONNECT_SECS
+                  or an explicit ``release()``.
+      off       — never touch the radio (bleak is not even imported);
+                  ``run()`` idles until the mode changes.
+
+    ``backoff_floor`` (seconds) raises the minimum reconnect delay; the
+    daemon sets it to SLOW_RETRY_SECS while the device soft-pins another
+    host (hello ack sel:false) and clears it when sel flips back.
     """
 
     IDLE_DISCONNECT_SECS = 120.0
@@ -130,10 +138,12 @@ class LinkManager:
         self.name_prefix = name_prefix
         self.address = address.strip()
         self.mode = mode
+        self.backoff_floor = 0.0
         self._client = None  # BleakClient | None
         self._assembler = LineAssembler()
         self._connected_evt = asyncio.Event()
         self._want_evt = asyncio.Event()
+        self._poke_evt = asyncio.Event()
         self._send_lock = asyncio.Lock()
         self._stop_evt = asyncio.Event()
         self._cycler = RadioCycler()
@@ -152,17 +162,34 @@ class LinkManager:
     async def drop_connection(self) -> None:
         """Disconnect the current client (if any); the run() loop then walks
         its normal teardown + reconnect path. Used for dead-link recovery
-        (rxack watch) and host-switch backoff."""
+        (rxack watch), host-switch backoff, and mode changes."""
         client = self._client
         if client is not None:
             with contextlib.suppress(Exception):
                 await client.disconnect()
+
+    async def set_mode(self, mode: str) -> None:
+        """Switch the link mode live. Drops the current connection except
+        for ondemand -> exclusive (an already-open link is what exclusive
+        wants anyway)."""
+        previous, self.mode = self.mode, mode
+        if mode == "off":
+            self._want_evt.clear()
+        if previous != mode and not (mode == "exclusive" and self.connected):
+            await self.drop_connection()
+        self._poke()
+
+    async def release(self) -> None:
+        """Ondemand: the gate is over — disarm and drop the connection."""
+        self._want_evt.clear()
+        await self.drop_connection()
 
     async def ensure_connected(self, timeout: float) -> bool:
         """Arm an ondemand connection and wait for it. True when connected."""
         if self.mode == "off":
             return False
         self._want_evt.set()
+        self._poke()
         self._last_activity = time.monotonic()
         if self.connected:
             return True
@@ -196,18 +223,18 @@ class LinkManager:
             return False
 
     async def run(self) -> None:
-        """Connect/serve/reconnect until stop(). No-op when mode == 'off'."""
-        if self.mode == "off":
-            log.info("ble: mode=off, link disabled")
-            return
-        from bleak import BleakClient
-
+        """Connect/serve/reconnect until stop(). Mode gates are re-checked
+        every iteration so ``set_mode`` takes effect live; while the mode is
+        'off' (or ondemand with nothing armed) this idles without ever
+        importing bleak or touching the radio."""
         backoff = BACKOFF_BASE_SECS
         consecutive_misses = 0
         while not self._stop_evt.is_set():
-            if self.mode == "ondemand" and not self._want_evt.is_set():
-                await self._wait_want()
+            if self.mode == "off" or (self.mode == "ondemand" and not self._want_evt.is_set()):
+                await self._wait_poke()
                 continue
+            from bleak import BleakClient
+
             connect_ts: float | None = None
             try:
                 device = await self._find_device()
@@ -221,7 +248,7 @@ class LinkManager:
                     if await self._cycler.maybe_cycle(consecutive_misses):
                         backoff = BACKOFF_BASE_SECS  # cycle slept ~4s; fresh fast retry
                         continue
-                    await self._sleep(backoff)
+                    await self._sleep(max(backoff, self.backoff_floor))
                     backoff = min(backoff * 2, BACKOFF_MAX_SECS)
                     continue
                 consecutive_misses = 0
@@ -244,7 +271,7 @@ class LinkManager:
                             log.info("ble: ondemand idle, releasing connection")
                             self._want_evt.clear()
                             break
-                        await asyncio.sleep(1.0)
+                        await asyncio.sleep(CONNECTED_POLL_SECS)
                     # Clear immediately on observing the drop (teardown can lag).
                     self._connected_evt.clear()
                     log.info("ble: disconnected after %.1fs", time.monotonic() - connect_ts)
@@ -262,12 +289,16 @@ class LinkManager:
                     time.monotonic() - connect_ts >= STABLE_CONNECTION_SECS
                 ):
                     backoff = BACKOFF_BASE_SECS
-                await self._sleep(backoff)
+                if self.mode == "off" or (
+                    self.mode == "ondemand" and not self._want_evt.is_set()
+                ):
+                    continue  # released/switched off: idle instead of backing off
+                await self._sleep(max(backoff, self.backoff_floor))
                 backoff = min(backoff * 2, BACKOFF_MAX_SECS)
 
     async def stop(self) -> None:
         self._stop_evt.set()
-        self._want_evt.set()  # unblock ondemand waiters
+        self._poke()  # unblock idle waiters
         client = self._client
         if client is not None and client.is_connected:
             with contextlib.suppress(Exception):
@@ -275,13 +306,18 @@ class LinkManager:
 
     # ---- internals ----
 
-    async def _wait_want(self) -> None:
-        want = asyncio.ensure_future(self._want_evt.wait())
+    def _poke(self) -> None:
+        self._poke_evt.set()
+
+    async def _wait_poke(self) -> None:
+        """Idle until something changes (mode switch, ondemand arm, stop)."""
+        poke = asyncio.ensure_future(self._poke_evt.wait())
         stop = asyncio.ensure_future(self._stop_evt.wait())
         try:
-            await asyncio.wait({want, stop}, return_when=asyncio.FIRST_COMPLETED)
+            await asyncio.wait({poke, stop}, return_when=asyncio.FIRST_COMPLETED)
         finally:
-            for fut in (want, stop):
+            self._poke_evt.clear()
+            for fut in (poke, stop):
                 if not fut.done():
                     fut.cancel()
                     with contextlib.suppress(asyncio.CancelledError):

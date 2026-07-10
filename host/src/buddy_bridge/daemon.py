@@ -37,7 +37,7 @@ from .audit import (
     append_audit,
 )
 from .config import Config
-from .ble.link import LinkManager
+from .ble.link import SLOW_RETRY_SECS, LinkManager
 from .decision import ALLOW, ASK, DENY, DecisionRouter, build_hint, extract_detail
 from .ipc.endpoint import remove_endpoint, write_endpoint
 from .ipc.server import IpcServer
@@ -58,6 +58,12 @@ HEARTBEAT_SECS = 10.0
 STATUS_POLL_SECS = 15.0
 TIMESYNC_SECS = 24 * 3600.0
 TICK_SECS = 1.0
+# ondemand gating: a connect that can't complete fast fails open ("ask"),
+# and the device gets the gate deadline minus a safety margin to decide.
+ONDEMAND_CONNECT_SECS = 5.0
+ONDEMAND_DEADLINE_MARGIN_SECS = 10.0
+
+_BLE_MODES = ("exclusive", "ondemand", "off")
 
 
 class Daemon:
@@ -103,6 +109,9 @@ class Daemon:
         self._last_send_ts = 0.0
         self._last_timesync_ts = 0.0
         self._last_status_poll_ts = 0.0
+        self._ondemand_lock = asyncio.Lock()  # one on-demand gate at a time
+        self._tasks: list[asyncio.Task] = []
+        self._ble_task: Optional[asyncio.Task] = None
         self._stop_evt = asyncio.Event()
 
     # ---- transcript + usage ----
@@ -273,8 +282,32 @@ class Daemon:
             return None
         if event == "permission_request":
             return await self.handle_permission_request(msg)
+        if event == "set_mode":
+            return await self.handle_set_mode(msg)
         log.debug("ipc: unhandled event %r", msg)
         return None
+
+    async def handle_set_mode(self, msg: dict[str, Any]) -> dict[str, Any]:
+        mode = str(msg.get("mode") or "")
+        if mode not in _BLE_MODES:
+            return {"ok": False, "error": f"invalid mode {mode!r}"}
+        await self._apply_mode(mode)
+        return {"ok": True, "mode": mode}
+
+    async def _apply_mode(self, mode: str) -> None:
+        """Switch the BLE mode live: update config view, retarget the link,
+        and make sure the link task exists when leaving 'off'."""
+        if mode != self.cfg.ble_mode:
+            log.info("daemon: ble mode %s -> %s", self.cfg.ble_mode, mode)
+        self.cfg.ble_mode = mode
+        await self.link.set_mode(mode)
+        if mode != "off":
+            self._ensure_ble_task()
+
+    def _ensure_ble_task(self) -> None:
+        if self._ble_task is None or self._ble_task.done():
+            self._ble_task = asyncio.create_task(self.link.run(), name="ble-link")
+            self._tasks.append(self._ble_task)
 
     def handle_hook_mirror(self, msg: dict[str, Any]) -> None:
         agent = msg.get("agent")
@@ -291,15 +324,6 @@ class Daemon:
 
     def _decision_timeout(self, agent: str) -> float:
         return self.cfg.codex_decision if agent == "codex" else self.cfg.claude_decision
-
-    async def _device_available(self) -> bool:
-        if self.cfg.ble_mode == "off":
-            return False
-        if self.link.connected:
-            return True
-        if self.cfg.ble_mode == "ondemand":
-            return await self.link.ensure_connected(timeout=10.0)
-        return False
 
     async def handle_permission_request(self, msg: dict[str, Any]) -> dict[str, Any]:
         """Decide allow/deny/ask for a blocking hook request.
@@ -339,18 +363,14 @@ class Daemon:
         if klass not in (ALWAYS_ASK, STRICT):
             return {"decision": ASK}  # default: native prompt handles it
 
-        if not await self._device_available():
+        if self.cfg.ble_mode == "ondemand":
+            return await self._gate_ondemand(msg, agent, sid, tool, tool_input, hint, audit)
+
+        if self.cfg.ble_mode == "off" or not self.link.connected:
             audit(ASK, SOURCE_DAEMON_DOWN)
             return {"decision": ASK}
 
-        pending = self.router.create(
-            agent,
-            sid,
-            str(msg.get("tool_use_id") or ""),
-            hint,
-            tool=protocol.sanitize(tool),
-            detail=protocol.sanitize(extract_detail(tool_input)),
-        )
+        pending = self._create_pending(msg, agent, sid, tool, tool_input, hint)
         await self._send_snapshot(force=True)  # surface the prompt immediately
         decision = ASK
         try:
@@ -365,6 +385,59 @@ class Daemon:
         else:
             audit(ASK, SOURCE_TIMEOUT_FALLBACK)
         return {"decision": decision}
+
+    def _create_pending(self, msg, agent, sid, tool, tool_input, hint):
+        return self.router.create(
+            agent,
+            sid,
+            str(msg.get("tool_use_id") or ""),
+            hint,
+            tool=protocol.sanitize(tool),
+            detail=protocol.sanitize(extract_detail(tool_input)),
+        )
+
+    async def _gate_ondemand(self, msg, agent, sid, tool, tool_input, hint, audit) -> dict:
+        """Ondemand gating: no persistent link. Acquire the lock, connect,
+        (hello runs via the connect callback), push one focused snapshot with
+        the prompt, wait for a decision up to the gate deadline minus a
+        margin, clear the prompt, disconnect. A connect that fails fast
+        fails open ("ask")."""
+        async with self._ondemand_lock:
+            if not await self.link.ensure_connected(timeout=ONDEMAND_CONNECT_SECS):
+                audit(ASK, SOURCE_DAEMON_DOWN)
+                return {"decision": ASK}
+            await self._await_hello()
+            if not self.device_sel:  # soft-pinned to another host
+                audit(ASK, SOURCE_DAEMON_DOWN)
+                await self.link.release()
+                return {"decision": ASK}
+            pending = self._create_pending(msg, agent, sid, tool, tool_input, hint)
+            await self._send_snapshot(force=True)
+            timeout = max(0.05, self._decision_timeout(agent) - ONDEMAND_DEADLINE_MARGIN_SECS)
+            decision = ASK
+            try:
+                decision = await self.router.wait(pending, timeout)
+            finally:
+                await self._cancel_displayed_prompt(
+                    pending.wire_id, decision_from_device=decision in (ALLOW, DENY)
+                )
+                await self._send_snapshot(force=True)  # clear the prompt display
+                await self.link.release()
+            if decision in (ALLOW, DENY):
+                audit(decision, SOURCE_DEVICE)
+            else:
+                audit(ASK, SOURCE_TIMEOUT_FALLBACK)
+            return {"decision": decision}
+
+    async def _await_hello(self) -> None:
+        """Wait out an in-flight hello negotiation (bounded by its own 2s
+        deadline) so on-demand gates get v2 framing when available."""
+        while (
+            self.hello_ack is None
+            and self._hello_deadline
+            and time.monotonic() < self._hello_deadline
+        ):
+            await asyncio.sleep(0.05)
 
     async def _cancel_displayed_prompt(
         self, wire_id: str, *, decision_from_device: bool
@@ -442,13 +515,20 @@ class Daemon:
         if not ack.sel:
             await self._on_unselected()
             return
+        self.link.backoff_floor = 0.0  # selected again: normal reconnect cadence
         await self._send_snapshot(force=True)
 
     async def _on_unselected(self) -> None:
         """hello ack said sel:false — the device is soft-pinned to another
-        host and will drop this link in ~1s (host-switch handling per mode
-        lands with the multi-host phase)."""
-        log.info("ble: device is pinned to another host (sel:false)")
+        host and will drop this link in ~1s anyway. Disconnect ourselves and
+        raise the reconnect floor to a slow retry (60s) so we don't spam a
+        device that's actively pinned elsewhere, until sel flips back."""
+        log.info(
+            "ble: device is pinned to another host (sel:false); retrying every %.0fs",
+            SLOW_RETRY_SECS,
+        )
+        self.link.backoff_floor = SLOW_RETRY_SECS
+        await self.link.drop_connection()
 
     # Device decision vocabulary per REFERENCE.md ("once" approves) mapped
     # onto the router's allow/deny/ask; unknown values fail open to ask.
@@ -595,17 +675,16 @@ class Daemon:
             "daemon: ipc on 127.0.0.1:%d, home=%s, ble mode=%s",
             port, self.cfg.home, self.cfg.ble_mode,
         )
-        tasks = [
-            asyncio.create_task(self.link.run(), name="ble-link"),
-            asyncio.create_task(self._pump(), name="pump"),
-        ]
-        tasks.extend(await self.start_background())
+        self._tasks = [asyncio.create_task(self._pump(), name="pump")]
+        if self.cfg.ble_mode != "off":
+            self._ensure_ble_task()  # mode=off: BLE tasks never start
+        self._tasks.extend(await self.start_background())
         try:
             await self._stop_evt.wait()
         finally:
-            for task in tasks:
+            for task in self._tasks:
                 task.cancel()
-            for task in tasks:
+            for task in self._tasks:
                 with contextlib.suppress(asyncio.CancelledError, Exception):
                     await task
             await self.link.stop()
