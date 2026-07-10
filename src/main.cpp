@@ -2,6 +2,7 @@
 #include "config.h"
 #include "hal/hal.h"
 #include "logic/wrap_text_logic.h"
+#include "logic/persona_logic.h"
 #include <LittleFS.h>
 #include <stdarg.h>
 #include "esp_task_wdt.h"
@@ -39,8 +40,7 @@ const int CY_BASE = 120;
 const uint16_t HOT   = 0xFA20;   // red-orange: warnings, impatience, deny
 const uint16_t PANEL = 0x2104;   // overlay panel background
 
-enum PersonaState { P_SLEEP, P_IDLE, P_BUSY, P_ATTENTION, P_CELEBRATE, P_DIZZY, P_HEART };
-const char* stateNames[] = { "sleep", "idle", "busy", "attention", "celebrate", "dizzy", "heart" };
+// PersonaState / stateNames / derivePersona live in logic/persona_logic.h
 
 TamaState    tama;
 PersonaState baseState   = P_SLEEP;
@@ -508,12 +508,11 @@ static void drawClock() {
   M5.Lcd.setRotation(0);
 }
 
-PersonaState derive(const TamaState& s) {
-  if (!s.connected)            return P_IDLE;
-  if (s.sessionsWaiting > 0)   return P_ATTENTION;
-  if (s.recentlyCompleted)     return P_CELEBRATE;
-  if (s.sessionsRunning >= 3)  return P_BUSY;
-  return P_IDLE;   // connected, 0+ sessions, nothing urgent — hang out
+// Persona base-state mapping extracted to logic/persona_logic.h; pack the
+// bridge fields it consumes and let the pure header decide.
+static PersonaState derive(const TamaState& s) {
+  PersonaInputs in = { s.connected, s.sessionsRunning, s.sessionsWaiting, s.recentlyCompleted };
+  return derivePersona(in);
 }
 
 void triggerOneShot(PersonaState s, uint32_t durMs) {
