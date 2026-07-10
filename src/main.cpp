@@ -23,11 +23,11 @@ TFT_eSprite spr = TFT_eSprite(&M5.Lcd);
 // in one room are distinguishable in the desktop picker. Name persists in
 // btName for the BLUETOOTH info page.
 static char btName[16] = "Claude";
-static void startBt() {
+static void startBt(uint8_t pairMode) {
   uint8_t mac[6] = {0};
   esp_read_mac(mac, ESP_MAC_BT);
   snprintf(btName, sizeof(btName), "Claude-%02X%02X", mac[4], mac[5]);
-  bleInit(btName);
+  bleInit(btName, pairMode);
 }
 
 #include "character.h"
@@ -55,8 +55,9 @@ bool    menuOpen    = false;
 uint8_t menuSel     = 0;
 // brightness level stored in settings().bright (0..4 → ScreenBreath 20..100)
 bool    btnALong    = false;
+bool    btnBLong    = false;
 
-enum DisplayMode { DISP_NORMAL, DISP_PET, DISP_INFO, DISP_COUNT };
+enum DisplayMode { DISP_NORMAL, DISP_SESSIONS, DISP_PET, DISP_INFO, DISP_COUNT };
 uint8_t displayMode = DISP_NORMAL;
 uint8_t infoPage = 0;
 uint8_t petPage = 0;
@@ -140,9 +141,10 @@ static void sendCmd(const char* json) {
   bleWrite((const uint8_t*)json, n);
   bleWrite((const uint8_t*)"\n", 1);
 }
-const uint8_t INFO_PAGES = 6;
+const uint8_t INFO_PAGES = 7;
 const uint8_t INFO_PG_BUTTONS = 1;
-const uint8_t INFO_PG_CREDITS = 5;
+const uint8_t INFO_PG_HOSTS   = 5;
+const uint8_t INFO_PG_CREDITS = 6;
 
 void applyDisplayMode() {
   bool peek = displayMode != DISP_NORMAL;
@@ -156,20 +158,50 @@ void applyDisplayMode() {
   characterInvalidate();  // redraws character on next tick (text mode path)
 }
 
-const char* menuItems[] = { "settings", "turn off", "help", "about", "demo", "close" };
-const uint8_t MENU_N = 6;
+const char* menuItems[] = { "hosts", "settings", "turn off", "help", "about", "demo", "close" };
+const uint8_t MENU_N = 7;
 
 bool    settingsOpen = false;
 uint8_t settingsSel  = 0;
-const char* settingsItems[] = { "brightness", "volume", "bluetooth", "wifi", "led", "transcript", "clock rot", "ascii pet", "reset", "back" };
-const uint8_t SETTINGS_N = 10;
+const char* settingsItems[] = { "brightness", "volume", "pairing", "host mode", "bluetooth", "wifi", "led", "transcript", "clock rot", "ascii pet", "reset", "back" };
+const uint8_t SETTINGS_N = 12;
 
 bool    resetOpen = false;
 uint8_t resetSel  = 0;
-const char* resetItems[] = { "delete char", "factory reset", "back" };
-const uint8_t RESET_N = 3;
+const char* resetItems[] = { "delete char", "forget all hosts", "factory reset", "back" };
+const uint8_t RESET_N = 4;
 static uint32_t resetConfirmUntil = 0;
 static uint8_t  resetConfirmIdx = 0xFF;
+
+// hosts menu (multi-host P4/P6): registry rows + auto / add host / forget / back
+bool    hostsOpen  = false;
+uint8_t hostsSel   = 0;
+bool    forgetOpen = false;
+uint8_t forgetSel  = 0;
+
+// ask overlay (protocol v2, read-only): dismissed locally with B / A-long,
+// re-armed when a new ask id arrives. Cursor just scrolls the options.
+char    lastAskId[16] = "";
+bool    askDismissed  = false;
+uint8_t askCursor     = 0;
+
+// Transient toast, drawn last over whatever is on screen.
+static char     toastMsg[24] = "";
+static uint32_t toastUntil   = 0;
+static void showToast(const char* s, uint32_t ms = 1800) {
+  strncpy(toastMsg, s, sizeof(toastMsg) - 1);
+  toastMsg[sizeof(toastMsg) - 1] = 0;
+  toastUntil = millis() + ms;
+}
+
+// Is the ask overlay the active bottom-area surface right now? Any pending
+// prompt (even one already answered and showing "sent...") outranks it,
+// matching drawHUD's dispatch order.
+static bool askShowing() {
+  return tama.qAskId[0] && !askDismissed && displayMode == DISP_NORMAL &&
+         !menuOpen && !settingsOpen && !resetOpen && !hostsOpen && !forgetOpen &&
+         !tama.promptId[0];
+}
 
 static void applySetting(uint8_t idx) {
   Settings& s = settings();
@@ -186,19 +218,36 @@ static void applySetting(uint8_t idx) {
       if (s.vol) board::beep(1800, 60);   // preview the new level
       return;
     case 2:
+      // Pairing mode is baked into the BLE stack at bleInit — takes effect
+      // on the next boot. Existing bonds stay valid either way.
+      s.pair = s.pair ? 0 : 1;
+      settingsSave();
+      showToast("reboot to apply");
+      return;
+    case 3: {
+      // Host mode shortcut: cycle auto -> host 0 -> ... -> host n-1 -> auto.
+      int8_t next = s.hostsel + 1;
+      if (next >= (int8_t)hostGlueCount()) next = -1;
+      s.hostsel = next;
+      settingsSave();
+      hostGlueSetPin(next);
+      showToast(next < 0 ? "host: auto" : hostGlueGet(next)->name);
+      return;
+    }
+    case 4:
       // BT toggle is a stored preference only — BLE stays live. Turning
       // BLE off cleanly would require tearing down the BLE stack which
       // the Arduino BLE library doesn't do reliably. If we need a
       // hard-off someday, stop advertising via BLEDevice::getAdvertising().
       s.bt = !s.bt;
       break;
-    case 3: s.wifi = !s.wifi; break;   // stored only — no WiFi stack linked
-    case 4: s.led = !s.led; break;
-    case 5: s.hud = !s.hud; break;
-    case 6: s.clockRot = (s.clockRot + 1) % 3; break;
-    case 7: nextPet(); return;
-    case 8: resetOpen = true; resetSel = 0; resetConfirmIdx = 0xFF; return;
-    case 9: settingsOpen = false; characterInvalidate(); return;
+    case 5: s.wifi = !s.wifi; break;   // stored only — no WiFi stack linked
+    case 6: s.led = !s.led; break;
+    case 7: s.hud = !s.hud; break;
+    case 8: s.clockRot = (s.clockRot + 1) % 3; break;
+    case 9: nextPet(); return;
+    case 10: resetOpen = true; resetSel = 0; resetConfirmIdx = 0xFF; return;
+    case 11: settingsOpen = false; characterInvalidate(); return;
   }
   settingsSave();
 }
@@ -209,7 +258,7 @@ static void applyReset(uint8_t idx) {
   uint32_t now = millis();
   bool armed = (resetConfirmIdx == idx) && (int32_t)(now - resetConfirmUntil) < 0;
 
-  if (idx == 2) { resetOpen = false; return; }
+  if (idx == 3) { resetOpen = false; return; }
 
   if (!armed) {
     resetConfirmIdx = idx;
@@ -219,6 +268,18 @@ static void applyReset(uint8_t idx) {
   }
 
   beep(800, 200);
+  if (idx == 1) {
+    // forget all hosts: BLE bonds + host registry ("hosts" namespace),
+    // back to auto mode. Live operation — no reboot needed; the device
+    // just re-advertises for a fresh pairing.
+    hostGlueForgetAll();
+    settings().hostsel = -1;
+    settingsSave();
+    resetOpen = false;
+    resetConfirmIdx = 0xFF;
+    showToast("hosts forgotten");
+    return;
+  }
   if (idx == 0) {
     // delete char: wipe /characters/, reboot into ASCII mode
     File d = LittleFS.open("/characters");
@@ -245,10 +306,13 @@ static void applyReset(uint8_t idx) {
       d.close();
     }
   } else {
-    // factory reset: NVS namespace wipe + filesystem format + BLE bonds.
-    // Clears stats, owner, petname, species, settings, GIF characters,
-    // and any stored LTKs so the next desktop has to re-pair.
+    // factory reset: NVS namespace wipes + filesystem format + BLE bonds.
+    // Clears stats, owner, petname, species, settings, the host registry,
+    // GIF characters, and any stored LTKs so the next desktop has to re-pair.
     _prefs.begin("buddy", false);
+    _prefs.clear();
+    _prefs.end();
+    _prefs.begin("hosts", false);
     _prefs.clear();
     _prefs.end();
     LittleFS.format();
@@ -298,13 +362,19 @@ static void drawSettings() {
     } else if (i == 1) {
       if (s.vol == 0) spr.print("mut");
       else spr.printf("%u/4", s.vol);
-    } else if (i >= 2 && i <= 5) {
-      spr.setTextColor(vals[i-2] ? GREEN : p.textDim, PANEL);
-      spr.print(vals[i-2] ? " on" : "off");
-    } else if (i == 6) {
+    } else if (i == 2) {
+      spr.print(s.pair ? " jw" : " pk");   // just-works / passkey
+    } else if (i == 3) {
+      if (s.hostsel < 0) spr.print("auto");
+      else spr.printf("%.5s", hostGlueGet((uint8_t)s.hostsel)
+                                ? hostGlueGet((uint8_t)s.hostsel)->name : "?");
+    } else if (i >= 4 && i <= 7) {
+      spr.setTextColor(vals[i-4] ? GREEN : p.textDim, PANEL);
+      spr.print(vals[i-4] ? " on" : "off");
+    } else if (i == 8) {
       static const char* const RN[] = { "auto", "port", "land" };
       spr.print(RN[s.clockRot]);
-    } else if (i == 7) {
+    } else if (i == 9) {
       uint8_t total = buddySpeciesCount() + (gifAvailable ? 1 : 0);
       uint8_t pos   = buddyMode ? buddySpeciesIdx() + 1 : total;
       spr.printf("%u/%u", pos, total);
@@ -335,18 +405,19 @@ static void drawReset() {
 
 void menuConfirm() {
   switch (menuSel) {
-    case 0: settingsOpen = true; menuOpen = false; settingsSel = 0; break;
-    case 1: board::powerOff(); break;
-    case 2:
+    case 0: hostsOpen = true; menuOpen = false; hostsSel = 0; break;
+    case 1: settingsOpen = true; menuOpen = false; settingsSel = 0; break;
+    case 2: board::powerOff(); break;
     case 3:
+    case 4:
       menuOpen = false;
       displayMode = DISP_INFO;
-      infoPage = (menuSel == 2) ? INFO_PG_BUTTONS : INFO_PG_CREDITS;
+      infoPage = (menuSel == 3) ? INFO_PG_BUTTONS : INFO_PG_CREDITS;
       applyDisplayMode();
       characterInvalidate();
       break;
-    case 4: dataSetDemo(!dataDemo()); break;
-    case 5: menuOpen = false; characterInvalidate(); break;
+    case 5: dataSetDemo(!dataDemo()); break;
+    case 6: menuOpen = false; characterInvalidate(); break;
   }
 }
 
@@ -363,9 +434,136 @@ void drawMenu() {
     spr.setCursor(mx + 6, my + 8 + i * 14);
     spr.print(sel ? "> " : "  ");
     spr.print(menuItems[i]);
-    if (i == 4) spr.print(dataDemo() ? "  on" : "  off");
+    if (i == 5) spr.print(dataDemo() ? "  on" : "  off");
   }
   drawMenuHints(p, mx, mw, my + mh - 12);
+}
+
+// Hosts panel: one row per registry entry (* = connected, > = pinned), then
+// auto / add host / forget / back. Row count is dynamic but bounded:
+// BUDDY_MAX_HOSTS + 4 = 11 rows fits the 240px panel budget.
+static uint8_t hostsRowCount() { return hostGlueCount() + 4; }
+
+static void drawHosts() {
+  const Palette& p = characterPalette();
+  uint8_t n = hostGlueCount();
+  uint8_t rows = hostsRowCount();
+  int mw = 118, mh = 16 + rows * 14 + MENU_HINT_H;
+  int mx = (W - mw) / 2, my = (H - mh) / 2;
+  spr.fillRoundRect(mx, my, mw, mh, 4, PANEL);
+  spr.drawRoundRect(mx, my, mw, mh, 4, p.textDim);
+  spr.setTextSize(1);
+  int connSlot = hostGlueConnectedSlot();
+  int8_t pin = hostGluePin();
+  for (uint8_t i = 0; i < rows; i++) {
+    bool sel = (i == hostsSel);
+    spr.setTextColor(sel ? p.text : p.textDim, PANEL);
+    spr.setCursor(mx + 6, my + 8 + i * 14);
+    spr.print(sel ? "> " : "  ");
+    if (i < n) {
+      const HostRec* r = hostGlueGet(i);
+      char row[20];
+      snprintf(row, sizeof(row), "%.13s%s%s", r->name,
+               (int)i == connSlot ? "*" : "",
+               (int8_t)i == pin ? ">" : "");
+      spr.print(row);
+    } else if (i == n) {
+      spr.print("auto");
+      if (pin < 0) spr.print(" >");
+    } else if (i == n + 1) {
+      uint32_t left = blePairingRemainingMs();
+      if (left) {
+        spr.setTextColor(GREEN, PANEL);
+        spr.printf("pairing %lus", (unsigned long)((left + 999) / 1000));
+      } else {
+        spr.print("add host...");
+      }
+    } else if (i == n + 2) {
+      spr.print("forget...");
+    } else {
+      spr.print("back");
+    }
+  }
+  drawMenuHints(p, mx, mw, my + mh - 12, "Next", "Select");
+}
+
+static void drawForget() {
+  const Palette& p = characterPalette();
+  uint8_t n = hostGlueCount();
+  uint8_t rows = n + 1;   // hosts + back
+  int mw = 118, mh = 16 + rows * 14 + MENU_HINT_H;
+  int mx = (W - mw) / 2, my = (H - mh) / 2;
+  spr.fillRoundRect(mx, my, mw, mh, 4, PANEL);
+  spr.drawRoundRect(mx, my, mw, mh, 4, HOT);
+  spr.setTextSize(1);
+  for (uint8_t i = 0; i < rows; i++) {
+    bool sel = (i == forgetSel);
+    spr.setTextColor(sel ? p.text : p.textDim, PANEL);
+    spr.setCursor(mx + 6, my + 8 + i * 14);
+    spr.print(sel ? "> " : "  ");
+    if (i < n) spr.printf("%.14s", hostGlueGet(i)->name);
+    else spr.print("back");
+  }
+  drawMenuHints(p, mx, mw, my + mh - 12, "Next", "Forget");
+}
+
+static void hostsConfirm() {
+  uint8_t n = hostGlueCount();
+  if (hostsSel < n) {
+    // Pin this host. Selecting it again keeps the pin (use "auto" to clear).
+    settings().hostsel = (int8_t)hostsSel;
+    settingsSave();
+    hostGlueSetPin((int8_t)hostsSel);
+    showToast(hostGlueGet(hostsSel)->name);
+  } else if (hostsSel == n) {
+    settings().hostsel = -1;
+    settingsSave();
+    hostGlueSetPin(-1);
+    showToast("host: auto");
+  } else if (hostsSel == n + 1) {
+    // add host: toggle the 60s open-pairing window. The passkey screen takes
+    // over automatically once a peer starts pairing (blePasskey() path).
+    bool open = blePairingRemainingMs() > 0;
+    hostGluePairWindow(!open);
+    if (!open) showToast("pairing open 60s");
+  } else if (hostsSel == n + 2) {
+    if (n > 0) { forgetOpen = true; forgetSel = 0; }
+    else showToast("no hosts");
+  } else {
+    hostsOpen = false;
+    characterInvalidate();
+  }
+}
+
+static void forgetConfirm() {
+  uint8_t n = hostGlueCount();
+  if (forgetSel < n) {
+    hostGlueForget(forgetSel);
+    // Forgetting shifts slots; mirror the glue's remapped pin into settings.
+    settings().hostsel = hostGluePin();
+    settingsSave();
+    showToast("forgotten");
+    if (hostGlueCount() == 0) forgetOpen = false;
+    else if (forgetSel > hostGlueCount()) forgetSel = hostGlueCount();
+  } else {
+    forgetOpen = false;
+  }
+}
+
+// Bottom-center toast, drawn last so it floats over every surface.
+static void drawToast() {
+  if (!toastMsg[0]) return;
+  if ((int32_t)(millis() - toastUntil) >= 0) { toastMsg[0] = 0; return; }
+  const Palette& p = characterPalette();
+  int tw = (int)strlen(toastMsg) * 6 + 12;
+  int tx = (W - tw) / 2;
+  int ty = H - 56;
+  spr.fillRoundRect(tx, ty, tw, 14, 3, PANEL);
+  spr.drawRoundRect(tx, ty, tw, 14, 3, p.textDim);
+  spr.setTextSize(1);
+  spr.setTextColor(p.text, PANEL);
+  spr.setCursor(tx + 6, ty + 4);
+  spr.print(toastMsg);
 }
 
 // Clock orientation: gravity along the in-plane X axis means the stick is
@@ -590,6 +788,9 @@ void drawInfo() {
     spr.setTextColor(p.textDim, p.bg);
     ln("18 species. Settings");
     ln("> ascii pet to cycle.");
+    y += 6;
+    ln("fw %s", BUDDY_FW_VERSION);
+    ln("protocol v%d", BUDDY_PROTO_VER);
 
   } else if (infoPage == 1) {
     _infoHeader(p, y, "BUTTONS", infoPage);
@@ -701,6 +902,37 @@ void drawInfo() {
       ln(" auto-connects via BLE");
     }
 
+  } else if (infoPage == INFO_PG_HOSTS) {
+    _infoHeader(p, y, "HOSTS", infoPage);
+    uint8_t n = hostGlueCount();
+    int connSlot = hostGlueConnectedSlot();
+    int8_t pin = hostGluePin();
+    if (n == 0) {
+      spr.setTextColor(p.textDim, p.bg);
+      ln("  none paired");
+      y += 4;
+      ln("  menu > hosts >");
+      ln("  add host...");
+    } else {
+      for (uint8_t i = 0; i < n; i++) {
+        const HostRec* r = hostGlueGet(i);
+        spr.setTextColor((int)i == connSlot ? GREEN : p.textDim, p.bg);
+        ln("%c %.15s%s", (int)i == connSlot ? '*' : ' ', r->name,
+           (int8_t)i == pin ? " >" : "");
+      }
+    }
+    y += 8;
+    spr.setTextColor(p.text, p.bg);
+    ln("MODE");
+    spr.setTextColor(p.textDim, p.bg);
+    ln("  select   %s", pin < 0 ? "auto" : "pinned");
+    ln("  pairing  %s", settings().pair ? "justworks" : "passkey");
+    uint32_t left = blePairingRemainingMs();
+    if (left) {
+      spr.setTextColor(GREEN, p.bg);
+      ln("  window   %lus left", (unsigned long)((left + 999) / 1000));
+    }
+
   } else {
     _infoHeader(p, y, "CREDITS", infoPage);
     spr.setTextColor(p.textDim, p.bg);
@@ -758,6 +990,27 @@ static void drawApproval() {
   if (hlen > 21) {
     spr.setCursor(4, H - AREA + 42);
     spr.printf("%.21s", tama.promptHint + 21);
+  }
+
+  // v2: owning-session badge. With a focus pin active, prompts from other
+  // sessions are flagged instead of hidden — approvals are too important to
+  // filter away. "+Nq" = more prompts queued behind this one (host caps at 3).
+  if (tama.promptSid[0]) {
+    const Session* ss = sessionTabBySid(&_sessions, tama.promptSid);
+    const char* title = (ss && ss->title[0]) ? ss->title : tama.promptSid;
+    bool other = _sessions.pinSid[0] &&
+                 strcmp(_sessions.pinSid, tama.promptSid) != 0;
+    spr.setTextColor(other ? HOT : p.body, p.bg);
+    spr.setCursor(4, H - AREA + 52);
+    if (other) spr.printf("[other: %.10s]", title);
+    else       spr.printf("[%.16s]", title);
+    if (tama.promptQn > 0) {
+      char qb[8];
+      snprintf(qb, sizeof(qb), "+%uq", tama.promptQn);
+      spr.setTextColor(p.textDim, p.bg);
+      spr.setCursor(W - (int)strlen(qb) * 6 - 4, H - AREA + 52);
+      spr.print(qb);
+    }
   }
 
   if (responseSent) {
@@ -945,20 +1198,190 @@ void drawPet() {
   spr.printf("%u/%u", petPage + 1, PET_PAGES);
 }
 
+// Compact token count for one-line rows: 842 / 18k / 90k / 1.2M
+static void fmtTok(char* out, size_t cap, uint32_t v) {
+  if (v >= 1000000)   snprintf(out, cap, "%lu.%luM", (unsigned long)(v / 1000000),
+                               (unsigned long)((v / 100000) % 10));
+  else if (v >= 1000) snprintf(out, cap, "%luk", (unsigned long)(v / 1000));
+  else                snprintf(out, cap, "%lu", (unsigned long)v);
+}
+
+// DISP_SESSIONS: per-session list from the v2 heartbeat. Two rows each:
+// [cursor][state][agent] title ....tok / dimmed last-line. State glyphs are
+// ASCII because the on-device fonts stop at 0x7E: > run, ! wait, . idle,
+// * done. BtnB short moves the selection, BtnB long pins/unpins focus.
+static void drawSessions() {
+  const Palette& p = characterPalette();
+  const int TOP = 70;
+  spr.fillRect(0, TOP, W, H - TOP, p.bg);
+  spr.setTextSize(1);
+  int y = TOP + 2;
+
+  // Header: connected host's name left, session count right. (Spec sketch
+  // says "<hostname> · N sess" — the middot isn't in the ASCII font.)
+  const char* hn = hostGlueActiveName();
+  spr.setTextColor(p.text, p.bg);
+  spr.setCursor(4, y);
+  spr.printf("%.13s", hn[0] ? hn : (tama.connected ? "host" : "no host"));
+  char cnt[10];
+  snprintf(cnt, sizeof(cnt), "%u sess", _sessions.count);
+  spr.setTextColor(p.textDim, p.bg);
+  spr.setCursor(W - (int)strlen(cnt) * 6 - 4, y);
+  spr.print(cnt);
+  y += 14;
+
+  int selIdx = sessionTabSelIdx(&_sessions);
+  int pinIdx = sessionTabPinIdx(&_sessions);
+  for (uint8_t i = 0; i < _sessions.count; i++) {
+    const Session& s = _sessions.s[i];
+    bool sel = (int)i == selIdx;
+    char g = s.state == SES_RUN  ? '>' :
+             s.state == SES_WAIT ? '!' :
+             s.state == SES_DONE ? '*' : '.';
+    char a = (s.agent[0] == 'x' || strncmp(s.agent, "codex", 5) == 0) ? 'X' : 'C';
+
+    // Row 1: cursor, state glyph (waiting highlighted), agent, title, tokens
+    spr.setCursor(2, y);
+    spr.setTextColor(sel ? p.text : p.textDim, p.bg);
+    spr.print(sel ? '>' : ' ');
+    spr.setTextColor(s.state == SES_WAIT ? HOT : (sel ? p.text : p.textDim), p.bg);
+    spr.print(g);
+    spr.setTextColor(sel ? p.text : p.textDim, p.bg);
+    spr.print(a);
+    spr.print(' ');
+    spr.printf("%.12s", s.title[0] ? s.title : s.sid);
+    char tok[8];
+    fmtTok(tok, sizeof(tok), s.tok);
+    spr.setTextColor(p.textDim, p.bg);
+    spr.setCursor(W - (int)strlen(tok) * 6 - 4, y);
+    spr.print(tok);
+    y += 9;
+
+    // Row 2: last activity line, dimmed; focus-pin marker at the far right
+    spr.setTextColor(p.textDim, p.bg);
+    spr.setCursor(8, y);
+    spr.printf("%.19s", s.last);
+    if ((int)i == pinIdx) {
+      spr.setTextColor(p.body, p.bg);
+      spr.setCursor(W - 10, y);
+      spr.print("#");
+    }
+    y += 11;
+  }
+
+  spr.setTextColor(p.textDim, p.bg);
+  spr.setCursor(4, H - 10);
+  spr.print(pinIdx >= 0 ? "B:next  hold:unpin" : "B:next  hold:pin");
+}
+
+// Ask overlay (protocol v2, read-only): first question of an ask event.
+// Priority sits just below the approval overlay — a pending permission
+// prompt always wins the bottom area. A scrolls the option cursor, B or
+// A-long dismisses; answering happens on the desktop.
+static void drawAsk() {
+  const Palette& p = characterPalette();
+  const int AREA = 104;
+  spr.fillRect(0, H - AREA, W, AREA, p.bg);
+  spr.drawFastHLine(0, H - AREA, W, p.textDim);
+  spr.setTextSize(1);
+  int y = H - AREA + 3;
+
+  spr.setTextColor(p.body, p.bg);
+  spr.setCursor(4, y);
+  if (tama.qHeader[0]) spr.printf("%.21s", tama.qHeader);
+  else spr.print("Question");
+  if (tama.qMulti) {
+    spr.setTextColor(p.textDim, p.bg);
+    spr.setCursor(W - 22, y);
+    spr.print("m+");   // multi-select hint
+  }
+  y += 10;
+
+  // Question text, wrapped to at most 3 rows
+  char rows[3][24];
+  uint8_t nRows = wrapInto(tama.qText, rows, 3, 21);
+  spr.setTextColor(p.text, p.bg);
+  for (uint8_t i = 0; i < nRows; i++) {
+    spr.setCursor(4, y);
+    spr.print(rows[i]);
+    y += 8;
+  }
+  y = H - AREA + 3 + 10 + 3 * 8 + 2;   // options at a fixed y for stability
+
+  for (uint8_t i = 0; i < tama.qNOpts; i++) {
+    bool cur = i == askCursor;
+    spr.setTextColor(cur ? p.text : p.textDim, p.bg);
+    spr.setCursor(4, y);
+    spr.printf("%c%.20s", cur ? '>' : ' ', tama.qOpts[i]);
+    y += 9;
+  }
+
+  spr.setTextColor(p.textDim, p.bg);
+  spr.setCursor(4, H - 10);
+  spr.print("answer on desktop");
+  spr.setCursor(W - 40, H - 10);
+  spr.print("B:ok");
+}
+
 void drawHUD() {
   if (tama.promptId[0]) { drawApproval(); return; }
+  if (tama.qAskId[0] && !askDismissed) { drawAsk(); return; }
   const Palette& p = characterPalette();
   const int SHOW = 3, LH = 8, WIDTH = 21;
-  const int AREA = SHOW * LH + 4;
+  const int BADGE = 10;
+  const int AREA = SHOW * LH + 4 + BADGE;
   spr.fillRect(0, H - AREA, W, AREA, p.bg);
   spr.setTextSize(1);
+
+  // Host badge line (v2): connected host's name — or the focus-pinned
+  // session's title — plus ntfy count and one pip per session (host sends
+  // waiting-first; wait pips run hot, running green).
+  {
+    int by = H - AREA + 1;
+    int pinIdx = sessionTabPinIdx(&_sessions);
+    spr.setCursor(4, by);
+    if (pinIdx >= 0) {
+      spr.setTextColor(p.body, p.bg);
+      spr.printf("#%.11s", _sessions.s[pinIdx].title);
+    } else if (!tama.connected) {
+      spr.setTextColor(p.textDim, p.bg);
+      spr.print("no host");
+    } else {
+      const char* hn = hostGlueActiveName();
+      spr.setTextColor(p.textDim, p.bg);
+      spr.printf("%.11s", hn[0] ? hn : "host");
+    }
+    if (_ntfy.count) {
+      char nb[6];
+      snprintf(nb, sizeof(nb), "n%u", _ntfy.count);
+      spr.setTextColor(p.body, p.bg);
+      spr.setCursor(W - 8 - (int)_sessions.count * 7 - (int)strlen(nb) * 6, by);
+      spr.print(nb);
+    }
+    for (uint8_t i = 0; i < _sessions.count; i++) {
+      uint16_t c = _sessions.s[i].state == SES_WAIT ? HOT
+                 : _sessions.s[i].state == SES_RUN  ? GREEN : p.textDim;
+      int px = W - 8 - (int)(_sessions.count - 1 - i) * 7;
+      if (_sessions.s[i].state == SES_RUN || _sessions.s[i].state == SES_WAIT)
+        spr.fillCircle(px, by + 3, 2, c);
+      else
+        spr.drawCircle(px, by + 3, 2, c);
+    }
+  }
 
   if (tama.lineGen != lastLineGen) { lastLineGen = tama.lineGen; wake(); }
 
   if (tama.nLines == 0) {
     spr.setTextColor(p.text, p.bg);
     spr.setCursor(4, H - LH - 2);
-    spr.print(tama.msg);
+    // Focus pin filters the idle line: show the pinned session's last
+    // activity instead of the global summary when transcripts are off.
+    int pinIdx = sessionTabPinIdx(&_sessions);
+    if (pinIdx >= 0 && _sessions.s[pinIdx].last[0]) {
+      spr.printf("%.21s", _sessions.s[pinIdx].last);
+    } else {
+      spr.print(tama.msg);
+    }
     return;
   }
 
@@ -997,8 +1420,15 @@ void setup() {
   board::begin();        // M5.begin + speaker + per-board power/LED setup
   board::serialInit();
   M5.Display.setRotation(0);
-  startBt();
-  settingsLoad();
+  settingsLoad();                 // before startBt: bleInit needs s_pair
+  startBt(settings().pair);
+  // Registry after bleInit (the Bluedroid bond store must be up for the
+  // boot reconcile), then mirror any pin remap back into settings.
+  hostGlueInit(settings().hostsel, settings().hostfb);
+  if (hostGluePin() != settings().hostsel) {
+    settings().hostsel = hostGluePin();
+    settingsSave();
+  }
   applyBrightness();
   applyVolume();
   lastInteractMs = millis();
@@ -1070,6 +1500,7 @@ void loop() {
   t++;
   uint32_t now = millis();
 
+  hostGluePoll(now);   // multi-host policy engine (soft-pin, pairing window)
   dataPoll(&tama);
   if (statsPollLevelUp()) triggerOneShot(P_CELEBRATE, 3000);
   baseState = derive(tama);
@@ -1129,10 +1560,24 @@ void loop() {
       // Jump to the approval screen no matter what was open — drawApproval
       // only runs from drawHUD which only runs in DISP_NORMAL.
       displayMode = DISP_NORMAL;
-      menuOpen = settingsOpen = resetOpen = false;
+      menuOpen = settingsOpen = resetOpen = hostsOpen = forgetOpen = false;
       applyDisplayMode();
       characterInvalidate();
       if (buddyMode) buddyInvalidate();
+    }
+  }
+
+  // Ask arrival (v2, read-only): chirp + re-arm the overlay for the new id.
+  // Unlike prompts it doesn't hijack the display mode — it renders when the
+  // HUD is visible and waits its turn behind a pending approval.
+  if (strcmp(tama.qAskId, lastAskId) != 0) {
+    strncpy(lastAskId, tama.qAskId, sizeof(lastAskId) - 1);
+    lastAskId[sizeof(lastAskId) - 1] = 0;
+    askDismissed = false;
+    askCursor = 0;
+    if (tama.qAskId[0]) {
+      wake();
+      beep(1000, 80);
     }
   }
 
@@ -1142,7 +1587,7 @@ void loop() {
   static const uint32_t PROMPT_TIMEOUT_MS = 5UL * 60UL * 1000UL;
   if (tama.promptId[0] && !responseSent
       && (millis() - promptArrivedMs) > PROMPT_TIMEOUT_MS) {
-    tama.promptId[0] = 0;
+    protoPromptClear(&tama);   // id + tool/hint + v2 sid/qn together
   }
 
   bool inPrompt = tama.promptId[0] && !responseSent;
@@ -1177,7 +1622,10 @@ void loop() {
   if (M5.BtnA.pressedFor(600) && !btnALong && !swallowBtnA) {
     btnALong = true;
     beep(800, 60);
-    if (resetOpen) { resetOpen = false; }
+    if (askShowing()) { askDismissed = true; }   // A-long dismisses the ask card
+    else if (forgetOpen) { forgetOpen = false; }
+    else if (hostsOpen) { hostsOpen = false; characterInvalidate(); }
+    else if (resetOpen) { resetOpen = false; }
     else if (settingsOpen) { settingsOpen = false; characterInvalidate(); }
     else {
       menuOpen = !menuOpen;
@@ -1197,6 +1645,15 @@ void loop() {
         statsOnApproval(tookS);
         beep(2400, 60);
         if (tookS < 5) triggerOneShot(P_HEART, 2000);
+      } else if (askShowing()) {
+        beep(1800, 30);
+        if (tama.qNOpts > 0) askCursor = (uint8_t)((askCursor + 1) % tama.qNOpts);
+      } else if (forgetOpen) {
+        beep(1800, 30);
+        forgetSel = (uint8_t)((forgetSel + 1) % (hostGlueCount() + 1));
+      } else if (hostsOpen) {
+        beep(1800, 30);
+        hostsSel = (uint8_t)((hostsSel + 1) % hostsRowCount());
       } else if (resetOpen) {
         beep(1800, 30);
         resetSel = (resetSel + 1) % RESET_N;
@@ -1210,6 +1667,10 @@ void loop() {
       } else {
         beep(1800, 30);
         displayMode = (displayMode + 1) % DISP_COUNT;
+        // Session list is pointless while empty — skip it in the cycle.
+        if (displayMode == DISP_SESSIONS && _sessions.count == 0) {
+          displayMode = (displayMode + 1) % DISP_COUNT;
+        }
         applyDisplayMode();
       }
     }
@@ -1217,17 +1678,51 @@ void loop() {
     swallowBtnA = false;
   }
 
-  // BtnB: pet → heart
-  if (M5.BtnB.wasPressed()) {
-    if (swallowBtnB) { swallowBtnB = false; }
-    else
-    if (inPrompt) {
+  // BtnB: short = act on release (deny / select / next); long (600ms) =
+  // session focus controls. Release-based so the long press doesn't also
+  // fire the short action — same pattern as BtnA.
+  // Only claim the press as "long" when a long action actually exists in
+  // this context — otherwise a slow B press must still fire its short
+  // action on release (a held B during a prompt still denies, etc).
+  if (M5.BtnB.pressedFor(600) && !btnBLong && !swallowBtnB &&
+      !inPrompt && !menuOpen && !settingsOpen && !resetOpen &&
+      !hostsOpen && !forgetOpen && !askShowing()) {
+    if (displayMode == DISP_SESSIONS) {
+      // pin/unpin focus on the selected session
+      btnBLong = true;
+      beep(800, 60);
+      bool pinned = sessionTabTogglePin(&_sessions);
+      showToast(pinned ? "focus pinned" : "focus cleared");
+    } else if (displayMode == DISP_NORMAL) {
+      btnBLong = true;
+      beep(800, 60);
+      if (_sessions.count > 0) {
+        displayMode = DISP_SESSIONS;
+        applyDisplayMode();
+      } else {
+        showToast("no sessions");
+      }
+    }
+  }
+  if (M5.BtnB.wasReleased()) {
+    if (swallowBtnB || btnBLong) {
+      // swallowed wake press or long-press already handled
+    } else if (inPrompt) {
       char cmd[96];
       snprintf(cmd, sizeof(cmd), "{\"cmd\":\"permission\",\"id\":\"%s\",\"decision\":\"deny\"}", tama.promptId);
       sendCmd(cmd);
       responseSent = true;
       statsOnDenial();
       beep(600, 60);
+    } else if (askShowing()) {
+      beep(2400, 30);
+      askDismissed = true;   // read-only card — B just puts it away
+    } else if (forgetOpen) {
+      beep(2400, 30);
+      forgetConfirm();
+    } else if (hostsOpen) {
+      beep(2400, 30);
+      hostsConfirm();
     } else if (resetOpen) {
       beep(2400, 30);
       applyReset(resetSel);
@@ -1244,10 +1739,15 @@ void loop() {
       beep(2400, 30);
       petPage = (petPage + 1) % PET_PAGES;
       applyDisplayMode();
+    } else if (displayMode == DISP_SESSIONS) {
+      beep(2400, 30);
+      sessionTabSelectNext(&_sessions);
     } else {
       beep(2400, 30);
       msgScroll = (msgScroll >= 30) ? 0 : msgScroll + 1;
     }
+    btnBLong = false;
+    swallowBtnB = false;
   }
 
   // blink bookkeeping
@@ -1261,6 +1761,7 @@ void loop() {
   // doesn't count as activity (it's the only way to get the RTC synced).
   bool clocking = displayMode == DISP_NORMAL
                && !menuOpen && !settingsOpen && !resetOpen && !inPrompt
+               && !hostsOpen && !forgetOpen && !askShowing()
                && tama.sessionsRunning == 0 && tama.sessionsWaiting == 0
                && dataRtcValid() && _onUsb;
   if (clocking) clockUpdateOrient();
@@ -1334,10 +1835,14 @@ void loop() {
     else if (clocking) drawClock();
     else if (displayMode == DISP_INFO) drawInfo();
     else if (displayMode == DISP_PET) drawPet();
+    else if (displayMode == DISP_SESSIONS) drawSessions();
     else if (settings().hud) drawHUD();
-    if (resetOpen) drawReset();
+    if (forgetOpen) drawForget();
+    else if (hostsOpen) drawHosts();
+    else if (resetOpen) drawReset();
     else if (settingsOpen) drawSettings();
     else if (menuOpen) drawMenu();
+    drawToast();
     spr.pushSprite(0, 0);
   }
 

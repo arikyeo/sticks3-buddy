@@ -1,6 +1,7 @@
 #pragma once
 #include <Arduino.h>
 #include <Preferences.h>
+#include "config.h"
 
 // Header-only with file-static state: include from exactly one translation
 // unit (main.cpp). Including from a second .cpp produces duplicate symbols.
@@ -36,8 +37,12 @@ static bool _dirty = false;
 // from the old s_snd so a muted device stays muted (false → 0, else default
 // 3). s_snd itself is left in place — old firmware can still boot off it —
 // it just stops being written.
+// v2 → v3: multi-host / protocol v2 knobs. hostsel (I8: -1 auto, 0..6 pinned
+// registry slot), hostfb (U8: pinned-host no-show fallback, 0 stay / 1 auto),
+// s_pair (U8: 0 SC passkey / 1 SC just-works). Seeded to the stock behavior
+// (auto host, auto fallback, passkey pairing) so an upgrade changes nothing.
 // Idempotent: sv=N short-circuits every boot after the first.
-static const uint8_t NVS_SCHEMA_V = 2;
+static const uint8_t NVS_SCHEMA_V = 3;
 
 inline void nvsMigrate() {
   _prefs.begin("buddy", false);
@@ -56,6 +61,12 @@ inline void nvsMigrate() {
       _prefs.putUChar("s_vol", _prefs.getBool("s_snd", true) ? 3 : 0);
     }
     _prefs.putUChar("sv", 2);
+  }
+  if (_prefs.getUChar("sv", 0) < 3) {
+    if (!_prefs.isKey("hostsel")) _prefs.putChar("hostsel", -1);
+    if (!_prefs.isKey("hostfb"))  _prefs.putUChar("hostfb", 1);
+    if (!_prefs.isKey("s_pair"))  _prefs.putUChar("s_pair", 0);
+    _prefs.putUChar("sv", 3);
   }
   _prefs.end();
 }
@@ -222,9 +233,12 @@ struct Settings {
   bool hud;
   uint8_t clockRot;  // 0=auto 1=portrait 2=landscape
   uint8_t bright;    // 0..4 → ScreenBreath 20..100
+  uint8_t pair;      // 0 = SC passkey (MITM), 1 = SC just-works; applied at bleInit
+  int8_t  hostsel;   // -1 auto, 0..6 pinned host registry slot
+  uint8_t hostfb;    // pinned-host no-show fallback: 0 stay, 1 auto after 30s
 };
 
-static Settings _settings = { 3, true, false, true, true, 0, 4 };
+static Settings _settings = { 3, true, false, true, true, 0, 4, 0, -1, 1 };
 
 inline void settingsLoad() {
   nvsMigrate();   // idempotent; setup() calls settingsLoad before statsLoad,
@@ -240,6 +254,12 @@ inline void settingsLoad() {
   if (_settings.clockRot > 2) _settings.clockRot = 0;
   _settings.bright   = _prefs.getUChar("s_bright", 4);
   if (_settings.bright > 4) _settings.bright = 4;
+  _settings.pair     = _prefs.getUChar("s_pair", 0);   // seeded by nvsMigrate v3
+  if (_settings.pair > 1) _settings.pair = 0;
+  _settings.hostsel  = _prefs.getChar("hostsel", -1);
+  if (_settings.hostsel >= BUDDY_MAX_HOSTS) _settings.hostsel = -1;
+  _settings.hostfb   = _prefs.getUChar("hostfb", 1);
+  if (_settings.hostfb > 1) _settings.hostfb = 1;
   _prefs.end();
 }
 
@@ -252,6 +272,9 @@ inline void settingsSave() {
   _prefs.putBool("s_hud",    _settings.hud);
   _prefs.putUChar("s_crot",  _settings.clockRot);
   _prefs.putUChar("s_bright", _settings.bright);
+  _prefs.putUChar("s_pair",  _settings.pair);
+  _prefs.putChar("hostsel",  _settings.hostsel);
+  _prefs.putUChar("hostfb",  _settings.hostfb);
   _prefs.end();
 }
 

@@ -290,3 +290,42 @@ Resolved ambiguities — both sides are built to these; treat as normative:
 8. **`state:"done"`** is defined but not currently emitted by the reference host (sessions drop on end); devices must still tolerate it.
 9. **`rxack.n`** is advisory; hosts treat any rx-ack as liveness and do not verify the count.
 10. **`prompt.sid`/`prompt.qn` are proto-gated, not cap-gated**: hosts send them whenever negotiated proto ≥ 2, even if `sessions` wasn't negotiated. Standard unknown-field tolerance applies.
+
+## Firmware implementation notes (reference device)
+
+Decisions the reference firmware (this repo) made where the spec above is
+silent or loose — pinned here so hosts don't have to reverse-engineer them.
+
+- **`prompt.qn` semantics** (host+firmware agreed): the count of prompts
+  *queued behind* the shown one for the same session, capped at 3; `0` or
+  absent means it's the only one. It is not a question index. The device
+  renders it as a `+Nq` badge.
+- **rxack `n` counts bytes**, per the wording above: total bytes received
+  on that transport (since connect for BLE, since boot for USB serial),
+  reported after each received line. Hosts must not assert a specific
+  meaning — any rx ack is proof of liveness.
+- **Capability gating is asymmetric by design.** The device only *sends*
+  v2 traffic (rx acks) if the host's `hello` caps asked for it, but it
+  *accepts* v2 messages (`sessions[]`, `ask`, `ntfy`, `prompt_cancel`)
+  post-hello without re-checking the host's claimed caps — the host gates
+  its own sends on the device's ack caps. `ntfy` in particular never
+  appears in a host's hello caps.
+- **Pre-hello, unknown `cmd`s are swallowed silently** (no ack) — that is
+  long-standing v1 firmware behavior and exactly what `prompt_cancel` or
+  other v2 commands hit if sent before `hello`. `hello` itself is always
+  answered.
+- **`ask` / `ask_cancel` / `ntfy` are events, not commands: no acks.**
+  "Works the same way as `prompt_cancel`" means clear-by-id, not the ack.
+  Only the first entry of `questions[]` is displayed, first 4 options.
+- **`sel:false` timing**: the losing link gets the `sel:false` ack first,
+  then the disconnect ~0.3s later (well inside the ~1s the spec promises).
+  The pinned-host decision is made per connection; a pairing window
+  (explicit user action on the device) suspends it.
+- **Pairing security**: outside a device-initiated 60s pairing window, a
+  connection from an unbonded peer is dropped before pairing can start
+  (drive-by-bonding guard). Exception: a device with zero stored bonds is
+  open, preserving the out-of-box flow. NUS characteristics stay
+  encrypted-only in both pairing modes (passkey and just-works).
+- **Replies are dual-written** to USB serial and BLE, like every v1 ack —
+  a host may see acks for the other transport's traffic and must ignore
+  unknown/unexpected acks (the v1 tolerance rule, applied to acks).
