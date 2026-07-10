@@ -18,6 +18,10 @@
 #include "audio/tunes.h"   // tune engine + slot registry (8MB boards only)
 #include "ir/ir_remote.h"  // raw RMT learn/replay (8MB boards only)
 #endif
+#ifdef BUDDY_OTA
+#include "ota/ota.h"       // WiFi OTA from GitHub releases (-ota envs only)
+#endif
+#include "esp_ota_ops.h"   // rollback mark-valid on healthy boot (all builds)
 
 #ifdef BUDDY_DEBUG
 #include "esp_system.h"
@@ -146,6 +150,9 @@ static bool powerBusyGuard() {
 #ifdef BUDDY_EXTRAS_FULL
   if (irLearning()) return true;
 #endif
+#ifdef BUDDY_OTA
+  if (otaInProgress()) return true;
+#endif
   return false;
 }
 
@@ -218,8 +225,15 @@ void applyDisplayMode() {
   characterInvalidate();  // redraws character on next tick (text mode path)
 }
 
+// OTA builds append an "update..." row (kept just above "close" so the
+// muscle-memory indices of everything else survive across build tiers).
+#ifdef BUDDY_OTA
+const char* menuItems[] = { "hosts", "settings", "extras", "turn off", "help", "about", "demo", "update...", "close" };
+const uint8_t MENU_N = 9;
+#else
 const char* menuItems[] = { "hosts", "settings", "extras", "turn off", "help", "about", "demo", "close" };
 const uint8_t MENU_N = 8;
+#endif
 
 // extras: pomodoro (and, on BUDDY_EXTRAS_FULL builds, more) live on a
 // screen parked OUTSIDE the A-press carousel — reached via menu > extras,
@@ -510,6 +524,50 @@ static void drawReset() {
   drawMenuHints(p, mx, mw, my + mh - 12);
 }
 
+#ifdef BUDDY_OTA
+// OTA progress screen. The whole flow is blocking (otaRun), so this
+// callback is the only thing painting; the full-sprite redraw + single
+// pushSprite per change is inherently flicker-free (the oh001738 fix, but
+// on a sprite instead of per-glyph LCD writes), and the dedupe of repeat
+// (status,pct) pairs happens in ota.cpp.
+static void otaDrawProgress(const char* status, int pct) {
+  const Palette& p = characterPalette();
+  spr.fillSprite(p.bg);
+  spr.setTextSize(1);
+  spr.setTextColor(p.body, p.bg);
+  spr.setCursor(8, 56);  spr.print("FIRMWARE UPDATE");
+  spr.setTextColor(p.text, p.bg);
+  spr.setCursor(8, 96);  spr.printf("%.20s", status);
+  const int BX = 8, BW = W - 16, BH = 10, BY = 120;
+  spr.drawRect(BX, BY, BW, BH, p.textDim);
+  if (pct >= 0) {
+    int fill = (int)((int32_t)(BW - 2) * pct / 100);
+    if (fill > 0) spr.fillRect(BX + 1, BY + 1, fill, BH - 2, p.body);
+    spr.setTextColor(p.textDim, p.bg);
+    spr.setCursor(8, 138); spr.printf("%d%%", pct);
+  }
+  spr.setTextColor(p.textDim, p.bg);
+  spr.setCursor(8, 184);  spr.print("keep power on");
+  spr.setCursor(8, 194);  spr.print("ble stays paired");
+  spr.pushSprite(0, 0);
+}
+
+// menu > update... — the consent step. Blocks until flashed (device
+// reboots inside otaRun) or failed/up-to-date, which lands back here.
+static void otaStart() {
+  char err[64];
+  otaRun(otaDrawProgress, err, sizeof(err));
+  // Only failure paths return. Leave the message up long enough to read,
+  // then hand the screen back to the normal render loop.
+  otaDrawProgress(err[0] ? err : "update failed", -1);
+  delay(2500);
+  showToast(err[0] ? err : "update failed", 2600);
+  applyDisplayMode();
+  characterInvalidate();
+  if (buddyMode) buddyInvalidate();
+}
+#endif
+
 void menuConfirm() {
   switch (menuSel) {
     case 0: hostsOpen = true; menuOpen = false; hostsSel = 0; break;
@@ -525,7 +583,12 @@ void menuConfirm() {
       characterInvalidate();
       break;
     case 6: dataSetDemo(!dataDemo()); break;
+#ifdef BUDDY_OTA
+    case 7: menuOpen = false; otaStart(); break;
+    case 8: menuOpen = false; characterInvalidate(); break;
+#else
     case 7: menuOpen = false; characterInvalidate(); break;
+#endif
   }
 }
 
@@ -1631,6 +1694,10 @@ static uint16_t cardKindColor(const char* kind, const Palette& p) {
   if (strcmp(kind, "gh") == 0) return p.body;
   if (strcmp(kind, "ci") == 0) return GREEN;
   if (strcmp(kind, "weather") == 0 || strcmp(kind, "wx") == 0) return 0x07FF;
+  // firmware-update-available badge (bridge-pushed; see PROTOCOL_V2.md).
+  // Hot tag = "worth a look", but it's still just a card — updating stays
+  // a deliberate walk to menu > update... on OTA builds.
+  if (strcmp(kind, "update") == 0) return HOT;
   return p.textDim;   // unknown kinds render generic, per spec
 }
 
@@ -2423,6 +2490,23 @@ void loop() {
     bleConnParams(true);   // relax link first — it's a queued radio request
     setCpuFrequencyMhz(BUDDY_SCREEN_OFF_CPU_MHZ);
   }
+
+#ifdef CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE
+  // OTA rollback safety: the arduino core ships with bootloader rollback
+  // on, so a slot written by OTA boots as PENDING_VERIFY and the bootloader
+  // reverts to the previous slot on the NEXT reboot unless the app marks
+  // itself valid. 15s of uptime with BLE up and the loop alive is the
+  // "healthy" bar — a boot-crash or a wedged loop trips the 12s TWDT first,
+  // and that reboot is exactly what triggers the fallback. Lives in ALL
+  // builds, not just -DBUDDY_OTA: an -ota device can flash a plain release
+  // image, and that image must self-validate too or it rolls back after
+  // its first reboot. No-op (state != pending-verify) on esptool flashes.
+  static bool otaSlotValidated = false;
+  if (!otaSlotValidated && now > 15000) {
+    otaSlotValidated = true;
+    esp_ota_mark_app_valid_cancel_rollback();
+  }
+#endif
 
   delay(screenOff ? 100 : 16);
 }

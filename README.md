@@ -98,8 +98,37 @@ pio run -e m5stick-s3            # build
 pio run -e m5stick-s3 -t upload  # build and flash
 ```
 
+Other envs: `m5stickc-plus`, `m5stickc-plus2`, and the OTA-capable
+variants below.
+
 CI builds and size-guards every push and PR to `main` and `track-*`
 branches; see `.github/workflows/ci.yml`.
+
+### Over-the-air updates (optional)
+
+The default build is BLE-only. An opt-in variant adds a WiFi OTA flow
+that pulls the latest GitHub release from the device's own menu:
+
+```bash
+pio run -e m5stick-s3-ota -t upload       # S3 with menu > update...
+pio run -e m5stickc-plus2-ota -t upload   # Plus2 variant (no PSRAM — tighter heap)
+```
+
+One-time WiFi provisioning (credentials go to device NVS; wiped by
+factory reset, never echoed back):
+
+```bash
+python tools/test_protocol.py --skip-debug --wifi "MySSID" "MyPass"
+```
+
+or send `{"cmd":"wifi","ssid":"...","pass":"..."}` yourself over the
+encrypted BLE link or USB serial, after `hello`. Then on the device:
+**hold A → update...** — it joins WiFi, checks the latest release,
+flashes the inactive slot, reboots, and turns WiFi back off. If the new
+firmware fails to come up healthy, the bootloader rolls back to the
+previous slot on the next reboot. Details, asset naming, and the TLS
+caveat: [PROTOCOL_V2.md](PROTOCOL_V2.md), "WiFi provisioning + OTA".
+The 4MB `m5stickc-plus` has no second app slot and no OTA variant.
 
 ## Project layout
 
