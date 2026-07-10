@@ -950,6 +950,8 @@ class Daemon:
         _, running, waiting = self.registry.counts()
         if running or waiting or self.router.pending_count():
             return
+        if self._fed_active() and self.federation.pending_total() > 0:
+            return  # a federated prompt is on OUR display: keep the stick
         if not self._remote_pending:
             return
         for _ in range(len(self.cards.queue)):

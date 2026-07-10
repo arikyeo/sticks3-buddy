@@ -481,3 +481,21 @@ async def test_forged_decision_cannot_resolve_without_pending(origin):
         {"bb": 1, "ev": "decision", "host": "hold01", "id": "nope",
          "decision": "allow"})
     assert origin.router.pending_count() == 0  # nothing resolved, nothing crashed
+
+
+async def test_displayed_fed_prompt_blocks_v1_early_yield(holder):
+    await holder._on_peer_event(_state_sync(host="peer01", prompt={
+        "id": "p1", "tool": "Bash", "hint": "x",
+    }))
+    # an otherwise-idle holder would early-yield to a v1 peer's prompt, but
+    # a federated prompt on OUR display means the stick is in use
+    await holder._on_peer_event(
+        {"bb": 1, "ev": "prompt_pending", "host": "old99", "name": "carol",
+         "agent": "claude", "tool": "Bash", "hint": "make y", "sid": "s2"}
+    )
+    assert holder.yielding is False and holder.link.drops == 0
+    assert holder._local_busy() is True  # idle-yield holds off too
+    # the fed prompt resolves -> the v1 peer's demand can pull the stick again
+    holder.federation.drop_prompt("peer01")
+    await holder._maybe_peer_yield()
+    assert holder.yielding is True
