@@ -275,3 +275,18 @@ use to pick an icon or sound; treat unknown `kind` values as generic.
 | Link liveness         | 30s no-snapshot = dead           | + `rxack` for send-side dead detection (20s)  |
 | Clock                 | one-shot `time` on connect       | + daily resync                                |
 | Notifications         | not supported                    | optional `ntfy` cards                         |
+
+## Clarifications (locked during first host+firmware implementation)
+
+Resolved ambiguities — both sides are built to these; treat as normative:
+
+1. **`prompt.qn`** = count of prompts queued *behind* the displayed one for the same session, capped at 3. `0`/absent when nothing queued. Devices render `+N queued`; it is **not** a question index.
+2. **`ack.data.sel` absent** → hosts assume `true`. Devices should still send it explicitly.
+3. **`ack.ok:false`** = handshake declined; the host stays in v1 mode for the connection.
+4. **Ack value clamps**: hosts clamp `maxLine` to `[256,16384]` and `maxSessions` to `[1,32]`; if `data` is missing entirely, hosts fall back to 900-byte v1 budget. Devices must always populate `data.maxLine` and `data.maxSessions`.
+5. **`sessions[].last`**: hosts cap at 64 sanitized bytes and may send `""`. Devices may truncate further on ingest.
+6. **`ntfy` capability is device-advertised only**: hosts do not list `ntfy` in hello caps and gate card sends purely on the device ack caps. Devices must not require `ntfy` in the host's hello.
+7. **Decision vocabulary**: devices send `"once"`/`"deny"` (v1 vocabulary). Hosts additionally accept `"allow"` as a synonym for `"once"`.
+8. **`state:"done"`** is defined but not currently emitted by the reference host (sessions drop on end); devices must still tolerate it.
+9. **`rxack.n`** is advisory; hosts treat any rx-ack as liveness and do not verify the count.
+10. **`prompt.sid`/`prompt.qn` are proto-gated, not cap-gated**: hosts send them whenever negotiated proto ≥ 2, even if `sessions` wasn't negotiated. Standard unknown-field tolerance applies.
