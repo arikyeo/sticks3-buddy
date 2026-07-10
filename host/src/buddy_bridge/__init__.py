@@ -4,4 +4,4 @@ Keep this module import-light: hook scripts run `python -m buddy_bridge.hooks.*`
 on every hook event and must not pay for bleak/watchfiles imports.
 """
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"

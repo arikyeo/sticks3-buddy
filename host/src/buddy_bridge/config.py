@@ -77,6 +77,10 @@ class Config:
     relay_enabled: bool = False
     relay_port: int = 48901
     relay_token: str = ""  # shared secret; relay stays OFF while empty
+    # static peers ("host" or "host:port") get the discovery datagram as
+    # unicast too — overlay networks (Tailscale/WireGuard) have no broadcast
+    relay_peers: tuple[str, ...] = ()
+    relay_name_short: str = ""  # <= 6 chars shown as the [NAME] title prefix
 
     home: Path = field(default_factory=bridge_home)
 
@@ -190,6 +194,8 @@ def load_config(home: Path | None = None, create: bool = True) -> Config:
     if not (0 < cfg.relay_port < 65536):
         cfg.relay_port = 48901
     cfg.relay_token = _get_str(relay, "token", "")
+    cfg.relay_peers = _get_str_list(relay, "peers")
+    cfg.relay_name_short = _get_str(relay, "name_short", "")
 
     changed = False
     if not cfg.host_id:
@@ -215,6 +221,7 @@ def _toml_num(v: float) -> str:
 def to_toml(cfg: Config) -> str:
     b = lambda v: "true" if v else "false"  # noqa: E731
     repos = ", ".join(_toml_str(r) for r in cfg.cards_repos)
+    relay_peers = ", ".join(_toml_str(p) for p in cfg.relay_peers)
     weather = ""
     if cfg.cards_weather_lat is not None and cfg.cards_weather_lon is not None:
         weather = (
@@ -255,6 +262,8 @@ def to_toml(cfg: Config) -> str:
         f"enabled = {b(cfg.relay_enabled)}\n"
         f"port = {cfg.relay_port}\n"
         f"token = {_toml_str(cfg.relay_token)}\n"
+        f"peers = [{relay_peers}]\n"
+        f"name_short = {_toml_str(cfg.relay_name_short)}\n"
     )
 
 

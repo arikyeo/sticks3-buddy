@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "buddy-bridge"
-version = "0.1.0"
+version = "0.2.0"
 description = "Bridge Claude Code CLI and Codex CLI sessions to an M5 StickS3 BLE desk buddy"
 readme = "README.md"
 requires-python = ">=3.11"
