@@ -236,6 +236,12 @@ path, never take one away or block your CLI:
   native permission prompt appears exactly as if buddy-bridge weren't there.
 - Safe interaction tools (`AskUserQuestion`, `ExitPlanMode`, `TodoWrite`,
   `TaskCreate`, `TaskUpdate`, `TaskList`, `TaskGet`) are never gated.
+  `AskUserQuestion` gets special treatment: a non-blocking hook entry
+  (installed regardless of the gate setting) forwards the question payload
+  so a v2 stick with the `ask` capability *displays* the question —
+  header, text, and options — while you answer in the CLI as usual. The
+  display clears when you answer (or the turn/session ends); v1 sticks
+  and sticks without the capability see nothing new.
 - `BUDDY_BRIDGE_NOGATE=1` disables gating per invocation without uninstalling.
 - A device deny tells the agent: *"User denied on Hardware Buddy device. Do
   not retry with alternative phrasings."*

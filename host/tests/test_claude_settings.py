@@ -18,9 +18,14 @@ def test_install_into_missing_file(tmp_path):
     data = _read(settings)
     events = set(data["hooks"].keys())
     assert events == {
-        "SessionStart", "SessionEnd", "UserPromptSubmit", "Stop", "PostToolUse", "Notification",
+        "SessionStart", "SessionEnd", "UserPromptSubmit", "Stop", "PostToolUse",
+        "Notification", "PreToolUse",
     }
-    assert "PreToolUse" not in events  # gate off by default
+    # gate off by default: PreToolUse carries only the non-blocking ask
+    # forwarder (AskUserQuestion display), no timeout
+    (ask_group,) = data["hooks"]["PreToolUse"]
+    assert ask_group["matcher"] == "AskUserQuestion"
+    assert "timeout" not in ask_group["hooks"][0]
     cmd = data["hooks"]["SessionStart"][0]["hooks"][0]["command"]
     assert cmd == f'"{PY}" -m buddy_bridge.hooks.claude_hook'
     assert "\\" not in cmd  # forward slashes only
@@ -31,16 +36,17 @@ def test_install_gate_entry(tmp_path):
     settings = tmp_path / "settings.json"
     claude_settings.install(settings, gate=True, gate_tools="Bash|Write", python_exe=PY)
     data = _read(settings)
-    gate_groups = data["hooks"]["PreToolUse"]
-    assert len(gate_groups) == 1
-    assert gate_groups[0]["matcher"] == "Bash|Write"
-    hook = gate_groups[0]["hooks"][0]
+    ask_group, gate_group = data["hooks"]["PreToolUse"]
+    assert ask_group["matcher"] == "AskUserQuestion"
+    assert gate_group["matcher"] == "Bash|Write"
+    hook = gate_group["hooks"][0]
     assert hook["timeout"] == 330
     assert "buddy_bridge.hooks.claude_hook" in hook["command"]
 
-    # flipping the gate off removes our PreToolUse entry again
+    # flipping the gate off removes the gate entry; the ask forwarder stays
     assert claude_settings.install(settings, gate=False, python_exe=PY) is True
-    assert "PreToolUse" not in _read(settings)["hooks"]
+    (only,) = _read(settings)["hooks"]["PreToolUse"]
+    assert only["matcher"] == "AskUserQuestion"
 
 
 def test_install_idempotent(tmp_path):
@@ -78,10 +84,11 @@ def test_merge_preserves_foreign_and_uninstall_removes_only_ours(tmp_path):
     ss = data["hooks"]["SessionStart"]
     assert ss[0]["hooks"][0]["command"] == "other-tool --start"
     assert any("buddy_bridge.hooks.claude_hook" in h["command"] for g in ss[1:] for h in g["hooks"])
-    # foreign PreToolUse survives alongside our gate entry
+    # foreign PreToolUse survives alongside our ask + gate entries
     pre = data["hooks"]["PreToolUse"]
     assert pre[0]["hooks"][0]["command"] == "security-scan"
-    assert len(pre) == 2
+    assert len(pre) == 3
+    assert {g.get("matcher") for g in pre[1:]} == {"AskUserQuestion", "Bash"}
     assert data["hooks"]["SomeFutureEvent"] == FOREIGN["hooks"]["SomeFutureEvent"]
 
     assert claude_settings.uninstall(settings) is True

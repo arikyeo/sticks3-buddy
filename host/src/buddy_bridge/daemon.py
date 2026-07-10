@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import itertools
 import logging
 import os
 import secrets
@@ -48,7 +49,7 @@ from .cards import (
 from .config import Config
 from .ble.link import SLOW_RETRY_SECS, LinkManager
 from .relay import EV_ATTENTION, EV_PROMPT_PENDING, EV_PROMPT_RESOLVED, RelayManager
-from .decision import ALLOW, ASK, DENY, DecisionRouter, build_hint, extract_detail
+from .decision import ALLOW, ASK, DENY, DecisionRouter, _wire_safe, build_hint, extract_detail
 from .ipc.endpoint import remove_endpoint, write_endpoint
 from .ipc.server import IpcServer
 from .matchers import (
@@ -76,6 +77,49 @@ WIFI_ACK_TIMEOUT_SECS = 10.0  # max wait for the device's {"ack":"wifi",...}
 RELAY_SYNC_SECS = 2.0  # cadence of mirroring local waits to the holder
 RELAY_CARD_RATE_SECS = 10.0  # max 1 remote card per peer per this window
 REMOTE_PENDING_TTL_SECS = 300.0  # forget a peer's pending we never saw resolved
+# Ask origination (AskUserQuestion display): per-field caps applied before
+# the protocol layer's own byte-safe truncation + line-budget cascade.
+ASK_MAX_QUESTIONS = 3
+ASK_MAX_OPTIONS = 4
+ASK_HEADER_MAX_CHARS = 24
+ASK_TEXT_MAX_CHARS = 200
+ASK_LABEL_MAX_CHARS = 44
+ASK_DESC_MAX_CHARS = 64
+
+
+def convert_ask_questions(raw: object) -> list[dict]:
+    """Claude's AskUserQuestion tool_input questions -> protocol ask shape.
+
+    Input items look like {"question","header","options":[{"label",
+    "description"}],"multiSelect"}; the wire wants {"header","text",
+    "options":[{"label","desc"}]}. Tolerates any malformed subset."""
+    if not isinstance(raw, (list, tuple)):
+        return []
+    out: list[dict] = []
+    for q in list(raw)[:ASK_MAX_QUESTIONS]:
+        if not isinstance(q, dict):
+            continue
+        options: list[dict] = []
+        raw_options = q.get("options")
+        if isinstance(raw_options, (list, tuple)):
+            for opt in list(raw_options)[:ASK_MAX_OPTIONS]:
+                if isinstance(opt, dict):
+                    options.append(
+                        {
+                            "label": str(opt.get("label") or "")[:ASK_LABEL_MAX_CHARS],
+                            "desc": str(opt.get("description") or "")[:ASK_DESC_MAX_CHARS],
+                        }
+                    )
+                elif isinstance(opt, str) and opt:
+                    options.append({"label": opt[:ASK_LABEL_MAX_CHARS], "desc": ""})
+        question = {
+            "header": str(q.get("header") or "")[:ASK_HEADER_MAX_CHARS],
+            "text": str(q.get("question") or q.get("text") or "")[:ASK_TEXT_MAX_CHARS],
+            "options": options,
+        }
+        if question["text"] or question["header"] or options:
+            out.append(question)
+    return out
 
 _BLE_MODES = ("exclusive", "ondemand", "off")
 
@@ -122,6 +166,9 @@ class Daemon:
         self._rx_last_ts = 0.0
         self._tx_since_rx = False
         self._sent_prompt_ids: set[str] = set()  # prompt ids shown on-device
+        # Live asks displayed on the device (ask cap): wire id -> origin.
+        self._live_asks: dict[str, dict[str, str]] = {}
+        self._ask_counter = itertools.count(1)
         self._last_sent_line = ""
         self._last_send_ts = 0.0
         self._last_timesync_ts = 0.0
@@ -313,9 +360,13 @@ class Daemon:
             return {"ok": True}
         if event == "hook":
             self.handle_hook_mirror(msg)  # fire-and-forget: no reply line
+            await self._on_hook_followups(msg)
             return None
         if event == "permission_request":
             return await self.handle_permission_request(msg)
+        if event == "ask_pending":
+            await self.handle_ask_pending(msg)  # fire-and-forget: no reply line
+            return None
         if event == "set_mode":
             return await self.handle_set_mode(msg)
         if event == "wifi":
@@ -515,6 +566,7 @@ class Daemon:
         self._rx_last_ts = time.monotonic()
         self._tx_since_rx = False
         self._sent_prompt_ids.clear()
+        self._live_asks.clear()  # a fresh connection means a fresh device screen
         if await self._send_line(protocol.build_hello(self.cfg)):
             self._hello_deadline = time.monotonic() + protocol.HELLO_ACK_TIMEOUT_SECS
         await self._send_timesync()
@@ -794,10 +846,10 @@ class Daemon:
     ) -> bool:
         """Relay a structured read-only question to the device.
 
-        Gated on the negotiated ``ask`` capability. There is currently no
-        host-side origination source (the Claude hook set exposes no
-        AskUserQuestion payload; Codex request_user_input only folds to
-        state=wait), so this is a library path for adapters that have data.
+        Gated on the negotiated ``ask`` capability. Origination: the Claude
+        PreToolUse hook forwards AskUserQuestion payloads as "ask_pending"
+        IPC events (see handle_ask_pending); Codex has no source yet (its
+        request_user_input only folds to state=wait).
         """
         if not self.cap_active("ask"):
             return False
@@ -816,6 +868,67 @@ class Daemon:
         if not self.cap_active("ask"):
             return False
         return await self._send_line(protocol.build_ask_cancel(ask_id))
+
+    # ---- ask origination (Claude AskUserQuestion display) ----
+
+    async def handle_ask_pending(self, msg: dict[str, Any]) -> None:
+        """IPC "ask_pending" from the Claude PreToolUse hook: display the
+        structured question on a v2 stick with the ``ask`` capability.
+        Display-only (PROTOCOL_V2.md): the user still answers in the CLI;
+        no-cap/v1/disconnected links silently do nothing (stock behavior)."""
+        self.wake_from_yield()  # a question at the keyboard is local activity
+        if not self.cap_active("ask") or not self.link.connected:
+            return
+        agent = str(msg.get("agent") or "claude")
+        sid = str(msg.get("session_id") or "")
+        tool_use_id = str(msg.get("tool_use_id") or "")
+        questions = convert_ask_questions(msg.get("questions"))
+        if not questions:
+            return
+        if tool_use_id and any(
+            info["tool_use_id"] == tool_use_id for info in self._live_asks.values()
+        ):
+            return  # duplicate delivery (two matching hook groups): keep the first
+        if _wire_safe(tool_use_id) and tool_use_id not in self._live_asks:
+            ask_id = tool_use_id
+        else:
+            ask_id = f"a{next(self._ask_counter)}"
+        sent = await self.send_ask(
+            ask_id,
+            questions,
+            agent=agent,
+            sid=sid,
+            multi_select=msg.get("multiSelect") is True,
+        )
+        if sent:
+            self._live_asks[ask_id] = {
+                "agent": agent, "sid": sid, "tool_use_id": tool_use_id,
+            }
+
+    async def _on_hook_followups(self, msg: dict[str, Any]) -> None:
+        """Async follow-ups to a mirrored hook event (the sync registry
+        mutation already ran): clear displayed asks that the user answered
+        (PostToolUse of the same tool_use_id) or abandoned (new prompt,
+        turn end, session end)."""
+        agent = str(msg.get("agent") or "")
+        name = msg.get("name")
+        if name == "PostToolUse":
+            tool_use_id = str(msg.get("tool_use_id") or "")
+            if tool_use_id:
+                await self._cancel_asks(
+                    lambda info: info["tool_use_id"] == tool_use_id
+                )
+        elif name in ("UserPromptSubmit", "Stop", "SessionEnd"):
+            sid = str(msg.get("session_id") or "")
+            if sid:
+                await self._cancel_asks(
+                    lambda info: info["agent"] == agent and info["sid"] == sid
+                )
+
+    async def _cancel_asks(self, predicate) -> None:
+        for ask_id in [a for a, info in self._live_asks.items() if predicate(info)]:
+            del self._live_asks[ask_id]
+            await self.cancel_ask(ask_id)
 
     # ---- wifi provisioning ----
 
