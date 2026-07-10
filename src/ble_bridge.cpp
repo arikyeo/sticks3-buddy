@@ -42,6 +42,32 @@ static volatile uint16_t  mtu = 23;
 static esp_bd_addr_t      peerAddr;
 static volatile bool      hasPeer = false;
 
+// Pairing window (Track F P4): while non-zero and in the future, unbonded
+// peers may connect and pair. Written from the main loop, read in the BLE
+// stack task's onConnect.
+static volatile uint32_t  pairWinUntil = 0;
+
+static bool _pairWindowOpen() {
+  uint32_t u = pairWinUntil;
+  return u != 0 && (int32_t)(millis() - u) < 0;
+}
+
+// Is this address in the Bluedroid bond store? Called from the BLE task's
+// onConnect; the static buffer is safe because GATTS events are serialized.
+// Fails open on API error — the gate is defense-in-depth on top of the
+// encrypted-only characteristics, and a false lockout would be worse.
+static bool _isBonded(const uint8_t* bda) {
+  int n = esp_ble_get_bond_device_num();
+  if (n <= 0) return false;
+  static esp_ble_bond_dev_t list[BUDDY_MAX_HOSTS + 2];
+  if (n > (int)(sizeof(list) / sizeof(list[0]))) n = sizeof(list) / sizeof(list[0]);
+  if (esp_ble_get_bond_device_list(&n, list) != ESP_OK) return true;
+  for (int i = 0; i < n; i++) {
+    if (memcmp(bda, list[i].bd_addr, 6) == 0) return true;
+  }
+  return false;
+}
+
 static void rxPush(const uint8_t* p, size_t n) {
   portENTER_CRITICAL(&rxMux);
   for (size_t i = 0; i < n; i++) {
@@ -63,9 +89,22 @@ class RxCallbacks : public BLECharacteristicCallbacks {
 class ServerCallbacks : public BLEServerCallbacks {
   // Use the extended overload to capture the peer BD address.
   void onConnect(BLEServer* s, esp_ble_gatts_cb_param_t* param) override {
-    connected = true;
     memcpy((void*)peerAddr, param->connect.remote_bda, sizeof(esp_bd_addr_t));
     hasPeer = true;
+    // Anti drive-by-bonding gate: outside an explicit pairing window, only
+    // already-bonded peers may stay connected — drop unknowns here, before
+    // SMP pairing can even start. A device with zero bonds stays open so
+    // the first out-of-box pairing needs no menu trip. (Bonded peers using
+    // RPAs are resolved to their identity address by the stack before this
+    // event, since their IRKs sit in the controller resolving list.)
+    if (!_pairWindowOpen() && esp_ble_get_bond_device_num() > 0 &&
+        !_isBonded(peerAddr)) {
+      Serial.println("[ble] rejecting unbonded peer (pairing window closed)");
+      hasPeer = false;
+      s->disconnect(param->connect.conn_id);
+      return;
+    }
+    connected = true;
     Serial.printf("[ble] connected %02x:%02x:%02x:%02x:%02x:%02x\n",
       peerAddr[0], peerAddr[1], peerAddr[2],
       peerAddr[3], peerAddr[4], peerAddr[5]);
@@ -106,12 +145,19 @@ class SecCallbacks : public BLESecurityCallbacks {
   }
 };
 
-void bleInit(const char* deviceName) {
+void bleInit(const char* deviceName, uint8_t pairMode) {
   BLEDevice::init(deviceName);
   // Request the biggest MTU we can get. macOS negotiates to 185 typically.
   BLEDevice::setMTU(517);
 
-  BLEDevice::setEncryptionLevel(ESP_BLE_SEC_ENCRYPT_MITM);
+  // pairMode 0 (default): LE Secure Connections passkey-entry — we are
+  // DisplayOnly, the desktop types the 6-digit code (MITM protection).
+  // pairMode 1: LE Secure Connections just-works — no passkey, still bonded
+  // and AES-CCM encrypted, just without MITM authentication. The NUS
+  // characteristics keep their encrypted-only permissions in both modes.
+  bool justWorks = pairMode == 1;
+  BLEDevice::setEncryptionLevel(justWorks ? ESP_BLE_SEC_ENCRYPT
+                                          : ESP_BLE_SEC_ENCRYPT_MITM);
   BLEDevice::setSecurityCallbacks(new SecCallbacks());
 
   server = BLEDevice::createServer();
@@ -138,8 +184,9 @@ void bleInit(const char* deviceName) {
   svc->start();
 
   BLESecurity* sec = new BLESecurity();
-  sec->setAuthenticationMode(ESP_LE_AUTH_REQ_SC_MITM_BOND);
-  sec->setCapability(ESP_IO_CAP_OUT);
+  sec->setAuthenticationMode(justWorks ? ESP_LE_AUTH_REQ_SC_BOND
+                                       : ESP_LE_AUTH_REQ_SC_MITM_BOND);
+  sec->setCapability(justWorks ? ESP_IO_CAP_NONE : ESP_IO_CAP_OUT);
   sec->setKeySize(16);
   sec->setInitEncryptionKey(ESP_BLE_ENC_KEY_MASK | ESP_BLE_ID_KEY_MASK);
   sec->setRespEncryptionKey(ESP_BLE_ENC_KEY_MASK | ESP_BLE_ID_KEY_MASK);
@@ -156,6 +203,63 @@ void bleInit(const char* deviceName) {
 bool bleConnected() { return connected; }
 bool bleSecure()    { return secure; }
 uint32_t blePasskey() { return passkey; }
+
+void bleAllowPairing(bool open, uint32_t windowMs) {
+  if (open) {
+    uint32_t until = millis() + windowMs;
+    pairWinUntil = until == 0 ? 1 : until;   // 0 means closed — dodge wraparound
+    Serial.printf("[ble] pairing window open for %lus\n",
+                  (unsigned long)(windowMs / 1000));
+  } else {
+    pairWinUntil = 0;
+    Serial.println("[ble] pairing window closed");
+  }
+}
+
+uint32_t blePairingRemainingMs() {
+  uint32_t u = pairWinUntil;
+  if (u == 0) return 0;
+  int32_t left = (int32_t)(u - millis());
+  return left > 0 ? (uint32_t)left : 0;
+}
+
+bool blePeerBda(uint8_t out[6]) {
+  if (!hasPeer) return false;
+  memcpy(out, (const void*)peerAddr, 6);
+  return true;
+}
+
+void bleDisconnect() {
+  if (server && connected) server->disconnect(server->getConnId());
+}
+
+#ifdef BUDDY_BLE_WHITELIST
+// Optional adv-level pin enforcement: only the whitelisted address may even
+// connect. OFF by default — a pinned host using resolvable private addresses
+// can fail the controller whitelist match (risk R3) and get silently locked
+// out at the radio layer, with none of the soft-pin path's self-healing.
+// Soft-pin (accept, resolve, sel:false, disconnect) is the guaranteed path;
+// this is a power/no-op-connect optimization for public/static-address hosts.
+void bleWhitelistPin(const uint8_t* bda) {
+  BLEAdvertising* adv = BLEDevice::getAdvertising();
+  adv->stop();
+  static uint8_t curWl[6];
+  static bool haveWl = false;
+  if (haveWl) {
+    esp_ble_gap_update_whitelist(false, curWl, BLE_WL_ADDR_TYPE_PUBLIC);
+    haveWl = false;
+  }
+  if (bda) {
+    memcpy(curWl, bda, 6);
+    esp_ble_gap_update_whitelist(true, curWl, BLE_WL_ADDR_TYPE_PUBLIC);
+    haveWl = true;
+    adv->setScanFilter(false, true);   // scan any, connect whitelist-only
+  } else {
+    adv->setScanFilter(false, false);
+  }
+  adv->start();
+}
+#endif
 
 void bleRemoveCurrentBond() {
   if (!hasPeer) {
