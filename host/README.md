@@ -109,12 +109,18 @@ yield with a normal fast reconnect burst; if another host has taken the
 stick meanwhile, the attempts stay patient at 60 s while your sessions
 keep mirroring locally. `buddy-bridge status` reports `ble_yielding`.
 
-### LAN relay federation (`[relay]`)
+### Relay federation (`[relay]`): every machine on one stick
 
-Machines running buddy-bridge on the same trusted LAN can federate: the
-bridge currently holding the stick (the *holder*) shows cards for the
-other machines' pending prompts, and hands the stick over when a peer
-needs it. Two-machine example — on **both** `alpha` and `bravo`:
+Machines running buddy-bridge on the same trusted network federate into
+one view: the bridge currently holding the stick (the *holder*) shows a
+**merged** session list for every machine, surfaces the oldest pending
+prompt across all of them, and routes your button press back to the
+machine that asked. You approve or deny *any* machine's prompt from the
+stick, wherever it is plugged in.
+
+Three-machine walkthrough — `alpha` (Windows desktop, usually holds the
+stick), `bravo` (Windows laptop), `carol` (a Mac). On **every** machine,
+the same `[relay]` block:
 
 ```toml
 [ble]
@@ -124,36 +130,109 @@ idle_yield_min = 5
 enabled = true
 port = 48901
 token = "pick-one-long-random-string"   # REQUIRED, same on every machine
+name_short = "alpha"                    # optional, <= 6 chars; hostname otherwise
 ```
 
-Restart the daemons (`buddy-bridge status` shows the relay view). What
-you get:
+On the Mac, install and autostart the same way as anywhere else:
+
+```bash
+uv tool install ./host        # or: pipx install ./host
+buddy-bridge setup            # then paste the same [relay] block
+buddy-bridge hooks install claude && buddy-bridge hooks install codex
+buddy-bridge service install  # launchd user agent, starts at login
+```
+
+Restart the daemons (`buddy-bridge status` shows the relay + federation
+view). What you get:
 
 - Peers find each other via signed UDP broadcasts on `port` (every 30 s,
   immediately on holder changes; a silent peer expires after 120 s).
-- While `alpha` holds the stick and a prompt waits on `bravo`, the stick
-  shows a dim `remote` card — `[bravo] approve: Bash` plus the hint —
-  rate-limited to 1 card per peer per 10 s and deduped. When `bravo`'s
-  prompt resolves, an undelivered card is retracted.
-- If `alpha` is idle when `bravo`'s prompt lands, `alpha` yields the
-  stick immediately (no need to wait out `idle_yield_min`) and `bravo`'s
-  reconnect grabs it — switchover typically 5–10 s.
-- **No remote decisions in v1**: the card is informational; you answer on
-  the machine that asked (its native CLI prompt, or its own stick session
-  once it holds the link). A future revision may relay decisions.
+- Non-holders stream their full state to the holder (`state_sync`: on
+  change, 5 s keepalive). The stick's session list shows everyone —
+  `[bravo] api-server`, `[carol] webapp` — waiting-first across all
+  machines; remote idle sessions are the first dropped when the list
+  overflows. A peer that goes silent for 30 s vanishes from the view.
+- The heartbeat prompt is the **oldest waiting prompt across all
+  machines**, with `qn` counting the merged queue behind it. Press the
+  button: a local prompt resolves as always, a remote one is relayed to
+  its origin (retried 3x), whose gate returns allow/deny exactly as if
+  its own stick had answered. The origin's clock still rules — if the
+  relay or the holder dies mid-decision, the origin times out and fails
+  open to the native CLI prompt, same as ever.
+- A machine with **no stick at all** (`mode off`, or a failed ondemand
+  connect) now waits for a federated decision when a v2 holder is on the
+  air, instead of instantly falling open.
+- Claude `AskUserQuestion` panels from any machine render read-only on
+  the holder's stick, `[NAME]`-prefixed; you still answer them in that
+  machine's CLI.
+- Machines still running the previous buddy-bridge speak v1: their
+  prompts appear as the old dim `remote` cards, and this version's card
+  path is used when *the holder* is v1. Mixed networks work; upgrade the
+  holder first to get the merged view.
+- Yield still works: an idle holder hands the stick to a busy peer, and
+  a machine whose prompt you keep answering remotely never needs it.
 
-Security model (trusted LAN, shared secret):
+#### Overlay networks (Tailscale / WireGuard / routed subnets)
 
-- The `token` is a shared secret; **every** discovery datagram and TCP
-  frame is HMAC-SHA256 signed with it. Unsigned, tampered, wrong-token or
-  stale (>120 s skew) input is dropped silently — keep machine clocks
-  roughly in sync (NTP is fine).
-- No credentials, transcripts, or decisions ever ride the relay — only
-  host names, tool names, prompt hints (<= 80 chars), and session ids.
-- The relay binds `0.0.0.0` **only** while `enabled = true` *and* the
-  token is non-empty; otherwise zero sockets are opened (test-asserted).
-  Treat the LAN as the trust boundary: don't enable it on networks you
-  don't control, and rotate the token like any shared secret.
+Discovery uses UDP broadcast, which doesn't cross routed or overlay
+networks. Add static peers and the same signed discovery datagram is
+also **unicast** to each of them (30 s cadence, instantly on holder
+flips) — broadcast stays on, so LAN mates and remote peers mix freely:
+
+```toml
+[relay]
+enabled = true
+token = "pick-one-long-random-string"
+peers = [
+  "desktop.tail1234.ts.net",       # MagicDNS names re-resolve at send time
+  "mbp.tail1234.ts.net",
+  "100.64.0.7:48901",              # or plain IPv4, optionally with a port
+]
+```
+
+List every *other* machine on each host (a self-entry is harmless — own
+datagrams are ignored). Names that don't resolve are skipped quietly and
+retried on the next announce; a successful TCP exchange also refreshes
+peer liveness, so a link where UDP only passes one way stays federated.
+Everything else (state_sync, decisions) is already unicast TCP and needs
+no extra configuration. Tailscale passes both fine.
+
+#### Threat model (read before enabling)
+
+The relay v2 crosses a real line: **decisions ride the network**, so the
+`[relay]` token now guards approval authority, not just display text.
+
+- **Every** datagram and TCP frame is HMAC-SHA256 signed over its
+  canonical JSON body with the shared token. Unsigned, tampered,
+  wrong-token or stale (>120 s skew) input is dropped without a reply —
+  keep machine clocks roughly in sync (NTP is fine).
+- **Whoever holds the token can forge an "allow"** for any gated command
+  on any federated machine. Make it long and random
+  (`python -c "import secrets;print(secrets.token_urlsafe(32))"`),
+  treat it like an SSH private key, rotate it if a machine is retired or
+  the network changes. The relay refuses to open any socket while the
+  token is empty (test-asserted).
+- Static peers extend the trust boundary to **wherever the token goes**:
+  the supported way to cross the open internet is a WireGuard/Tailscale
+  overlay (use Tailscale ACLs to pin which nodes may reach the port).
+  Never port-forward the relay port to the raw internet — HMAC gates
+  actions but won't stop replay probing, fingerprinting, or a leaked
+  token becoming remote approval authority.
+- What rides the relay is bounded: host names, session titles, tool
+  names, pre-truncated prompt hints (<= 80 chars), ask texts, session
+  ids, allow/deny verdicts. **Never** credentials, transcripts, file
+  contents, or WiFi passwords. Hints are sanitized and capped at the
+  origin, and the holder re-sanitizes everything before it touches the
+  device (a peer's HMAC proves token possession, not well-formedness).
+- Inbound remote decisions resolve only a *matching pending id* — a
+  forged or replayed id that isn't in flight is a logged no-op, and the
+  freshness window bounds replay of a real one. Remote cards are further
+  rate-limited (1 per peer per 10 s).
+
+Changes vs 0.1.x: `state_sync`/`decision` relay events, merged stick
+view, remote approve/deny, ask relay, `[relay] peers` static unicast
+discovery, `[relay] name_short`; every v1 relay message is still spoken
+and v1 peers keep working (cards).
 
 ## WiFi provisioning
 
