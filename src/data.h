@@ -93,11 +93,16 @@ bool protoXferCommand(JsonDocument& doc) { return xferCommand(doc); }
 // Bridge sends {"time":[epoch_sec, tz_offset_sec]}; gmtime_r on the
 // adjusted epoch yields local components including weekday. The board
 // clock stores them — BM8563 hardware on the Plus/Plus2, millis-projected
-// software clock on the S3 (which has no RTC).
+// software clock on the S3 (which has no RTC). The tz offset is kept so
+// other epoch-stamped data (ntfy card timestamps) can render local HH:MM.
+static int32_t _tzOffsetSec = 0;
+inline int32_t dataTzOffset() { return _tzOffsetSec; }
+
 void protoSetClock(uint32_t epoch, int32_t tzOffsetSec) {
   time_t local = (time_t)epoch + tzOffsetSec;
   struct tm lt; gmtime_r(&local, &lt);
   board::setClock(&lt);
+  _tzOffsetSec = tzOffsetSec;
   extern uint32_t _clkLastRead;
   _clkLastRead = 0;   // force clockRefreshRtc() to re-read immediately
   _rtcValid = true;

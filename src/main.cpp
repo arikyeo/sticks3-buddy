@@ -3,12 +3,21 @@
 #include "hal/hal.h"
 #include "logic/wrap_text_logic.h"
 #include "logic/persona_logic.h"
+#include "logic/clock_display_logic.h"
+#include "logic/clock_orient_logic.h"
+#include "logic/clock_time_logic.h"
+#include "logic/pomodoro_logic.h"
+#include "logic/gesture_logic.h"
 #include <LittleFS.h>
 #include <stdarg.h>
 #include "esp_task_wdt.h"
 #include "ble_bridge.h"
 #include "data.h"
 #include "buddy.h"
+#ifdef BUDDY_EXTRAS_FULL
+#include "audio/tunes.h"   // tune engine + slot registry (8MB boards only)
+#include "ir/ir_remote.h"  // raw RMT learn/replay (8MB boards only)
+#endif
 
 #ifdef BUDDY_DEBUG
 #include "esp_system.h"
@@ -48,6 +57,7 @@ PersonaState activeState = P_SLEEP;
 uint32_t     oneShotUntil = 0;
 uint32_t     lastShakeCheck = 0;
 float        accelBaseline = 1.0f;
+GestureState gest;   // flip -> host switch, double-tap -> wake (gesture_logic.h)
 unsigned long t = 0;
 
 // Menu
@@ -57,8 +67,9 @@ uint8_t menuSel     = 0;
 bool    btnALong    = false;
 bool    btnBLong    = false;
 
-enum DisplayMode { DISP_NORMAL, DISP_SESSIONS, DISP_PET, DISP_INFO, DISP_COUNT };
+enum DisplayMode { DISP_NORMAL, DISP_SESSIONS, DISP_PET, DISP_CLOCK, DISP_CARDS, DISP_INFO, DISP_COUNT };
 uint8_t displayMode = DISP_NORMAL;
+uint8_t cardSel = 0;    // DISP_CARDS view index, 0 = newest
 uint8_t infoPage = 0;
 uint8_t petPage = 0;
 const uint8_t PET_PAGES = 3;
@@ -135,6 +146,22 @@ static void beep(uint16_t freq, uint16_t dur) {
   if (settings().vol) board::beep(freq, dur);
 }
 
+#ifdef BUDDY_EXTRAS_FULL
+// Jingle wrapper: play a tune slot when the tunes setting is on, volume is
+// up and the slot has data; false = caller falls back to the classic beep.
+static bool tunesJingle(const Tune* t) {
+  if (!settings().tune || !settings().vol) return false;
+  if (!t || !(t->len || t->pcm)) return false;
+  jingleStart(t);
+  return true;
+}
+#define TUNE_OR_BEEP(slot, f, d) do { if (!tunesJingle(slot)) beep((f), (d)); } while (0)
+#else
+// Non-FULL boards keep the classic beep as the only sound engine; the
+// slot token is never expanded, so SLOT_* needn't exist here.
+#define TUNE_OR_BEEP(slot, f, d) beep((f), (d))
+#endif
+
 static void sendCmd(const char* json) {
   Serial.println(json);
   size_t n = strlen(json);
@@ -158,13 +185,38 @@ void applyDisplayMode() {
   characterInvalidate();  // redraws character on next tick (text mode path)
 }
 
-const char* menuItems[] = { "hosts", "settings", "turn off", "help", "about", "demo", "close" };
-const uint8_t MENU_N = 7;
+const char* menuItems[] = { "hosts", "settings", "extras", "turn off", "help", "about", "demo", "close" };
+const uint8_t MENU_N = 8;
+
+// extras: pomodoro (and, on BUDDY_EXTRAS_FULL builds, more) live on a
+// screen parked OUTSIDE the A-press carousel — reached via menu > extras,
+// left with A-long. On it, A and B belong to the active extras page.
+const uint8_t DISP_EXTRAS = DISP_COUNT;
+bool      extrasOpen = false;   // the menu > extras submenu
+uint8_t   extrasSel  = 0;
+uint8_t   extrasPage = 0;       // 0 = pomodoro, 1 = IR remote (FULL builds)
+PomoState pomo;
+#ifdef BUDDY_EXTRAS_FULL
+const char* extrasItems[] = { "pomodoro", "ir remote", "back" };
+const uint8_t EXTRAS_N = 3;
+uint8_t  irSel = 0;             // IR page slot cursor
+uint32_t irLearnDeadline = 0;   // learn session timeout tick
+#else
+const char* extrasItems[] = { "pomodoro", "back" };
+const uint8_t EXTRAS_N = 2;
+#endif
 
 bool    settingsOpen = false;
 uint8_t settingsSel  = 0;
+#ifdef BUDDY_EXTRAS_FULL
+// FULL builds get a "tunes" row after volume; applySetting/drawSettings
+// remap the rows below it so the base indices stay board-independent.
+const char* settingsItems[] = { "brightness", "volume", "tunes", "pairing", "host mode", "bluetooth", "wifi", "led", "transcript", "clock rot", "ascii pet", "reset", "back" };
+const uint8_t SETTINGS_N = 13;
+#else
 const char* settingsItems[] = { "brightness", "volume", "pairing", "host mode", "bluetooth", "wifi", "led", "transcript", "clock rot", "ascii pet", "reset", "back" };
 const uint8_t SETTINGS_N = 12;
+#endif
 
 bool    resetOpen = false;
 uint8_t resetSel  = 0;
@@ -200,11 +252,20 @@ static void showToast(const char* s, uint32_t ms = 1800) {
 static bool askShowing() {
   return tama.qAskId[0] && !askDismissed && displayMode == DISP_NORMAL &&
          !menuOpen && !settingsOpen && !resetOpen && !hostsOpen && !forgetOpen &&
-         !tama.promptId[0];
+         !extrasOpen && !tama.promptId[0];
 }
 
 static void applySetting(uint8_t idx) {
   Settings& s = settings();
+#ifdef BUDDY_EXTRAS_FULL
+  if (idx == 2) {   // "tunes" row, FULL builds only
+    s.tune = !s.tune;
+    settingsSave();
+    if (s.tune) tunesJingle(SLOT_APPROVE);   // preview
+    return;
+  }
+  if (idx > 2) idx--;   // map back to the base table for the switch below
+#endif
   switch (idx) {
     case 0:
       settings().bright = (settings().bright + 1) % 5;
@@ -357,24 +418,33 @@ static void drawSettings() {
     spr.print(settingsItems[i]);
     spr.setCursor(mx + mw - 36, my + 8 + i * 14);
     spr.setTextColor(p.textDim, PANEL);
-    if (i == 0) {
+    int vi = i;   // base-table index (see applySetting's remap)
+#ifdef BUDDY_EXTRAS_FULL
+    if (i == 2) {
+      spr.setTextColor(s.tune ? GREEN : p.textDim, PANEL);
+      spr.print(s.tune ? " on" : "off");
+      continue;
+    }
+    if (i > 2) vi = i - 1;
+#endif
+    if (vi == 0) {
       spr.printf("%u/4", settings().bright);
-    } else if (i == 1) {
+    } else if (vi == 1) {
       if (s.vol == 0) spr.print("mut");
       else spr.printf("%u/4", s.vol);
-    } else if (i == 2) {
+    } else if (vi == 2) {
       spr.print(s.pair ? " jw" : " pk");   // just-works / passkey
-    } else if (i == 3) {
+    } else if (vi == 3) {
       if (s.hostsel < 0) spr.print("auto");
       else spr.printf("%.5s", hostGlueGet((uint8_t)s.hostsel)
                                 ? hostGlueGet((uint8_t)s.hostsel)->name : "?");
-    } else if (i >= 4 && i <= 7) {
-      spr.setTextColor(vals[i-4] ? GREEN : p.textDim, PANEL);
-      spr.print(vals[i-4] ? " on" : "off");
-    } else if (i == 8) {
+    } else if (vi >= 4 && vi <= 7) {
+      spr.setTextColor(vals[vi-4] ? GREEN : p.textDim, PANEL);
+      spr.print(vals[vi-4] ? " on" : "off");
+    } else if (vi == 8) {
       static const char* const RN[] = { "auto", "port", "land" };
       spr.print(RN[s.clockRot]);
-    } else if (i == 9) {
+    } else if (vi == 9) {
       uint8_t total = buddySpeciesCount() + (gifAvailable ? 1 : 0);
       uint8_t pos   = buddyMode ? buddySpeciesIdx() + 1 : total;
       spr.printf("%u/%u", pos, total);
@@ -407,17 +477,18 @@ void menuConfirm() {
   switch (menuSel) {
     case 0: hostsOpen = true; menuOpen = false; hostsSel = 0; break;
     case 1: settingsOpen = true; menuOpen = false; settingsSel = 0; break;
-    case 2: board::powerOff(); break;
-    case 3:
+    case 2: extrasOpen = true; menuOpen = false; extrasSel = 0; break;
+    case 3: board::powerOff(); break;
     case 4:
+    case 5:
       menuOpen = false;
       displayMode = DISP_INFO;
-      infoPage = (menuSel == 3) ? INFO_PG_BUTTONS : INFO_PG_CREDITS;
+      infoPage = (menuSel == 4) ? INFO_PG_BUTTONS : INFO_PG_CREDITS;
       applyDisplayMode();
       characterInvalidate();
       break;
-    case 5: dataSetDemo(!dataDemo()); break;
-    case 6: menuOpen = false; characterInvalidate(); break;
+    case 6: dataSetDemo(!dataDemo()); break;
+    case 7: menuOpen = false; characterInvalidate(); break;
   }
 }
 
@@ -434,9 +505,40 @@ void drawMenu() {
     spr.setCursor(mx + 6, my + 8 + i * 14);
     spr.print(sel ? "> " : "  ");
     spr.print(menuItems[i]);
-    if (i == 5) spr.print(dataDemo() ? "  on" : "  off");
+    if (i == 6) spr.print(dataDemo() ? "  on" : "  off");
   }
   drawMenuHints(p, mx, mw, my + mh - 12);
+}
+
+// extras submenu: same panel pattern as the main menu.
+static void drawExtras() {
+  const Palette& p = characterPalette();
+  int mw = 118, mh = 16 + EXTRAS_N * 14 + MENU_HINT_H;
+  int mx = (W - mw) / 2, my = (H - mh) / 2;
+  spr.fillRoundRect(mx, my, mw, mh, 4, PANEL);
+  spr.drawRoundRect(mx, my, mw, mh, 4, p.textDim);
+  spr.setTextSize(1);
+  for (int i = 0; i < EXTRAS_N; i++) {
+    bool sel = (i == extrasSel);
+    spr.setTextColor(sel ? p.text : p.textDim, PANEL);
+    spr.setCursor(mx + 6, my + 8 + i * 14);
+    spr.print(sel ? "> " : "  ");
+    spr.print(extrasItems[i]);
+  }
+  drawMenuHints(p, mx, mw, my + mh - 12, "Next", "Select");
+}
+
+static void extrasConfirm() {
+  uint8_t pages = EXTRAS_N - 1;   // every row but "back" opens a page
+  if (extrasSel < pages) {
+    extrasOpen = false;
+    extrasPage = extrasSel;
+    displayMode = DISP_EXTRAS;
+    applyDisplayMode();
+  } else {   // back
+    extrasOpen = false;
+    characterInvalidate();
+  }
 }
 
 // Hosts panel: one row per registry entry (* = connected, > = pinned), then
@@ -572,9 +674,10 @@ static void drawToast() {
 //   0 = portrait (sprite path, pet sleeps underneath)
 //   1 = landscape, BtnA-side down (M5.Lcd rotation 1)
 //   3 = landscape, USB-side down (M5.Lcd rotation 3)
-static uint8_t clockOrient   = 0;
-static int8_t  orientFrames  = 0;
-static uint8_t paintedOrient = 0;
+static uint8_t clockOrient     = 0;
+static int8_t  orientFrames    = 0;
+static int8_t  clockSwapFrames = 0;
+static uint8_t paintedOrient   = 0;
 // RTC and IMU share an I2C bus. Reading the RTC at 60fps starves the IMU
 // reads in clockUpdateOrient — orientation detection gets noisy. Cache the
 // time once per second; mood logic and drawClock both read from here.
@@ -594,57 +697,55 @@ static void clockRefreshRtc() {
 static void clockUpdateOrient() {
   float ax, ay, az;
   board::imuAccel(&ax, &ay, &az);
-  uint8_t lock = settings().clockRot;
-  if (lock == 1) { clockOrient = 0; return; }
-  if (lock == 2) {
-    // Locked landscape: never drop to 0, but still pick 1 vs 3 from
-    // gravity so the cradle works either way up. Need a strong tilt
-    // for the 1↔3 swap so handling jitter doesn't flip it; otherwise
-    // hold whatever we last had (or 1 from boot).
-    if (clockOrient == 0) clockOrient = (ax >= 0) ? 1 : 3;
-    if      (ax >  0.5f && clockOrient != 1) clockOrient = 1;
-    else if (ax < -0.5f && clockOrient != 3) clockOrient = 3;
-    return;
+  // State machine extracted to logic/clock_orient_logic.h (unit-tested
+  // natively); ax is the in-plane long axis on every supported board.
+  clockOrientUpdate(&clockOrient, &orientFrames, &clockSwapFrames,
+                    ax, ay, az, settings().clockRot);
+}
+
+// Clock face: shown when charging on USB with nothing else going on, and
+// as the carousel DISP_CLOCK screen (withStrip adds the host/session row).
+// Portrait paints the lower area of the sprite; pet renders above.
+// Landscape draws direct to LCD with rotation — sprite stays untouched.
+// Month/weekday labels + placeholder-hardened formatting live in
+// logic/clock_display_logic.h.
+
+static uint8_t clockDow() { return (uint8_t)_clk.tm_wday % 7; }
+
+// Host/session status strip: connected host's name (or "no host") on the
+// left, one pip per session on the right — wait pips hot, running green,
+// idle/done dim outlines. Same vocabulary as the HUD badge line. Draws to
+// either surface (portrait sprite / landscape LCD) via the TFT_eSPI base.
+static void drawClockStrip(TFT_eSPI* g, int y) {
+  const Palette& p = characterPalette();
+  g->setTextSize(1);
+  g->setCursor(4, y);
+  g->setTextColor(p.textDim, p.bg);
+  if (!tama.connected) {
+    g->print("no host");
+  } else {
+    const char* hn = hostGlueActiveName();
+    char row[16];
+    snprintf(row, sizeof(row), "%.13s", hn[0] ? hn : "host");
+    g->print(row);
   }
-  // Dual threshold: strict to enter (must be clearly sideways), loose to
-  // stay (tolerate ~65° of tilt). With one shared threshold a slight lean
-  // while sitting on the long edge puts ax right at the boundary and the
-  // counter ratchets down in ~half a second.
-  bool side = (clockOrient == 0)
-    ? fabsf(ax) > 0.7f && fabsf(ay) < 0.5f && fabsf(az) < 0.5f
-    : fabsf(ax) > 0.4f;
-  if (side) { if (orientFrames < 20) orientFrames++; }
-  else      { if (orientFrames > -10) orientFrames--; }
-  if (clockOrient == 0 && orientFrames >= 15) {
-    clockOrient = (ax > 0) ? 1 : 3;
-  } else if (clockOrient != 0 && orientFrames <= -8) {
-    clockOrient = 0;
-  } else if (clockOrient != 0 && side) {
-    // Direct 1↔3: a fast flip keeps |ax|>0.7 (just changes sign), so
-    // `side` never drops and the exit-via-0 path can't fire. Watch for
-    // ax sign disagreeing with the stored orientation.
-    static int8_t swapFrames = 0;
-    uint8_t want = (ax > 0) ? 1 : 3;
-    if (want != clockOrient) { if (++swapFrames >= 8) { clockOrient = want; swapFrames = 0; } }
-    else swapFrames = 0;
+  int wpx = g->width();
+  for (uint8_t i = 0; i < _sessions.count; i++) {
+    uint16_t c = _sessions.s[i].state == SES_WAIT ? HOT
+               : _sessions.s[i].state == SES_RUN  ? GREEN : p.textDim;
+    int px = wpx - 8 - (int)(_sessions.count - 1 - i) * 7;
+    if (_sessions.s[i].state == SES_RUN || _sessions.s[i].state == SES_WAIT)
+      g->fillCircle(px, y + 3, 2, c);
+    else
+      g->drawCircle(px, y + 3, 2, c);
   }
 }
 
-// Clock face: shown when charging on USB with nothing else going on.
-// Portrait paints the upper ~110px to the sprite; pet renders below.
-// Landscape draws direct to LCD with rotation — sprite stays untouched.
-static const char* const MON[] = {
-  "Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"
-};
-static const char* const DOW[] = {"Sun","Mon","Tue","Wed","Thu","Fri","Sat"};
-
-static uint8_t clockDow() { return (uint8_t)_clk.tm_wday % 7; }
-static void drawClock() {
+static void drawClock(bool withStrip = false) {
   const Palette& p = characterPalette();
-  char hm[6]; snprintf(hm, sizeof(hm), "%02u:%02u", (unsigned)_clk.tm_hour, (unsigned)_clk.tm_min);
-  char ss[4]; snprintf(ss, sizeof(ss), ":%02u", (unsigned)_clk.tm_sec);
-  uint8_t mi = (_clk.tm_mon >= 0 && _clk.tm_mon < 12) ? (uint8_t)_clk.tm_mon : 0;
-  char dl[8]; snprintf(dl, sizeof(dl), "%s %02u", MON[mi], (unsigned)_clk.tm_mday);
+  char hm[8]; clockFormatHm(hm, sizeof(hm), _clk.tm_hour, _clk.tm_min);
+  char ss[8]; clockFormatSeconds(ss, sizeof(ss), _clk.tm_sec);
+  char dl[12]; clockFormatDateLine(dl, sizeof(dl), _clk.tm_mon + 1, _clk.tm_mday);
 
   if (clockOrient == 0) {
     paintedOrient = 0;
@@ -656,6 +757,7 @@ static void drawClock() {
     spr.setTextSize(2); spr.setTextColor(p.textDim, p.bg); spr.drawString(ss, CX, 175);
     spr.setTextSize(1);                                     spr.drawString(dl, CX, 200);
     spr.setTextDatum(TL_DATUM);
+    if (withStrip) drawClockStrip(&spr, H - 14);
     return;
   }
 
@@ -671,14 +773,22 @@ static void drawClock() {
   // for nothing. Gate on the second changing (or full repaint).
   if (repaint || (uint8_t)_clk.tm_sec != lastSec) {
     lastSec = (uint8_t)_clk.tm_sec;
-    char wdl[12]; snprintf(wdl, sizeof(wdl), "%s %s %02u", DOW[clockDow()], MON[mi], (unsigned)_clk.tm_mday);
-    char ssl[3]; snprintf(ssl, sizeof(ssl), "%02u", (unsigned)_clk.tm_sec);
+    char wdl[14];
+    clockFormatWeekDateLine(wdl, sizeof(wdl), clockDow(), _clk.tm_mon + 1, _clk.tm_mday);
+    // bare seconds, no colon — historic landscape layout
+    char ssl[4]; snprintf(ssl, sizeof(ssl), "%.2s", ss + 1);
     M5.Lcd.setTextDatum(MC_DATUM);
     M5.Lcd.setTextSize(3); M5.Lcd.setTextColor(p.text, p.bg);    M5.Lcd.drawString(hm, 170, 42);
     M5.Lcd.setTextSize(2); M5.Lcd.setTextColor(p.textDim, p.bg); M5.Lcd.drawString(ssl, 170, 72);
                                                                   M5.Lcd.drawString(wdl, 170, 102);
     M5.Lcd.setTextDatum(TL_DATUM);
     M5.Lcd.setTextSize(1);
+    if (withStrip) {
+      // Pips don't self-clear when a session drops off — wipe the row.
+      // 1Hz + 12px tall: no visible tear.
+      M5.Lcd.fillRect(0, 121, M5.Lcd.width(), 12, p.bg);
+      drawClockStrip(&M5.Lcd, 123);
+    }
   }
 
   // Pet on left at 5 fps. Clear includes the overlay-particle zone above
@@ -704,6 +814,158 @@ static void drawClock() {
     }
   }
   M5.Lcd.setRotation(0);
+}
+
+// DISP_CLOCK portrait: carousel clock screen. Header row like PET/INFO
+// (title left, weekday right), big HH:MM, seconds + date, host/session
+// strip pinned at the bottom. Landscape reuses drawClock's face (identical
+// layout) with the strip enabled — the loop routes there directly.
+static void drawClockScreen() {
+  const Palette& p = characterPalette();
+  const int TOP = 70;
+  spr.fillRect(0, TOP, W, H - TOP, p.bg);
+  spr.setTextSize(1);
+  spr.setTextColor(p.text, p.bg);
+  spr.setCursor(4, TOP + 2); spr.print("Clock");
+  spr.setTextColor(p.textDim, p.bg);
+  spr.setCursor(W - 22, TOP + 2); spr.print(clockWeekdayLabel(clockDow()));
+
+  char hm[8]; clockFormatHm(hm, sizeof(hm), _clk.tm_hour, _clk.tm_min);
+  char ss[8]; clockFormatSeconds(ss, sizeof(ss), _clk.tm_sec);
+  char dl[12]; clockFormatDateLine(dl, sizeof(dl), _clk.tm_mon + 1, _clk.tm_mday);
+  spr.setTextDatum(MC_DATUM);
+  spr.setTextSize(4); spr.setTextColor(p.text, p.bg);    spr.drawString(hm, CX, 132);
+  spr.setTextSize(2); spr.setTextColor(p.textDim, p.bg); spr.drawString(ss, CX, 166);
+  spr.setTextSize(1);                                     spr.drawString(dl, CX, 192);
+  spr.setTextDatum(TL_DATUM);
+  drawClockStrip(&spr, H - 14);
+}
+
+// DISP_EXTRAS page 0 — pomodoro. A = start/pause/resume, B = skip phase,
+// B-long = reset to idle, A-long = leave the screen. Big mm:ss remaining,
+// progress bar, one dot per completed focus of the 4-block cycle.
+static const char* const POMO_PHASE_NAME[] = { "idle", "focus", "break", "long break" };
+static void drawPomodoro() {
+  const Palette& p = characterPalette();
+  const int TOP = 70;
+  uint32_t now = millis();
+  spr.fillRect(0, TOP, W, H - TOP, p.bg);
+  spr.setTextSize(1);
+  spr.setTextColor(p.text, p.bg);
+  spr.setCursor(4, TOP + 2); spr.print("Extras");
+  spr.setTextColor(p.textDim, p.bg);
+  spr.setCursor(W - 52, TOP + 2); spr.print("pomodoro");
+
+  int y = TOP + 22;
+  uint16_t phCol = pomo.phase == POMO_FOCUS ? HOT
+                 : pomo.phase == POMO_IDLE  ? p.textDim : GREEN;
+  spr.setTextSize(2);
+  spr.setTextColor(phCol, p.bg);
+  spr.setCursor(6, y);
+  spr.print(POMO_PHASE_NAME[pomo.phase]);
+  if (pomo.paused) {
+    spr.setTextSize(1);
+    spr.setTextColor(p.textDim, p.bg);
+    spr.setCursor(W - 40, y + 4);
+    spr.print("paused");
+  }
+  y += 26;
+
+  // Remaining mm:ss. Idle previews the focus block a press of A buys.
+  uint32_t r = (pomo.phase == POMO_IDLE ? POMO_FOCUS_MS
+                                        : pomoRemainMs(pomo, now)) / 1000;
+  char rem[8];
+  snprintf(rem, sizeof(rem), "%02lu:%02lu",
+           (unsigned long)(r / 60), (unsigned long)(r % 60));
+  spr.setTextDatum(MC_DATUM);
+  spr.setTextSize(4);
+  spr.setTextColor(pomo.phase == POMO_IDLE ? p.textDim : p.text, p.bg);
+  spr.drawString(rem, CX, y + 16);
+  spr.setTextDatum(TL_DATUM);
+  spr.setTextSize(1);
+  y += 42;
+
+  const int BX = 8, BW = W - 16, BH = 8;
+  spr.drawRect(BX, y, BW, BH, p.textDim);
+  if (pomo.phase != POMO_IDLE) {
+    int fill = (int)((uint64_t)(BW - 2) * pomoElapsedMs(pomo, now)
+                     / pomoPhaseDurMs(pomo.phase));
+    if (fill > 0) spr.fillRect(BX + 1, y + 1, fill, BH - 2, phCol);
+  }
+  y += 18;
+
+  for (uint8_t i = 0; i < POMO_CYCLE_LEN; i++) {
+    int px = CX - 21 + i * 14;
+    if (i < pomo.focusDone)
+      spr.fillCircle(px, y + 3, 3, p.body);
+    else if (i == pomo.focusDone && pomo.phase == POMO_FOCUS)
+      spr.fillCircle(px, y + 3, 3, phCol);
+    else
+      spr.drawCircle(px, y + 3, 3, p.textDim);
+  }
+
+  spr.setTextColor(p.textDim, p.bg);
+  spr.setCursor(4, H - 10);
+  spr.print(pomo.phase == POMO_IDLE ? "A:start  hold-A:exit"
+          : pomo.paused             ? "A:resume B:skip"
+                                    : "A:pause B:skip");
+}
+
+#ifdef BUDDY_EXTRAS_FULL
+// DISP_EXTRAS page 1 — IR remote (FULL builds only). Four learned-code
+// slots: A = next slot, B = blast the slot, B-long = learn (captures the
+// next burst from a real remote), A-long = leave. Codes are raw timings —
+// no protocol decoding, so any 38 kHz remote works.
+static void drawIrPage() {
+  const Palette& p = characterPalette();
+  const int TOP = 70;
+  spr.fillRect(0, TOP, W, H - TOP, p.bg);
+  spr.setTextSize(1);
+  spr.setTextColor(p.text, p.bg);
+  spr.setCursor(4, TOP + 2); spr.print("Extras");
+  spr.setTextColor(p.textDim, p.bg);
+  spr.setCursor(W - 58, TOP + 2); spr.print("ir remote");
+
+  int y = TOP + 20;
+  for (uint8_t i = 0; i < IR_SLOTS; i++) {
+    bool sel = i == irSel;
+    spr.setTextColor(sel ? p.text : p.textDim, p.bg);
+    spr.setCursor(6, y);
+    spr.printf("%s slot %u", sel ? ">" : " ", i + 1);
+    spr.setCursor(66, y);
+    if (irLearning() && irLearnSlot() == (int8_t)i) {
+      spr.setTextColor(HOT, p.bg);
+      spr.print("listening");
+    } else {
+      uint16_t n = irSlotEdges(i);
+      if (n) { spr.setTextColor(GREEN, p.bg); spr.printf("%u edges", n); }
+      else spr.print("empty");
+    }
+    y += 14;
+  }
+  y += 8;
+  spr.setTextColor(p.textDim, p.bg);
+  if (irLearning()) {
+    uint32_t leftMs = (int32_t)(irLearnDeadline - millis()) > 0
+                    ? irLearnDeadline - millis() : 0;
+    spr.setCursor(6, y);      spr.print("point remote at rx,");
+    spr.setCursor(6, y + 10); spr.printf("press a key... %lus",
+                                         (unsigned long)((leftMs + 999) / 1000));
+  } else {
+    spr.setCursor(6, y);      spr.print("hold B: learn slot");
+    spr.setCursor(6, y + 10); spr.printf("tx G%d  rx G%d", IR_TX_GPIO, IR_RX_GPIO);
+  }
+  spr.setCursor(4, H - 10);
+  spr.print("A:slot  B:send");
+}
+#endif
+
+// DISP_EXTRAS router: page 0 pomodoro everywhere; page 1 IR on FULL builds.
+static void drawExtrasScreen() {
+#ifdef BUDDY_EXTRAS_FULL
+  if (extrasPage == 1) { drawIrPage(); return; }
+#endif
+  drawPomodoro();
 }
 
 // Persona base-state mapping extracted to logic/persona_logic.h; pack the
@@ -1323,6 +1585,69 @@ static void drawAsk() {
   spr.print("B:ok");
 }
 
+// DISP_CARDS: ntfy notification cards — auto-inserted in the carousel
+// while the ring holds any. One card per view: kind tag + local HH:MM
+// header, title, wrapped body. B = next card, B-long = dismiss. Rendering
+// the screen clears the HUD unread badge (cards stay until dismissed or
+// rung out by newer ones).
+static uint16_t cardKindColor(const char* kind, const Palette& p) {
+  if (strcmp(kind, "gh") == 0) return p.body;
+  if (strcmp(kind, "ci") == 0) return GREEN;
+  if (strcmp(kind, "weather") == 0 || strcmp(kind, "wx") == 0) return 0x07FF;
+  return p.textDim;   // unknown kinds render generic, per spec
+}
+
+static void drawCards() {
+  const Palette& p = characterPalette();
+  const int TOP = 70;
+  spr.fillRect(0, TOP, W, H - TOP, p.bg);
+  spr.setTextSize(1);
+  int y = TOP + 2;
+  _ntfy.unread = 0;                       // viewed — badge clears
+  if (cardSel >= _ntfy.count) cardSel = 0;
+  const NtfyCard* c = ntfyCardAt(&_ntfy, cardSel);
+
+  spr.setTextColor(p.text, p.bg);
+  spr.setCursor(4, y); spr.print("Cards");
+  spr.setTextColor(p.textDim, p.bg);
+  spr.setCursor(W - 28, y); spr.printf("%u/%u", cardSel + 1, _ntfy.count);
+  y += 14;
+  if (!c) {   // ring emptied under us — carousel will skip next cycle
+    spr.setTextColor(p.textDim, p.bg);
+    spr.setCursor(4, y); spr.print("no cards");
+    return;
+  }
+
+  spr.setTextColor(cardKindColor(c->kind, p), p.bg);
+  spr.setCursor(4, y);
+  spr.printf("[%.6s]", c->kind[0] ? c->kind : "*");
+  if (c->ts && dataRtcValid()) {
+    // Bridge epoch (UTC) + its tz offset -> local wall time for the stamp.
+    struct tm ct;
+    clockEpochToTmUtc((time_t)((int64_t)c->ts + dataTzOffset()), &ct);
+    char hm[8]; clockFormatHm(hm, sizeof(hm), ct.tm_hour, ct.tm_min);
+    spr.setTextColor(p.textDim, p.bg);
+    spr.setCursor(W - 34, y);
+    spr.print(hm);
+  }
+  y += 12;
+
+  char rows[2][24];
+  uint8_t nR = wrapInto(c->title, rows, 2, 21);
+  spr.setTextColor(p.text, p.bg);
+  for (uint8_t i = 0; i < nR; i++) { spr.setCursor(4, y); spr.print(rows[i]); y += 9; }
+  y += 4;
+
+  char brows[8][24];
+  uint8_t nB = wrapInto(c->body, brows, 8, 21);
+  spr.setTextColor(p.textDim, p.bg);
+  for (uint8_t i = 0; i < nB; i++) { spr.setCursor(4, y); spr.print(brows[i]); y += 9; }
+
+  spr.setTextColor(p.textDim, p.bg);
+  spr.setCursor(4, H - 10);
+  spr.print("B:next  hold:dismiss");
+}
+
 void drawHUD() {
   if (tama.promptId[0]) { drawApproval(); return; }
   if (tama.qAskId[0] && !askDismissed) { drawAsk(); return; }
@@ -1351,9 +1676,9 @@ void drawHUD() {
       spr.setTextColor(p.textDim, p.bg);
       spr.printf("%.11s", hn[0] ? hn : "host");
     }
-    if (_ntfy.count) {
+    if (_ntfy.unread) {   // clears once the cards screen is viewed
       char nb[6];
-      snprintf(nb, sizeof(nb), "n%u", _ntfy.count);
+      snprintf(nb, sizeof(nb), "n%u", _ntfy.unread);
       spr.setTextColor(p.body, p.bg);
       spr.setCursor(W - 8 - (int)_sessions.count * 7 - (int)strlen(nb) * 6, by);
       spr.print(nb);
@@ -1431,6 +1756,8 @@ void setup() {
   }
   applyBrightness();
   applyVolume();
+  pomoInit(pomo);
+  gestureInit(gest);
   lastInteractMs = millis();
   statsLoad();
   petNameLoad();
@@ -1497,6 +1824,9 @@ void setup() {
 void loop() {
   esp_task_wdt_reset();   // pet the watchdog; loop normally cycles <100ms
   board::update();
+#ifdef BUDDY_EXTRAS_FULL
+  tuneTick();   // async jingle sequencer; no-op while idle
+#endif
   t++;
   uint32_t now = millis();
 
@@ -1504,6 +1834,51 @@ void loop() {
   dataPoll(&tama);
   if (statsPollLevelUp()) triggerOneShot(P_CELEBRATE, 3000);
   baseState = derive(tama);
+
+  // Pomodoro tick. Phase transitions chime through beep() (vol 0 = mute):
+  // focus done = two-note descent into the break, break over = single
+  // nudge back to work. Note 2 is millis-scheduled — tone() one-at-a-time.
+  // No wake(): the chime is the notification, the screen can stay off.
+  static uint32_t pomoNote2At = 0;
+  PomoEvent pev = pomoTick(pomo, now);
+  if (pev == POMO_EV_FOCUS_DONE) {
+    beep(2000, 100);
+    pomoNote2At = now + 130;
+  } else if (pev == POMO_EV_BREAK_DONE) {
+    beep(1400, 180);
+  }
+  if (pomoNote2At && (int32_t)(now - pomoNote2At) >= 0) {
+    beep(1500, 150);
+    pomoNote2At = 0;
+  }
+
+#ifdef BUDDY_EXTRAS_FULL
+  // IR learn session: poll the capture (non-blocking), time it out, and
+  // drop it if the user leaves the page — the RX driver only lives while
+  // a learn is actually armed.
+  if (irLearning()) {
+    if (displayMode != DISP_EXTRAS || extrasPage != 1) {
+      irLearnCancel();
+    } else {
+      int r = irLearnPoll();
+      if (r == 1)       { showToast("learned"); beep(2400, 60); }
+      else if (r == -1) { showToast("no signal"); beep(600, 60); }
+      else if ((int32_t)(now - irLearnDeadline) >= 0) {
+        irLearnCancel();
+        showToast("learn timeout");
+      }
+    }
+  }
+#endif
+
+  // Pomodoro focus: look busy while the timer runs and the desk is quiet.
+  // Real host state always wins — this only upgrades an otherwise-idle
+  // buddy (and skips the idle->sleep demotion below, on purpose).
+  if (pomo.phase == POMO_FOCUS && !pomo.paused && baseState == P_IDLE &&
+      tama.sessionsRunning == 0 && tama.sessionsWaiting == 0 &&
+      !tama.recentlyCompleted) {
+    baseState = P_BUSY;
+  }
 
   // After waking the screen, hold sleep for 12s so users see the wake-up
   // animation. Urgent states (attention, celebrate, busy) override this.
@@ -1524,8 +1899,15 @@ void loop() {
   static PersonaState prevActiveState = P_SLEEP;
   static uint32_t chimeNote2At = 0;
   if (activeState == P_CELEBRATE && prevActiveState != P_CELEBRATE) {
-    beep(2000, 100);
-    chimeNote2At = now + 130;
+#ifdef BUDDY_EXTRAS_FULL
+    if (tunesJingle(SLOT_DONE)) {
+      chimeNote2At = 0;   // the tune replaces both notes
+    } else
+#endif
+    {
+      beep(2000, 100);
+      chimeNote2At = now + 130;
+    }
   }
   if (chimeNote2At && (int32_t)(now - chimeNote2At) >= 0) {
     beep(2800, 150);
@@ -1545,6 +1927,34 @@ void loop() {
       triggerOneShot(P_DIZZY, 2000);
       Serial.println("shake: dizzy");
     }
+
+    // IMU gestures on the same 50ms cadence (checkShake keeps its own
+    // read + EMA; one extra I2C read here is noise next to the render).
+    // Gestures run even with the screen off — that's the whole point of
+    // double-tap-to-wake. NO gesture ever answers a prompt.
+    float gax, gay, gaz;
+    board::imuAccel(&gax, &gay, &gaz);
+    GestureEvent ge = gestureFeed(gest, gax, gay, gaz, now);
+    if (ge == GE_FLIP && !napping && !isFaceDown() && !tama.promptId[0] &&
+        hostGlueCount() > 0) {
+      // Flip = pin the next bonded host, same cycle as settings > host
+      // mode (auto -> h0 -> ... -> auto). The flat face-down pose is
+      // excluded — that gesture belongs to the nap.
+      int8_t next = settings().hostsel + 1;
+      if (next >= (int8_t)hostGlueCount()) next = -1;
+      settings().hostsel = next;
+      settingsSave();
+      hostGlueSetPin(next);
+      char tb[20];
+      snprintf(tb, sizeof(tb), "-> %.14s",
+               next < 0 ? "auto" : hostGlueGet((uint8_t)next)->name);
+      showToast(tb, 2600);   // long enough to survive flipping back over
+      beep(1800, 60);
+      wake();
+      Serial.printf("flip: host %s\n", next < 0 ? "auto" : hostGlueGet((uint8_t)next)->name);
+    } else if (ge == GE_DOUBLE_TAP && !napping) {
+      wake();   // tap-tap the desk to light the screen without a button
+    }
   }
 
   // BtnA: step through fake scenarios
@@ -1556,15 +1966,24 @@ void loop() {
     if (tama.promptId[0]) {
       promptArrivedMs = millis();
       wake();
-      beep(1200, 80);   // alert chirp
+      TUNE_OR_BEEP(SLOT_ALERT, 1200, 80);   // alert
       // Jump to the approval screen no matter what was open — drawApproval
       // only runs from drawHUD which only runs in DISP_NORMAL.
       displayMode = DISP_NORMAL;
-      menuOpen = settingsOpen = resetOpen = hostsOpen = forgetOpen = false;
+      menuOpen = settingsOpen = resetOpen = hostsOpen = forgetOpen = extrasOpen = false;
       applyDisplayMode();
       characterInvalidate();
       if (buddyMode) buddyInvalidate();
     }
+  }
+
+  // ntfy card arrival: short chirp (vol-gated via beep) and deliberately
+  // NO wake() — attention without screen burn. If the screen is off it
+  // stays off; the unread badge and carousel pick it up later.
+  static uint32_t seenNtfyTotal = 0;
+  if (_ntfy.total > seenNtfyTotal) {
+    seenNtfyTotal = _ntfy.total;
+    beep(1600, 50);
   }
 
   // Ask arrival (v2, read-only): chirp + re-arm the overlay for the new id.
@@ -1627,6 +2046,12 @@ void loop() {
     else if (hostsOpen) { hostsOpen = false; characterInvalidate(); }
     else if (resetOpen) { resetOpen = false; }
     else if (settingsOpen) { settingsOpen = false; characterInvalidate(); }
+    else if (extrasOpen) { extrasOpen = false; characterInvalidate(); }
+    else if (displayMode == DISP_EXTRAS) {
+      // leave the extras screen (pomodoro keeps running in the background)
+      displayMode = DISP_NORMAL;
+      applyDisplayMode();
+    }
     else {
       menuOpen = !menuOpen;
       menuSel = 0;
@@ -1643,7 +2068,7 @@ void loop() {
         responseSent = true;
         uint32_t tookS = (millis() - promptArrivedMs) / 1000;
         statsOnApproval(tookS);
-        beep(2400, 60);
+        TUNE_OR_BEEP(SLOT_APPROVE, 2400, 60);
         if (tookS < 5) triggerOneShot(P_HEART, 2000);
       } else if (askShowing()) {
         beep(1800, 30);
@@ -1661,16 +2086,30 @@ void loop() {
       } else if (settingsOpen) {
         beep(1800, 30);
         settingsSel = (settingsSel + 1) % SETTINGS_N;
+      } else if (extrasOpen) {
+        beep(1800, 30);
+        extrasSel = (extrasSel + 1) % EXTRAS_N;
       } else if (menuOpen) {
         beep(1800, 30);
         menuSel = (menuSel + 1) % MENU_N;
+      } else if (displayMode == DISP_EXTRAS) {
+        beep(1800, 30);
+#ifdef BUDDY_EXTRAS_FULL
+        if (extrasPage == 1) irSel = (uint8_t)((irSel + 1) % IR_SLOTS);
+        else
+#endif
+        pomoStartPause(pomo, millis());   // pomodoro page: A drives the timer
       } else {
         beep(1800, 30);
-        displayMode = (displayMode + 1) % DISP_COUNT;
-        // Session list is pointless while empty — skip it in the cycle.
-        if (displayMode == DISP_SESSIONS && _sessions.count == 0) {
+        // Skip screens with nothing to show: the session list while empty,
+        // the clock until a time source exists. DISP_NORMAL is never
+        // skipped, so the walk always terminates.
+        do {
           displayMode = (displayMode + 1) % DISP_COUNT;
-        }
+        } while ((displayMode == DISP_SESSIONS && _sessions.count == 0) ||
+                 (displayMode == DISP_CLOCK && !board::clockValid()) ||
+                 (displayMode == DISP_CARDS && _ntfy.count == 0));
+        if (displayMode == DISP_CARDS) cardSel = 0;   // land on the newest
         applyDisplayMode();
       }
     }
@@ -1686,13 +2125,42 @@ void loop() {
   // action on release (a held B during a prompt still denies, etc).
   if (M5.BtnB.pressedFor(600) && !btnBLong && !swallowBtnB &&
       !inPrompt && !menuOpen && !settingsOpen && !resetOpen &&
-      !hostsOpen && !forgetOpen && !askShowing()) {
+      !hostsOpen && !forgetOpen && !extrasOpen && !askShowing()) {
     if (displayMode == DISP_SESSIONS) {
       // pin/unpin focus on the selected session
       btnBLong = true;
       beep(800, 60);
       bool pinned = sessionTabTogglePin(&_sessions);
       showToast(pinned ? "focus pinned" : "focus cleared");
+    } else if (displayMode == DISP_EXTRAS) {
+      btnBLong = true;
+      beep(800, 60);
+#ifdef BUDDY_EXTRAS_FULL
+      if (extrasPage == 1) {
+        // IR page: B-long arms a learn session on the selected slot
+        if (!irLearning() && irLearnStart(irSel)) {
+          irLearnDeadline = millis() + 8000;
+          showToast("listening 8s");
+        }
+      } else
+#endif
+      {
+        // pomodoro page: B-long resets the timer to idle
+        pomoStop(pomo);
+        showToast("pomodoro reset");
+      }
+    } else if (displayMode == DISP_CARDS) {
+      // dismiss the shown card; an empty ring drops us back home
+      btnBLong = true;
+      beep(800, 60);
+      if (ntfyDismiss(&_ntfy, cardSel)) {
+        if (cardSel >= _ntfy.count) cardSel = 0;
+        showToast("dismissed");
+        if (_ntfy.count == 0) {
+          displayMode = DISP_NORMAL;
+          applyDisplayMode();
+        }
+      }
     } else if (displayMode == DISP_NORMAL) {
       btnBLong = true;
       beep(800, 60);
@@ -1713,7 +2181,7 @@ void loop() {
       sendCmd(cmd);
       responseSent = true;
       statsOnDenial();
-      beep(600, 60);
+      TUNE_OR_BEEP(SLOT_DENY, 600, 60);
     } else if (askShowing()) {
       beep(2400, 30);
       askDismissed = true;   // read-only card — B just puts it away
@@ -1729,9 +2197,21 @@ void loop() {
     } else if (settingsOpen) {
       beep(2400, 30);
       applySetting(settingsSel);
+    } else if (extrasOpen) {
+      beep(2400, 30);
+      extrasConfirm();
     } else if (menuOpen) {
       beep(2400, 30);
       menuConfirm();
+    } else if (displayMode == DISP_EXTRAS) {
+      beep(2400, 30);
+#ifdef BUDDY_EXTRAS_FULL
+      if (extrasPage == 1) {
+        if (irLearning()) { irLearnCancel(); showToast("learn cancelled"); }
+        else showToast(irBlast(irSel) ? "sent" : "empty");
+      } else
+#endif
+      pomoSkip(pomo, millis());   // pomodoro page: B skips the phase
     } else if (displayMode == DISP_INFO) {
       beep(2400, 30);
       infoPage = (infoPage + 1) % INFO_PAGES;
@@ -1742,6 +2222,9 @@ void loop() {
     } else if (displayMode == DISP_SESSIONS) {
       beep(2400, 30);
       sessionTabSelectNext(&_sessions);
+    } else if (displayMode == DISP_CARDS) {
+      beep(2400, 30);
+      if (_ntfy.count) cardSel = (uint8_t)((cardSel + 1) % _ntfy.count);
     } else {
       beep(2400, 30);
       msgScroll = (msgScroll >= 30) ? 0 : msgScroll + 1;
@@ -1764,9 +2247,16 @@ void loop() {
                && !hostsOpen && !forgetOpen && !askShowing()
                && tama.sessionsRunning == 0 && tama.sessionsWaiting == 0
                && dataRtcValid() && _onUsb;
-  if (clocking) clockUpdateOrient();
-  else { clockOrient = 0; orientFrames = 0; paintedOrient = 0; }
-  bool landscapeClock = clocking && clockOrient != 0;
+  // User-selected clock screen (DISP_CLOCK): same face and orientation
+  // machinery as the charging clock, but picked from the carousel. Any
+  // overlay (menus, prompt, passkey) drops it back to the portrait sprite
+  // path so the overlay stays visible; landscape draws direct to LCD.
+  bool clockScreen = displayMode == DISP_CLOCK && !menuOpen && !settingsOpen
+                  && !resetOpen && !hostsOpen && !forgetOpen && !inPrompt
+                  && !blePasskey();
+  if (clocking || clockScreen) clockUpdateOrient();
+  else { clockOrient = 0; orientFrames = 0; clockSwapFrames = 0; paintedOrient = 0; }
+  bool landscapeClock = (clocking || clockScreen) && clockOrient != 0;
 
   static bool wasClocking = false;
   static bool wasLandscape = false;
@@ -1829,10 +2319,13 @@ void loop() {
     }
   }
   if (landscapeClock) {
-    drawClock();
+    drawClock(clockScreen);   // strip on the user screen, not while charging
   } else if (!napping && !screenOff) {
     if (blePasskey()) drawPasskey();
     else if (clocking) drawClock();
+    else if (displayMode == DISP_CLOCK) drawClockScreen();
+    else if (displayMode == DISP_CARDS) drawCards();
+    else if (displayMode == DISP_EXTRAS) drawExtrasScreen();
     else if (displayMode == DISP_INFO) drawInfo();
     else if (displayMode == DISP_PET) drawPet();
     else if (displayMode == DISP_SESSIONS) drawSessions();
@@ -1841,6 +2334,7 @@ void loop() {
     else if (hostsOpen) drawHosts();
     else if (resetOpen) drawReset();
     else if (settingsOpen) drawSettings();
+    else if (extrasOpen) drawExtras();
     else if (menuOpen) drawMenu();
     drawToast();
     spr.pushSprite(0, 0);

@@ -88,6 +88,7 @@ struct NtfyStore {
   NtfyCard card[4];
   uint8_t  head;    // next write slot
   uint8_t  count;   // cards held (<= 4)
+  uint8_t  unread;  // arrived since the cards screen was last viewed (<= count)
   uint32_t total;   // lifetime cards seen
 };
 
@@ -100,7 +101,34 @@ inline void ntfyPush(NtfyStore* n, const char* kind, const char* title,
   c.ts = ts;
   n->head = (uint8_t)((n->head + 1) % 4);
   if (n->count < 4) n->count++;
+  if (n->unread < 4) n->unread++;   // badge caps at what the ring can hold
   n->total++;
+}
+
+// Card by view index, 0 = newest. NULL when out of range.
+inline const NtfyCard* ntfyCardAt(const NtfyStore* n, uint8_t viewIdx) {
+  if (viewIdx >= n->count) return (const NtfyCard*)0;
+  return &n->card[(uint8_t)((n->head + 3 - viewIdx) % 4)];
+}
+
+// Remove one card by view index (0 = newest). Survivors are repacked
+// oldest-first from slot 0, head follows, so push order stays intact.
+// unread is clamped — a dismissal from the cards screen means "seen".
+inline bool ntfyDismiss(NtfyStore* n, uint8_t viewIdx) {
+  if (viewIdx >= n->count) return false;
+  NtfyCard tmp[4];
+  uint8_t k = 0;
+  for (uint8_t i = 0; i < n->count; i++) {           // oldest -> newest
+    uint8_t phys = (uint8_t)((n->head + 4 - n->count + i) % 4);
+    uint8_t view = (uint8_t)(n->count - 1 - i);
+    if (view == viewIdx) continue;
+    tmp[k++] = n->card[phys];
+  }
+  for (uint8_t i = 0; i < k; i++) n->card[i] = tmp[i];
+  n->count = k;
+  n->head = k;                                        // k <= 3 after a removal
+  if (n->unread > k) n->unread = k;
+  return true;
 }
 
 // ---------------------------------------------------------------------------

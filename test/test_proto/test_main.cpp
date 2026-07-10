@@ -321,6 +321,50 @@ void test_ntfy_ring_stores_and_wraps() {
   TEST_ASSERT_EQUAL_UINT8(4, _ntfy.count);       // ring holds 4
   TEST_ASSERT_EQUAL_UINT32(5, _ntfy.total);
   TEST_ASSERT_EQUAL_STRING("PR #4", _ntfy.card[0].title);   // wrapped over #0
+  TEST_ASSERT_EQUAL_UINT8(4, _ntfy.unread);      // badge caps at ring size
+}
+
+void test_ntfy_view_order_newest_first() {
+  ntfyPush(&_ntfy, "gh", "one",   "b", 1);
+  ntfyPush(&_ntfy, "ci", "two",   "b", 2);
+  ntfyPush(&_ntfy, "wx", "three", "b", 3);
+  TEST_ASSERT_EQUAL_STRING("three", ntfyCardAt(&_ntfy, 0)->title);
+  TEST_ASSERT_EQUAL_STRING("two",   ntfyCardAt(&_ntfy, 1)->title);
+  TEST_ASSERT_EQUAL_STRING("one",   ntfyCardAt(&_ntfy, 2)->title);
+  TEST_ASSERT_NULL(ntfyCardAt(&_ntfy, 3));
+  // ...and still correct after the ring wraps
+  ntfyPush(&_ntfy, "gh", "four", "b", 4);
+  ntfyPush(&_ntfy, "gh", "five", "b", 5);
+  TEST_ASSERT_EQUAL_STRING("five", ntfyCardAt(&_ntfy, 0)->title);
+  TEST_ASSERT_EQUAL_STRING("two",  ntfyCardAt(&_ntfy, 3)->title);   // oldest kept
+}
+
+void test_ntfy_dismiss_middle_keeps_order() {
+  ntfyPush(&_ntfy, "gh", "one",   "b", 1);
+  ntfyPush(&_ntfy, "ci", "two",   "b", 2);
+  ntfyPush(&_ntfy, "wx", "three", "b", 3);
+  TEST_ASSERT_TRUE(ntfyDismiss(&_ntfy, 1));      // drop "two"
+  TEST_ASSERT_EQUAL_UINT8(2, _ntfy.count);
+  TEST_ASSERT_EQUAL_STRING("three", ntfyCardAt(&_ntfy, 0)->title);
+  TEST_ASSERT_EQUAL_STRING("one",   ntfyCardAt(&_ntfy, 1)->title);
+  TEST_ASSERT_FALSE(ntfyDismiss(&_ntfy, 5));     // out of range
+  // pushes after a dismissal keep working (head was repacked)
+  ntfyPush(&_ntfy, "gh", "four", "b", 4);
+  TEST_ASSERT_EQUAL_STRING("four", ntfyCardAt(&_ntfy, 0)->title);
+  TEST_ASSERT_EQUAL_UINT8(3, _ntfy.count);
+}
+
+void test_ntfy_dismiss_to_empty_and_unread_clamp() {
+  ntfyPush(&_ntfy, "gh", "one", "b", 1);
+  ntfyPush(&_ntfy, "gh", "two", "b", 2);
+  TEST_ASSERT_EQUAL_UINT8(2, _ntfy.unread);
+  TEST_ASSERT_TRUE(ntfyDismiss(&_ntfy, 0));
+  TEST_ASSERT_TRUE(_ntfy.unread <= _ntfy.count); // clamped to what's held
+  TEST_ASSERT_TRUE(ntfyDismiss(&_ntfy, 0));
+  TEST_ASSERT_EQUAL_UINT8(0, _ntfy.count);
+  TEST_ASSERT_EQUAL_UINT8(0, _ntfy.unread);
+  TEST_ASSERT_NULL(ntfyCardAt(&_ntfy, 0));
+  TEST_ASSERT_FALSE(ntfyDismiss(&_ntfy, 0));     // nothing left
 }
 
 // ---- rxack gating ------------------------------------------------------------------
@@ -390,6 +434,9 @@ int main(int, char**) {
   RUN_TEST(test_ask_cancel_clears_only_matching_id);
   RUN_TEST(test_ask_pre_hello_ignored);
   RUN_TEST(test_ntfy_ring_stores_and_wraps);
+  RUN_TEST(test_ntfy_view_order_newest_first);
+  RUN_TEST(test_ntfy_dismiss_middle_keeps_order);
+  RUN_TEST(test_ntfy_dismiss_to_empty_and_unread_clamp);
   RUN_TEST(test_no_rxack_pre_hello);
   RUN_TEST(test_rxack_post_hello_with_cap);
   RUN_TEST(test_no_rxack_without_host_cap);

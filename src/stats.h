@@ -41,8 +41,11 @@ static bool _dirty = false;
 // registry slot), hostfb (U8: pinned-host no-show fallback, 0 stay / 1 auto),
 // s_pair (U8: 0 SC passkey / 1 SC just-works). Seeded to the stock behavior
 // (auto host, auto fallback, passkey pairing) so an upgrade changes nothing.
+// v3 → v4: extras wave — s_tune (U8 0/1, default 1) gates the tune-jingle
+// engine on BUDDY_EXTRAS_FULL builds. Seeded on every board so the pref
+// survives moving a bond/NVS image between board tiers.
 // Idempotent: sv=N short-circuits every boot after the first.
-static const uint8_t NVS_SCHEMA_V = 3;
+static const uint8_t NVS_SCHEMA_V = 4;
 
 inline void nvsMigrate() {
   _prefs.begin("buddy", false);
@@ -67,6 +70,10 @@ inline void nvsMigrate() {
     if (!_prefs.isKey("hostfb"))  _prefs.putUChar("hostfb", 1);
     if (!_prefs.isKey("s_pair"))  _prefs.putUChar("s_pair", 0);
     _prefs.putUChar("sv", 3);
+  }
+  if (_prefs.getUChar("sv", 0) < 4) {
+    if (!_prefs.isKey("s_tune")) _prefs.putUChar("s_tune", 1);
+    _prefs.putUChar("sv", 4);
   }
   _prefs.end();
 }
@@ -236,9 +243,10 @@ struct Settings {
   uint8_t pair;      // 0 = SC passkey (MITM), 1 = SC just-works; applied at bleInit
   int8_t  hostsel;   // -1 auto, 0..6 pinned host registry slot
   uint8_t hostfb;    // pinned-host no-show fallback: 0 stay, 1 auto after 30s
+  uint8_t tune;      // 0/1: tune jingles (acts only on BUDDY_EXTRAS_FULL builds)
 };
 
-static Settings _settings = { 3, true, false, true, true, 0, 4, 0, -1, 1 };
+static Settings _settings = { 3, true, false, true, true, 0, 4, 0, -1, 1, 1 };
 
 inline void settingsLoad() {
   nvsMigrate();   // idempotent; setup() calls settingsLoad before statsLoad,
@@ -260,6 +268,8 @@ inline void settingsLoad() {
   if (_settings.hostsel >= BUDDY_MAX_HOSTS) _settings.hostsel = -1;
   _settings.hostfb   = _prefs.getUChar("hostfb", 1);
   if (_settings.hostfb > 1) _settings.hostfb = 1;
+  _settings.tune     = _prefs.getUChar("s_tune", 1);   // seeded by nvsMigrate v4
+  if (_settings.tune > 1) _settings.tune = 1;
   _prefs.end();
 }
 
@@ -275,6 +285,7 @@ inline void settingsSave() {
   _prefs.putUChar("s_pair",  _settings.pair);
   _prefs.putChar("hostsel",  _settings.hostsel);
   _prefs.putUChar("hostfb",  _settings.hostfb);
+  _prefs.putUChar("s_tune",  _settings.tune);
   _prefs.end();
 }
 
