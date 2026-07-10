@@ -347,15 +347,18 @@ capability set — hosts don't need to know about them to be conformant.
   serial log. Every board tier accepts and stores the command (creds can
   be provisioned before flashing an `-ota` build); only `BUDDY_OTA` builds
   read them back. Factory reset wipes them; forget-host does not.
-  A `buddy-bridge wifi <ssid>` host CLI wrapper is planned but not yet
-  implemented — until then, `tools/test_protocol.py --wifi SSID PASS` or
-  any raw JSON line over serial/BLE does the job.
+  Host-side senders: `buddy-bridge wifi <ssid>` (reference bridge,
+  password via getpass — see host/README.md), the
+  `tools/test_protocol.py --wifi SSID PASS` harness, or any raw JSON
+  line over serial/BLE.
 - **`ntfy` card kind `"update"`** — a host that watches this repo's
   releases may push `{"evt":"ntfy","kind":"update","title":...,"body":...}`
-  when a newer firmware is published. The device renders it as a normal
-  card (with its own accent color); it is a *badge only*. The device
-  never updates on its own — consent is the user walking the on-device
-  menu to `update...`.
+  when a newer firmware is published (the reference bridge does, via its
+  `[cards] update_check` adapter, comparing the release tag against the
+  hello ack's `data.fw`). The device renders it as a normal card (with
+  its own accent color); it is a *badge only*. The device never updates
+  on its own — consent is the user walking the on-device menu to
+  `update...`.
 - **OTA flow (on-device)** — menu `update...` → join WiFi with the stored
   creds → `GET /repos/<origin>/releases/latest` → download the release
   asset `firmware-<board>.bin` (`s3` / `plus2`), falling back to plain

@@ -118,11 +118,12 @@ One-time WiFi provisioning (credentials go to device NVS; wiped by
 factory reset, never echoed back):
 
 ```bash
-python tools/test_protocol.py --skip-debug --wifi "MySSID" "MyPass"
+buddy-bridge wifi "MySSID"    # reference bridge; prompts for the password
 ```
 
-or send `{"cmd":"wifi","ssid":"...","pass":"..."}` yourself over the
-encrypted BLE link or USB serial, after `hello`. Then on the device:
+or `python tools/test_protocol.py --skip-debug --wifi "MySSID" "MyPass"`
+over USB serial, or send `{"cmd":"wifi","ssid":"...","pass":"..."}`
+yourself over the encrypted BLE link after `hello`. Then on the device:
 **hold A → update...** — it joins WiFi, checks the latest release,
 flashes the inactive slot, reboots, and turns WiFi back off. If the new
 firmware fails to come up healthy, the bootloader rolls back to the
