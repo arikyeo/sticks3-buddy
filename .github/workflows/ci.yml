@@ -16,14 +16,10 @@ jobs:
         include:
           - env: m5stick-s3
             continue-on-error: false
-          # Multi-board support lands in P2 — these envs don't exist in
-          # platformio.ini yet. Kept here as placeholders so the matrix
-          # doesn't need editing when they land; continue-on-error means
-          # a missing env fails the step but not the workflow.
           - env: m5stickc-plus
-            continue-on-error: true
+            continue-on-error: false
           - env: m5stickc-plus2
-            continue-on-error: true
+            continue-on-error: false
     steps:
       - uses: actions/checkout@v4
 
@@ -136,11 +132,7 @@ jobs:
       - name: Install PlatformIO
         run: pip install platformio
 
-      # No `native` test env exists in platformio.ini yet (lands P2/P9).
-      # continue-on-error keeps this job green (not skipped, so it still
-      # shows up and reports failure clearly) until then.
       - name: Run native tests
-        continue-on-error: true
         run: pio test -e native
 
   host:
