@@ -2488,12 +2488,17 @@ void loop() {
     else if (displayMode == DISP_PET) drawPet();
     else if (displayMode == DISP_SESSIONS) drawSessions();
     else if (settings().hud) drawHUD();
-    if (forgetOpen) drawForget();
-    else if (hostsOpen) drawHosts();
-    else if (resetOpen) drawReset();
-    else if (settingsOpen) drawSettings();
-    else if (extrasOpen) drawExtras();
-    else if (menuOpen) drawMenu();
+    // Menu overlays yield to an active pairing passkey — the user is mid
+    // "add host..." inside the hosts menu when the passkey arrives, and the
+    // code must not paint the menu over it.
+    if (!blePasskey()) {
+      if (forgetOpen) drawForget();
+      else if (hostsOpen) drawHosts();
+      else if (resetOpen) drawReset();
+      else if (settingsOpen) drawSettings();
+      else if (extrasOpen) drawExtras();
+      else if (menuOpen) drawMenu();
+    }
     drawToast();
     spr.pushSprite(0, 0);
   }
