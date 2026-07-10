@@ -63,6 +63,7 @@ TICK_SECS = 1.0
 # and the device gets the gate deadline minus a safety margin to decide.
 ONDEMAND_CONNECT_SECS = 5.0
 ONDEMAND_DEADLINE_MARGIN_SECS = 10.0
+WIFI_ACK_TIMEOUT_SECS = 10.0  # max wait for the device's {"ack":"wifi",...}
 
 _BLE_MODES = ("exclusive", "ondemand", "off")
 
@@ -114,6 +115,8 @@ class Daemon:
         self._last_timesync_ts = 0.0
         self._last_status_poll_ts = 0.0
         self._ondemand_lock = asyncio.Lock()  # one on-demand gate at a time
+        self._wifi_lock = asyncio.Lock()  # one wifi provisioning request at a time
+        self._wifi_ack_future: Optional[asyncio.Future] = None
         self._tasks: list[asyncio.Task] = []
         self._ble_task: Optional[asyncio.Task] = None
         self._stop_evt = asyncio.Event()
@@ -288,6 +291,8 @@ class Daemon:
             return await self.handle_permission_request(msg)
         if event == "set_mode":
             return await self.handle_set_mode(msg)
+        if event == "wifi":
+            return await self.handle_wifi(msg)
         log.debug("ipc: unhandled event %r", msg)
         return None
 
@@ -489,6 +494,9 @@ class Daemon:
         if ack == "hello":
             await self._on_hello_ack(obj)
             return
+        if ack == "wifi":
+            self._resolve_wifi_ack(obj)
+            return
         if isinstance(ack, str):
             # rx acks and command acks ({"ack":"rx","n":...},
             # {"ack":"prompt_cancel","ok":true}): liveness only.
@@ -615,7 +623,67 @@ class Daemon:
             return False
         return await self._send_line(protocol.build_ask_cancel(ask_id))
 
+    # ---- wifi provisioning ----
+
+    async def handle_wifi(self, msg: dict[str, Any]) -> dict[str, Any]:
+        """IPC "wifi" event: relay credentials to a v2 device and wait for
+        its ack. ``msg`` (and the ``password`` local below) carry the
+        plaintext password — never pass ``msg`` itself to a log call, only
+        the ssid is safe to mention."""
+        ssid = str(msg.get("ssid") or "")
+        password = str(msg.get("pass") or "")
+        if not ssid:
+            return {"ok": False, "error": "missing ssid"}
+        if not self.link.connected:
+            return {"ok": False, "error": "device not connected"}
+        if not self.v2_active:
+            return {"ok": False, "error": "device firmware is v1-only (wifi needs protocol v2)"}
+        log.info("daemon: wifi provisioning requested (ssid=%r)", ssid)
+        ok = await self.send_wifi(ssid, password)
+        if ok is None:
+            return {"ok": False, "error": "device did not acknowledge within timeout"}
+        return {"ok": ok}
+
+    async def send_wifi(
+        self, ssid: str, password: str, timeout: Optional[float] = None
+    ) -> Optional[bool]:
+        """Send ``{"cmd":"wifi",...}`` and wait for the device's
+        ``{"ack":"wifi","ok":...}``. Returns the device's ``ok`` verbatim,
+        or None when the send failed or nothing came back within
+        ``timeout`` (default WIFI_ACK_TIMEOUT_SECS). Serialized by
+        ``_wifi_lock`` so a second concurrent call can't steal the first
+        call's pending ack future."""
+        if timeout is None:
+            timeout = WIFI_ACK_TIMEOUT_SECS
+        async with self._wifi_lock:
+            loop = asyncio.get_running_loop()
+            fut: asyncio.Future = loop.create_future()
+            self._wifi_ack_future = fut
+            try:
+                if not await self._send_line(protocol.build_wifi_frame(ssid, password)):
+                    return None
+                return await asyncio.wait_for(fut, timeout)
+            except asyncio.TimeoutError:
+                return None
+            finally:
+                if self._wifi_ack_future is fut:
+                    self._wifi_ack_future = None
+
+    def _resolve_wifi_ack(self, obj: dict[str, Any]) -> None:
+        fut = self._wifi_ack_future
+        if fut is not None and not fut.done():
+            # Strict identity check (matches parse_hello_ack's style): only
+            # a literal JSON `true` counts as success, so a malformed or
+            # wrong-typed `ok` can never be misread as one.
+            fut.set_result(obj.get("ok") is True)
+
     # ---- info cards (extras: ntfy) ----
+
+    def device_fw_version(self) -> str:
+        """Firmware version string from the last hello ack (``""`` when no
+        v2 device has completed the handshake yet). Consumed by the
+        update-check card poller to compare against the latest release."""
+        return self.hello_ack.fw if self.hello_ack is not None else ""
 
     def submit_card(self, card: Card) -> bool:
         """Adapter entry point: dedupe + log + queue. Delivery happens from
@@ -707,6 +775,15 @@ class Daemon:
                     lon=self.cfg.cards_weather_lon,
                 )
                 tasks.append(asyncio.create_task(weather.run(), name="weather-cards"))
+            if self.cfg.cards_update_check:
+                from .adapters.update_cards import UpdateCardsPoller
+
+                updates = UpdateCardsPoller(
+                    self.submit_card,
+                    get_device_fw=self.device_fw_version,
+                    repo=self.cfg.cards_firmware_repo,
+                )
+                tasks.append(asyncio.create_task(updates.run(), name="update-cards"))
         return tasks
 
     async def run(self) -> None:

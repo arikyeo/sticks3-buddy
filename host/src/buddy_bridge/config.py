@@ -67,6 +67,8 @@ class Config:
     cards_repos: tuple[str, ...] = ()
     cards_weather_lat: float | None = None
     cards_weather_lon: float | None = None
+    cards_update_check: bool = True  # firmware update-check card (active once cards_enabled)
+    cards_firmware_repo: str = "arikyeo/sticks3-buddy"  # repo polled for the latest release tag
 
     home: Path = field(default_factory=bridge_home)
 
@@ -162,6 +164,10 @@ def load_config(home: Path | None = None, create: bool = True) -> Config:
     cfg.cards_repos = _get_str_list(cards, "repos")
     cfg.cards_weather_lat = _get_num_opt(cards, "weather_lat")
     cfg.cards_weather_lon = _get_num_opt(cards, "weather_lon")
+    cfg.cards_update_check = _get_bool(cards, "update_check", True)
+    cfg.cards_firmware_repo = (
+        _get_str(cards, "firmware_repo", "arikyeo/sticks3-buddy") or "arikyeo/sticks3-buddy"
+    )
 
     changed = False
     if not cfg.host_id:
@@ -218,6 +224,8 @@ def to_toml(cfg: Config) -> str:
         "\n[cards]\n"
         f"enabled = {b(cfg.cards_enabled)}\n"
         f"github = {b(cfg.cards_github)}\n"
+        f"update_check = {b(cfg.cards_update_check)}\n"
+        f"firmware_repo = {_toml_str(cfg.cards_firmware_repo)}\n"
         f"repos = [{repos}]\n"
         f"{weather}"
     )
