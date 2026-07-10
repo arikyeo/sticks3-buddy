@@ -149,6 +149,15 @@ class LinkManager:
     async def wait_connected(self) -> None:
         await self._connected_evt.wait()
 
+    async def drop_connection(self) -> None:
+        """Disconnect the current client (if any); the run() loop then walks
+        its normal teardown + reconnect path. Used for dead-link recovery
+        (rxack watch) and host-switch backoff."""
+        client = self._client
+        if client is not None:
+            with contextlib.suppress(Exception):
+                await client.disconnect()
+
     async def ensure_connected(self, timeout: float) -> bool:
         """Arm an ondemand connection and wait for it. True when connected."""
         if self.mode == "off":

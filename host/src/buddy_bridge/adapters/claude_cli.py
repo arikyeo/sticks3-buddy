@@ -36,6 +36,7 @@ def handle_event(registry: SessionRegistry, msg: dict) -> bool:
         message = str(msg.get("message") or "").strip()
         if message:
             session.prompts.append(message)
+            session.last_line = message
     elif name == "Stop":
         registry.set_state(AGENT, sid, WAIT, cwd)
     elif name == "SessionEnd":

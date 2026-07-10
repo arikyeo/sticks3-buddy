@@ -27,6 +27,8 @@ IDLE_REAP_SECS = 600.0
 ENTRY_FEED_MAX = 8
 PROMPTS_MAX = 4
 
+WIRE_SID_PREFIX = {"claude": "cli", "codex": "cdx"}
+
 
 def title_from_cwd(cwd: str) -> str:
     """Session title = basename of its working directory."""
@@ -46,6 +48,7 @@ class Session:
     wait_seq: int = 0  # >0 while waiting; FIFO order of entering wait
     last_seen: float = 0.0
     tokens: int = 0
+    last_line: str = ""  # last activity text, for the v2 per-session display
     prompts: deque = field(default_factory=lambda: deque(maxlen=PROMPTS_MAX))
 
     def pending_prompt(self) -> Optional[str]:
@@ -57,6 +60,13 @@ class SessionRegistry:
         self._now = now_fn
         self._sessions: dict[tuple[str, str], Session] = {}
         self._wait_counter = 0
+        # Wire sid pinning: (agent, session_id) -> "cli:N"/"cdx:N". Counters
+        # are monotonic and the map is never cleaned, so for the registry's
+        # (= daemon's) lifetime a wire sid can never be reused for a
+        # different session, and a session that drops and reappears keeps
+        # the sid the device already knows.
+        self._wire_sids: dict[tuple[str, str], str] = {}
+        self._wire_counters: dict[str, int] = {}
         self.entries: deque[str] = deque(maxlen=ENTRY_FEED_MAX)
         self.version = 0  # bumped on every mutation (cheap change detection)
 
@@ -109,6 +119,15 @@ class SessionRegistry:
             self.entries.append(line)
             self._bump()
 
+    def note_activity(self, agent: str, sid: str, text: str) -> None:
+        """Record a session's last activity line (v2 ``last``). No resurrect:
+        only sessions that already exist are touched."""
+        session = self._sessions.get((agent, sid))
+        if session is None or not text:
+            return
+        session.last_line = text
+        self._bump()
+
     def reap(self) -> int:
         """Drop sessions idle for > IDLE_REAP_SECS. Returns count removed."""
         now = self._now()
@@ -127,6 +146,18 @@ class SessionRegistry:
 
     def get(self, agent: str, sid: str) -> Optional[Session]:
         return self._sessions.get((agent, sid))
+
+    def wire_sid(self, agent: str, sid: str) -> str:
+        """Short device-facing sid, stable for this registry's lifetime."""
+        key = (agent, sid)
+        pinned = self._wire_sids.get(key)
+        if pinned is not None:
+            return pinned
+        prefix = WIRE_SID_PREFIX.get(agent, (agent[:3] or "unk"))
+        self._wire_counters[prefix] = self._wire_counters.get(prefix, 0) + 1
+        pinned = f"{prefix}:{self._wire_counters[prefix]}"
+        self._wire_sids[key] = pinned
+        return pinned
 
     def all_sessions(self) -> list[Session]:
         return list(self._sessions.values())

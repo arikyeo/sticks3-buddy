@@ -30,8 +30,10 @@ def _wire_safe(candidate: str) -> bool:
     return 0 < len(candidate) <= WIRE_ID_MAX and all(33 <= ord(c) < 127 for c in candidate)
 
 
-def build_hint(tool_name: str, tool_input: dict | None, max_chars: int = 120) -> str:
-    """Human-readable one-liner for the device screen (pre-sanitize)."""
+def extract_detail(tool_input: dict | None, max_chars: int = 120) -> str:
+    """The interesting part of a tool call (command/path/url/...), whitespace
+    collapsed — this is the wire prompt's ``hint`` (the tool name travels in
+    its own ``tool`` field per REFERENCE.md)."""
     detail = ""
     if isinstance(tool_input, dict):
         for key in ("command", "file_path", "path", "url", "pattern"):
@@ -46,6 +48,14 @@ def build_hint(tool_name: str, tool_input: dict | None, max_chars: int = 120) ->
                 except (TypeError, ValueError):
                     detail = ""
     detail = " ".join(detail.split())
+    if len(detail) > max_chars:
+        detail = detail[: max_chars - 3] + "..."
+    return detail
+
+
+def build_hint(tool_name: str, tool_input: dict | None, max_chars: int = 120) -> str:
+    """Human-readable one-liner for the device screen (pre-sanitize)."""
+    detail = extract_detail(tool_input, max_chars)
     hint = f"{tool_name}: {detail}" if detail else str(tool_name)
     if len(hint) > max_chars:
         hint = hint[: max_chars - 3] + "..."
@@ -61,6 +71,8 @@ class PendingDecision:
     hint: str
     future: asyncio.Future
     created: float
+    tool: str = ""  # wire prompt "tool" field
+    detail: str = ""  # wire prompt "hint" field (tool-less detail)
 
 
 class DecisionRouter:
@@ -68,7 +80,16 @@ class DecisionRouter:
         self._pending: dict[str, PendingDecision] = {}
         self._counter = itertools.count(1)
 
-    def create(self, agent: str, sid: str, tool_use_id: str, hint: str) -> PendingDecision:
+    def create(
+        self,
+        agent: str,
+        sid: str,
+        tool_use_id: str,
+        hint: str,
+        *,
+        tool: str = "",
+        detail: str = "",
+    ) -> PendingDecision:
         canonical = str(tool_use_id or "")
         if _wire_safe(canonical) and canonical not in self._pending:
             wire_id = canonical
@@ -84,6 +105,8 @@ class DecisionRouter:
             hint=hint,
             future=asyncio.get_running_loop().create_future(),
             created=time.monotonic(),
+            tool=tool,
+            detail=detail,
         )
         self._pending[wire_id] = pending
         return pending
@@ -122,6 +145,14 @@ class DecisionRouter:
     def oldest_hint(self) -> Optional[str]:
         pending = self.oldest()
         return pending.hint if pending else None
+
+    def oldest_for(self, agent: str, sid: str) -> Optional[PendingDecision]:
+        """Oldest pending decision belonging to one session, if any."""
+        mine = [p for p in self._pending.values() if p.agent == agent and p.sid == sid]
+        return min(mine, key=lambda p: p.created) if mine else None
+
+    def session_pending_count(self, agent: str, sid: str) -> int:
+        return sum(1 for p in self._pending.values() if p.agent == agent and p.sid == sid)
 
     def pending_count(self) -> int:
         return len(self._pending)

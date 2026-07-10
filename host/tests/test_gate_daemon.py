@@ -88,9 +88,13 @@ async def test_device_decides_deny(daemon, home):
     task = asyncio.create_task(daemon.handle_permission_request(_req(command="make deploy")))
     await asyncio.sleep(0.02)  # let it register + push the prompt snapshot
     assert daemon.router.pending_count() == 1
-    assert daemon.pending_prompt() == "Bash: make deploy"
+    # v1 wire prompt is an object per REFERENCE.md: id echoed back, tool +
+    # tool-less hint for the display
+    assert daemon.pending_prompt_obj() == {
+        "id": "toolu_777", "tool": "Bash", "hint": "make deploy",
+    }
     snap = json.loads(daemon.link.sent[-1])
-    assert snap["prompt"] == "Bash: make deploy"
+    assert snap["prompt"] == {"id": "toolu_777", "tool": "Bash", "hint": "make deploy"}
 
     await daemon.handle_device_permission(
         {"cmd": "permission", "id": "toolu_777", "decision": "deny"}
