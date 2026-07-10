@@ -226,9 +226,15 @@ def cmd_hooks(args: argparse.Namespace) -> int:
 
 
 def cmd_service(args: argparse.Namespace) -> int:
-    print("service install/uninstall lands in a later phase (run `buddy-bridge daemon` "
-          "in a terminal for now)")
-    return 2
+    from . import service
+
+    if args.action == "install":
+        code, messages = service.install()
+    else:
+        code, messages = service.uninstall()
+    for line in messages:
+        print(line)
+    return code
 
 
 def cmd_doctor(args: argparse.Namespace) -> int:
@@ -260,8 +266,8 @@ def cmd_doctor(args: argparse.Namespace) -> int:
 
             print("winrt radios  : ok (radio auto-recovery available)")
         except Exception:
-            print("winrt radios  : missing (pip install \"buddy-bridge[win32]\" for "
-                  "radio auto-recovery)")
+            print("winrt radios  : missing (winrt ships as a core Windows dependency now — "
+                  "reinstall buddy-bridge, or pip install \"buddy-bridge[win32]\")")
     for label, path in (
         ("claude hooks", Path.home() / ".claude" / "settings.json"),
         ("codex hooks", Path.home() / ".codex" / "hooks.json"),
