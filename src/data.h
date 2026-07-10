@@ -1,6 +1,9 @@
 #pragma once
 #include <Arduino.h>
 #include <ArduinoJson.h>
+#include "config.h"
+#include "hal/hal.h"
+#include "logic/utf8_text_logic.h"
 #include "ble_bridge.h"
 #include "xfer.h"
 
@@ -73,20 +76,16 @@ static void _applyJson(const char* line, TamaState* out) {
   if (xferCommand(doc)) { _lastLiveMs = millis(); return; }
 
   // Bridge sends {"time":[epoch_sec, tz_offset_sec]}; gmtime_r on the
-  // adjusted epoch yields local components including weekday.
+  // adjusted epoch yields local components including weekday. The board
+  // clock stores them — BM8563 hardware on the Plus/Plus2, millis-projected
+  // software clock on the S3 (which has no RTC).
   JsonArray t = doc["time"];
   if (!t.isNull() && t.size() == 2) {
     time_t local = (time_t)t[0].as<uint32_t>() + (int32_t)t[1];
     struct tm lt; gmtime_r(&local, &lt);
-    RTC_TimeTypeDef tm;
-    tm.hours = (uint8_t)lt.tm_hour; tm.minutes = (uint8_t)lt.tm_min; tm.seconds = (uint8_t)lt.tm_sec;
-    RTC_DateTypeDef dt;
-    dt.year = (uint16_t)(lt.tm_year + 1900); dt.month = (uint8_t)(lt.tm_mon + 1);
-    dt.date = (uint8_t)lt.tm_mday;          dt.weekDay = (uint8_t)lt.tm_wday;
-    M5.Rtc.setTime(&tm);
-    M5.Rtc.setDate(&dt);
+    board::setClock(&lt);
     extern uint32_t _clkLastRead;
-    _clkLastRead = 0;   // force re-read so _clkDt and _rtcValid agree
+    _clkLastRead = 0;   // force clockRefreshRtc() to re-read immediately
     _rtcValid = true;
     _lastLiveMs = millis();
     return;
@@ -99,8 +98,11 @@ static void _applyJson(const char* line, TamaState* out) {
   uint32_t bridgeTokens = doc["tokens"] | 0;
   if (doc["tokens"].is<uint32_t>()) statsOnBridgeTokens(bridgeTokens);
   out->tokensToday = doc["tokens_today"] | out->tokensToday;
+  // Display text is sanitized at ingestion (UTF-8 punctuation -> ASCII,
+  // everything unrenderable -> '?') so stored buffers are always safe for
+  // the ASCII-only fonts and the wrap logic.
   const char* m = doc["msg"];
-  if (m) { strncpy(out->msg, m, sizeof(out->msg)-1); out->msg[sizeof(out->msg)-1]=0; }
+  if (m) utf8Sanitize(out->msg, sizeof(out->msg), m);
   JsonArray la = doc["entries"];
   if (!la.isNull()) {
     // Entries are oldest-first; if more arrive than the buffer holds, skip the
@@ -111,7 +113,7 @@ static void _applyJson(const char* line, TamaState* out) {
     for (JsonVariant v : la) {
       if (skip > 0) { skip--; continue; }
       const char* s = v.as<const char*>();
-      strncpy(out->lines[n], s ? s : "", 91); out->lines[n][91]=0;
+      utf8Sanitize(out->lines[n], sizeof(out->lines[n]), s ? s : "");
       n++;
     }
     if (n != out->nLines || (n > 0 && strcmp(out->lines[n-1], out->msg) != 0)) {
@@ -122,9 +124,11 @@ static void _applyJson(const char* line, TamaState* out) {
   JsonObject pr = doc["prompt"];
   if (!pr.isNull()) {
     const char* pid = pr["id"]; const char* pt = pr["tool"]; const char* ph = pr["hint"];
+    // promptId is an opaque token echoed back in the permission response —
+    // copy it verbatim. Tool/hint are display text -> sanitize.
     strncpy(out->promptId,   pid ? pid : "", sizeof(out->promptId)-1);   out->promptId[sizeof(out->promptId)-1]=0;
-    strncpy(out->promptTool, pt  ? pt  : "", sizeof(out->promptTool)-1); out->promptTool[sizeof(out->promptTool)-1]=0;
-    strncpy(out->promptHint, ph  ? ph  : "", sizeof(out->promptHint)-1); out->promptHint[sizeof(out->promptHint)-1]=0;
+    utf8Sanitize(out->promptTool, sizeof(out->promptTool), pt ? pt : "");
+    utf8Sanitize(out->promptHint, sizeof(out->promptHint), ph ? ph : "");
   } else {
     out->promptId[0] = 0; out->promptTool[0] = 0; out->promptHint[0] = 0;
   }
@@ -148,7 +152,7 @@ struct _LineBuf {
   }
 };
 
-static _LineBuf<1024> _usbLine, _btLine;
+static _LineBuf<BUDDY_LINEBUF> _usbLine, _btLine;
 
 inline void dataPoll(TamaState* out) {
   uint32_t now = millis();

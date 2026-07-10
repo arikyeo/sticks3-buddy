@@ -1,6 +1,6 @@
 #include "buddy.h"
 #include "buddy_common.h"
-#include "m5_compat.h"
+#include "compat.h"
 #include <string.h>
 
 extern TFT_eSprite spr;

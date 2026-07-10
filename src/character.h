@@ -1,6 +1,6 @@
 #pragma once
 #include <stdint.h>
-#include "m5_compat.h"
+#include "compat.h"
 
 struct Palette {
   uint16_t body, bg, text, textDim, ink;
