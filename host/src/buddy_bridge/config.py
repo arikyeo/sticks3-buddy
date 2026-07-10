@@ -61,6 +61,12 @@ class Config:
     # [timeouts] (seconds the daemon waits for a device decision)
     claude_decision: float = 300.0
     codex_decision: float = 105.0
+    # [cards] (info-card pipeline: off by default, no network unless enabled)
+    cards_enabled: bool = False
+    cards_github: bool = True
+    cards_repos: tuple[str, ...] = ()
+    cards_weather_lat: float | None = None
+    cards_weather_lon: float | None = None
 
     home: Path = field(default_factory=bridge_home)
 
@@ -91,6 +97,20 @@ def _get_num(table: dict, key: str, default: float) -> float:
     return float(val)
 
 
+def _get_num_opt(table: dict, key: str) -> float | None:
+    val = table.get(key)
+    if isinstance(val, bool) or not isinstance(val, (int, float)):
+        return None
+    return float(val)
+
+
+def _get_str_list(table: dict, key: str) -> tuple[str, ...]:
+    val = table.get(key)
+    if not isinstance(val, list):
+        return ()
+    return tuple(v for v in val if isinstance(v, str) and v.strip())
+
+
 def load_config(home: Path | None = None, create: bool = True) -> Config:
     """Load config from ``<home>/config.toml``, tolerant of unknown/bad keys.
 
@@ -113,6 +133,7 @@ def load_config(home: Path | None = None, create: bool = True) -> Config:
     claude = data.get("claude", {}) if isinstance(data.get("claude"), dict) else {}
     codex = data.get("codex", {}) if isinstance(data.get("codex"), dict) else {}
     timeouts = data.get("timeouts", {}) if isinstance(data.get("timeouts"), dict) else {}
+    cards = data.get("cards", {}) if isinstance(data.get("cards"), dict) else {}
 
     cfg.host_id = _get_str(host, "id", "")
     cfg.host_name = _get_str(host, "name", "")
@@ -135,6 +156,12 @@ def load_config(home: Path | None = None, create: bool = True) -> Config:
 
     cfg.claude_decision = _get_num(timeouts, "claude_decision", 300.0)
     cfg.codex_decision = _get_num(timeouts, "codex_decision", 105.0)
+
+    cfg.cards_enabled = _get_bool(cards, "enabled", False)
+    cfg.cards_github = _get_bool(cards, "github", True)
+    cfg.cards_repos = _get_str_list(cards, "repos")
+    cfg.cards_weather_lat = _get_num_opt(cards, "weather_lat")
+    cfg.cards_weather_lon = _get_num_opt(cards, "weather_lon")
 
     changed = False
     if not cfg.host_id:
@@ -159,6 +186,13 @@ def _toml_num(v: float) -> str:
 
 def to_toml(cfg: Config) -> str:
     b = lambda v: "true" if v else "false"  # noqa: E731
+    repos = ", ".join(_toml_str(r) for r in cfg.cards_repos)
+    weather = ""
+    if cfg.cards_weather_lat is not None and cfg.cards_weather_lon is not None:
+        weather = (
+            f"weather_lat = {_toml_num(cfg.cards_weather_lat)}\n"
+            f"weather_lon = {_toml_num(cfg.cards_weather_lon)}\n"
+        )
     return (
         "# buddy-bridge configuration\n"
         "\n[host]\n"
@@ -181,6 +215,11 @@ def to_toml(cfg: Config) -> str:
         "\n[timeouts]\n"
         f"claude_decision = {_toml_num(cfg.claude_decision)}\n"
         f"codex_decision = {_toml_num(cfg.codex_decision)}\n"
+        "\n[cards]\n"
+        f"enabled = {b(cfg.cards_enabled)}\n"
+        f"github = {b(cfg.cards_github)}\n"
+        f"repos = [{repos}]\n"
+        f"{weather}"
     )
 
 

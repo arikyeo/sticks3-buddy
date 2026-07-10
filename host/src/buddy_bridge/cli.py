@@ -154,7 +154,11 @@ def cmd_mode(args: argparse.Namespace) -> int:
         return 0
     cfg.ble_mode = args.value
     save_config(cfg)
-    print(f"ble mode set to {cfg.ble_mode} (restart the daemon to apply)")
+    resp = _daemon_request({"event": "set_mode", "mode": args.value})
+    if resp is not None and resp.get("ok"):
+        print(f"ble mode set to {cfg.ble_mode} (applied to the running daemon)")
+    else:
+        print(f"ble mode set to {cfg.ble_mode} (no running daemon; applies on next start)")
     return 0
 
 

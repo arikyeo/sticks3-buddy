@@ -43,17 +43,52 @@ an unparseable config file is refused, never clobbered.
 
 ## BLE modes
 
-`buddy-bridge mode exclusive|ondemand|off` (restart the daemon to apply):
+`buddy-bridge mode exclusive|ondemand|off` persists to the config **and**
+applies live to a running daemon (via IPC); without one it takes effect on
+the next start:
 
 - **exclusive** (default) — hold the connection whenever the buddy is around;
-  reconnect with 3 s -> 60 s backoff.
-- **ondemand** — connect only while there is something to deliver (e.g. a
-  pending permission), drop after 2 min idle.
-- **off** — never touch the radio; mirrors and token accounting keep working.
+  reconnect with 3 s -> 60 s backoff. If the buddy is soft-pinned to another
+  host (hello ack `sel:false`), back off to one retry per minute until it
+  selects us again.
+- **ondemand** — no persistent link: a pending permission connects, delivers
+  the prompt, waits for the decision (gate deadline minus 10 s), then clears
+  and disconnects. A connect that can't complete in 5 s fails open to the
+  native prompt.
+- **off** — the BLE machinery never starts (bleak isn't even imported);
+  mirrors and token accounting keep working.
 
 On Windows, 5 consecutive scan misses trigger an automatic Bluetooth radio
 power-cycle (max 3 attempts, 120 s cooldown) to unstick the WinRT scanner —
 this briefly drops *all* BT devices, so it is deliberately rationed.
+
+## Protocol v2
+
+Every connection opens with a `hello`; a stick that acks `proto >= 2` gets
+the richer v2 stream per `PROTOCOL_V2.md` (negotiated line budget, a
+per-session `sessions[]` heartbeat with pinned `cli:N`/`cdx:N` ids, prompt
+`sid`/`qn` routing, `prompt_cancel`, and the rxack dead-link watch). No ack
+within 2 s means a v1-only stick: 900-byte lines and aggregate counts,
+exactly as before.
+
+## Info cards (opt-in)
+
+With `[cards] enabled = true` in the config, the daemon can push `ntfy`
+cards to sticks that advertise the `ntfy` capability:
+
+```toml
+[cards]
+enabled = true
+github = true                      # unread gh notifications (needs gh CLI)
+repos = ["arikyeo/sticks3-buddy"]  # optional: CI conclusion cards per repo
+weather_lat = 1.3521               # optional: Open-Meteo current weather
+weather_lon = 103.8198
+```
+
+GitHub cards go through the `gh` CLI (missing/unauthenticated `gh` degrades
+gracefully); weather polls the keyless Open-Meteo API every 30 min. Cards
+are deduped by content for 6 h and appended to `~/.buddy-bridge/cards.log`
+(tiny, one rotation). Nothing does network I/O while `enabled = false`.
 
 ## Permission gate (fail-open by design)
 

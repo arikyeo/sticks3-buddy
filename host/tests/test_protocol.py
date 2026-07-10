@@ -55,13 +55,15 @@ def test_snapshot_basic_shape():
     line = build_snapshot(
         total=3, running=1, waiting=2, msg="hello",
         entries=["10:00 first", "10:01 second"],
-        tokens=1234, tokens_today=99, prompt="Bash: git status",
+        tokens=1234, tokens_today=99,
+        prompt={"id": "req_abc123", "tool": "Bash", "hint": "git status"},
     )
     snap = json.loads(line)
     assert snap == {
         "total": 3, "running": 1, "waiting": 2, "msg": "hello",
         "entries": ["10:00 first", "10:01 second"],
-        "tokens": 1234, "tokens_today": 99, "prompt": "Bash: git status",
+        "tokens": 1234, "tokens_today": 99,
+        "prompt": {"id": "req_abc123", "tool": "Bash", "hint": "git status"},
     }
     assert len(line.encode("utf-8")) <= LINE_BUDGET
     assert line.encode("ascii")  # pure-ASCII wire
@@ -91,18 +93,21 @@ def test_cascade_shrinks_prompt_after_entries_gone():
     # no entries -> the prompt-shrink stage is exercised directly
     line = build_snapshot(
         total=1, running=0, waiting=1, msg="m", entries=[],
-        tokens=10, tokens_today=10, prompt="P" * 600, budget=400,
+        tokens=10, tokens_today=10,
+        prompt={"id": "p1", "tool": "Bash", "hint": "P" * 600}, budget=400,
     )
     snap = json.loads(line)
     assert len(line.encode()) <= 400
-    assert len(snap["prompt"]) == 96  # first shrink step suffices
+    assert len(snap["prompt"]["hint"]) == 96  # first shrink step suffices
+    assert snap["prompt"]["id"] == "p1"  # id survives shrinking
 
 
 def test_cascade_drops_prompt_then_shrinks_msg():
     # msg so big the prompt cannot be saved: prompt dropped, msg shrunk
     line = build_snapshot(
         total=1, running=0, waiting=1, msg="x" * 800, entries=[],
-        tokens=0, tokens_today=0, prompt="q" * 2000, budget=200,
+        tokens=0, tokens_today=0,
+        prompt={"id": "p1", "tool": "Bash", "hint": "q" * 2000}, budget=200,
     )
     snap = json.loads(line)
     assert len(line.encode()) <= 200
@@ -120,7 +125,7 @@ def test_cascade_fuzz_16_cjk_sessions_fits_budget():
         msg="中文状態消息" * 8,
         entries=entries,
         tokens=123456789, tokens_today=987654,
-        prompt="Bash: 危険なコマンド rm -rf /" * 6,
+        prompt={"id": "req_1", "tool": "Bash", "hint": "危険なコマンド rm -rf /" * 6},
     )
     assert len(line.encode("utf-8")) <= LINE_BUDGET
     snap = json.loads(line)

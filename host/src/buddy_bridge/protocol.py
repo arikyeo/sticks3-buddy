@@ -20,7 +20,7 @@ from __future__ import annotations
 import json
 import time as _time
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Iterable, Sequence
+from typing import TYPE_CHECKING, Callable, Iterable, Sequence
 
 if TYPE_CHECKING:  # pragma: no cover
     from .config import Config
@@ -97,6 +97,29 @@ def _bytelen(line: str) -> int:
     return len(line.encode("utf-8"))
 
 
+def _clean_prompt(prompt: dict | None) -> dict | None:
+    """Normalize a prompt object for the wire: {"id","tool","hint"[,"sid","qn"]}.
+
+    REFERENCE.md defines the heartbeat ``prompt`` as an object whose ``id`` the
+    device echoes back with its decision; PROTOCOL_V2.md adds optional ``sid``
+    and ``qn``. Unknown keys are dropped, text is sanitized.
+    """
+    if not isinstance(prompt, dict):
+        return None
+    out: dict = {
+        "id": truncate_utf8_bytes(sanitize(prompt.get("id") or ""), WIRE_ID_MAX_BYTES),
+        "tool": truncate_utf8_bytes(sanitize(prompt.get("tool") or ""), 32),
+        "hint": sanitize(prompt.get("hint") or ""),
+    }
+    sid = prompt.get("sid")
+    if isinstance(sid, str) and sid:
+        out["sid"] = truncate_utf8_bytes(sanitize(sid), 16)
+    qn = prompt.get("qn")
+    if isinstance(qn, int) and not isinstance(qn, bool) and qn >= 0:
+        out["qn"] = qn
+    return out
+
+
 def build_snapshot(
     *,
     total: int,
@@ -106,13 +129,22 @@ def build_snapshot(
     entries: Sequence[str] = (),
     tokens: int = 0,
     tokens_today: int = 0,
-    prompt: str | None = None,
+    prompt: dict | None = None,
+    sessions: Sequence[dict] | None = None,
     budget: int = LINE_BUDGET,
 ) -> str:
-    """Compose the v1 snapshot line, degrading until it fits the byte budget."""
+    """Compose the heartbeat snapshot line, degrading until it fits the budget.
+
+    v1 shape per REFERENCE.md; ``sessions`` (already-built entry dicts from
+    :func:`build_session_entries`, waiting-first) rides alongside the v1
+    aggregates per PROTOCOL_V2.md when provided. Degrade cascade:
+    drop oldest entries -> trim sessions tail -> shrink prompt hint
+    96/72/48/32 -> drop prompt -> shrink msg.
+    """
     msg_s = sanitize(msg)
     entry_list = [truncate_utf8_bytes(sanitize(e), ENTRY_MAX_BYTES) for e in entries]
-    prompt_s: str | None = sanitize(prompt) if prompt is not None else None
+    prompt_obj = _clean_prompt(prompt)
+    session_list = list(sessions) if sessions is not None else None
 
     def compose() -> str:
         snap: dict = {
@@ -124,8 +156,10 @@ def build_snapshot(
             "tokens": int(tokens),
             "tokens_today": int(tokens_today),
         }
-        if prompt_s is not None:
-            snap["prompt"] = prompt_s
+        if session_list is not None:
+            snap["sessions"] = session_list
+        if prompt_obj is not None:
+            snap["prompt"] = prompt_obj
         return dumps(snap)
 
     line = compose()
@@ -133,18 +167,22 @@ def build_snapshot(
     while _bytelen(line) > budget and entry_list:
         entry_list.pop(0)
         line = compose()
-    # 2. shrink the prompt hint stepwise
-    if prompt_s is not None:
+    # 2. trim sessions from the tail (waiting-first ordering keeps waiters)
+    while _bytelen(line) > budget and session_list:
+        session_list.pop()
+        line = compose()
+    # 3. shrink the prompt hint stepwise
+    if prompt_obj is not None:
         for step in HINT_STEPS:
             if _bytelen(line) <= budget:
                 break
-            prompt_s = truncate_utf8_bytes(prompt_s, step)
+            prompt_obj["hint"] = truncate_utf8_bytes(prompt_obj["hint"], step)
             line = compose()
-    # 3. drop the prompt entirely
-    if prompt_s is not None and _bytelen(line) > budget:
-        prompt_s = None
+    # 4. drop the prompt entirely
+    if prompt_obj is not None and _bytelen(line) > budget:
+        prompt_obj = None
         line = compose()
-    # 4. shrink msg
+    # 5. shrink msg
     for step in MSG_STEPS:
         if _bytelen(line) <= budget:
             break
@@ -189,19 +227,23 @@ def iter_lines(lines: Iterable[str]) -> Iterable[bytes]:
 
 
 # ---------------------------------------------------------------------------
-# Protocol v2 — STUB ONLY (firmware side lands in a later track; everything
-# here stays dormant unless a hello-ack negotiates proto >= 2, and the daemon
-# does not even send the hello unless its proto2 flag is switched on).
+# Protocol v2 (PROTOCOL_V2.md). Live: the daemon always opens with hello; a
+# device that acks with proto >= 2 switches the link to v2 framing, anything
+# else (v1 ack, no ack within 2s) leaves the link in plain v1 mode.
 # ---------------------------------------------------------------------------
 
 PROTO_V1 = 1
 PROTO_V2 = 2
 HELLO_ACK_TIMEOUT_SECS = 2.0  # no ack within this window -> stay in v1 mode
-V2_CAPS = ("sessions", "ask", "rxack", "cancel")
+V2_CAPS = ("sessions", "ask", "rxack", "cancel")  # host caps in the hello
+EXTRA_CAPS = ("ntfy", "play")  # extras: relevant iff the DEVICE advertises them
+V2_LINE_HEADROOM = 64  # spec maxLine 4608 -> host budget 4544
+RXACK_DEAD_SECS = 20.0  # sends but no rx-ack/traffic for this long -> link dead
 V2_TITLE_MAX = 24
+V2_LAST_MAX = 64  # spec caps neither; keep per-session "last" lines small
 V2_DEFAULT_MAX_SESSIONS = 6
-
-_SID_PREFIX = {"claude": "cli", "codex": "cdx"}
+WIRE_ID_MAX_BYTES = 39
+PROMPT_QN_CAP = 3
 
 
 def build_hello(cfg: "Config") -> str:
@@ -225,74 +267,172 @@ def build_hello(cfg: "Config") -> str:
 
 @dataclass
 class HelloAck:
+    """Parsed {"ack":"hello","ok":true,"proto":2,"data":{...}} device reply.
+
+    ``sel`` defaults to True: PROTOCOL_V2.md defines sel:false as the special
+    "pinned to another host" case, so an ack that omits it means proceed.
+    """
+
     proto: int = PROTO_V1
     max_line: int = LINE_BUDGET
     max_sessions: int = V2_DEFAULT_MAX_SESSIONS
-    sel: bool = False
+    sel: bool = True
+    caps: tuple[str, ...] = ()
+    fw: str = ""
+    board: str = ""
+    name: str = ""
 
 
 def parse_hello_ack(obj: object) -> HelloAck | None:
-    """Parse a device hello-ack frame; None when ``obj`` is something else."""
-    if not isinstance(obj, dict):
-        return None
-    if obj.get("cmd") not in ("hello-ack", "helloAck", "hello_ack"):
+    """Parse a device hello-ack frame; None when ``obj`` is something else.
+
+    Spec shape: {"ack":"hello","ok":true,"proto":2,"data":{"fw","board",
+    "name","caps","maxSessions","maxLine","sel"}}. An explicit ok:false is
+    treated as a declined handshake (proto forced to 1, no caps).
+    """
+    if not isinstance(obj, dict) or obj.get("ack") != "hello":
         return None
     ack = HelloAck()
+    if obj.get("ok") is False:
+        return ack  # device declined: stay v1
     proto = obj.get("proto")
     if isinstance(proto, int) and not isinstance(proto, bool) and proto >= 1:
         ack.proto = proto
-    max_line = obj.get("maxLine")
+    data = obj.get("data")
+    if not isinstance(data, dict):
+        data = {}
+    max_line = data.get("maxLine")
     if isinstance(max_line, int) and not isinstance(max_line, bool):
-        ack.max_line = max(128, min(4096, max_line))
-    max_sessions = obj.get("maxSessions")
+        ack.max_line = max(256, min(16384, max_line))
+    max_sessions = data.get("maxSessions")
     if isinstance(max_sessions, int) and not isinstance(max_sessions, bool):
-        ack.max_sessions = max(1, min(16, max_sessions))
-    ack.sel = obj.get("sel") is True
+        ack.max_sessions = max(1, min(32, max_sessions))
+    if data.get("sel") is False:
+        ack.sel = False
+    caps = data.get("caps")
+    if isinstance(caps, (list, tuple)):
+        ack.caps = tuple(str(c) for c in caps if isinstance(c, str) and c)
+    for attr in ("fw", "board", "name"):
+        val = data.get(attr)
+        if isinstance(val, str):
+            setattr(ack, attr, sanitize(val))
     return ack
 
 
-def build_sessions_frame(
+def effective_proto(theirs: int, ours: int = PROTO_V2) -> int:
+    """min(host.proto, device.proto), floored at v1."""
+    return max(PROTO_V1, min(int(ours), int(theirs)))
+
+
+def v2_line_budget(max_line: int) -> int:
+    """Outbound byte budget for a v2 link: device maxLine minus headroom."""
+    return max(128, int(max_line) - V2_LINE_HEADROOM)
+
+
+def build_session_entries(
     sessions: Sequence,
     *,
+    wire_sid: "Callable[[str, str], str]",
     max_sessions: int = V2_DEFAULT_MAX_SESSIONS,
-    budget: int = LINE_BUDGET,
-) -> str:
-    """v2 sessions frame from Session-like objects (agent/title/state/tokens/
-    last_seen/wait_seq attributes — the registry's Session works as-is).
+) -> list[dict]:
+    """Wire dicts for the heartbeat ``sessions`` array (PROTOCOL_V2.md).
 
-    Waiting sessions come first (FIFO by wait_seq) so a max_sessions cut can
-    never drop a session that needs the user. Short wire sids are minted per
-    agent in emitted order: cli:1, cli:2 / cdx:1, ... (stable only within a
-    frame — the phase-6 device UI work will pin them properly).
+    ``sessions`` must already be ordered waiting-first (the registry's
+    ``sessions_sorted()``); this only caps and formats. ``wire_sid`` pins the
+    short sid (cli:N / cdx:N) per (agent, session) — registry-owned so a sid
+    is never reused for a different session while the daemon lives.
     """
-    ordered = sorted(
-        sessions,
-        key=lambda s: (
-            0 if getattr(s, "state", "") == "wait" else 1,
-            getattr(s, "wait_seq", 0) or float("inf"),
-            -float(getattr(s, "last_seen", 0.0)),
-        ),
-    )
-    counters: dict[str, int] = {}
     entries: list[dict] = []
-    for session in ordered[: max(0, max_sessions)]:
+    for session in list(sessions)[: max(0, int(max_sessions))]:
         agent = str(getattr(session, "agent", "") or "")
-        prefix = _SID_PREFIX.get(agent, agent[:3] or "unk")
-        counters[prefix] = counters.get(prefix, 0) + 1
         entries.append(
             {
-                "sid": f"{prefix}:{counters[prefix]}",
+                "sid": wire_sid(agent, str(getattr(session, "sid", "") or "")),
                 "agent": agent,
                 "title": truncate_utf8_bytes(
                     sanitize(getattr(session, "title", "") or ""), V2_TITLE_MAX
                 ),
                 "state": str(getattr(session, "state", "") or "idle"),
                 "tok": int(getattr(session, "tokens", 0) or 0),
-                "last": int(getattr(session, "last_seen", 0.0) or 0),
+                "last": truncate_utf8_bytes(
+                    sanitize(getattr(session, "last_line", "") or ""), V2_LAST_MAX
+                ),
             }
         )
-    line = dumps({"cmd": "sessions", "sessions": entries})
-    while _bytelen(line) > budget and entries:
-        entries.pop()  # trim from the tail: waiting sessions at the front survive
-        line = dumps({"cmd": "sessions", "sessions": entries})
+    return entries
+
+
+def build_prompt_cancel(wire_id: str) -> str:
+    """{"cmd":"prompt_cancel","id":...} — requires the negotiated cancel cap."""
+    return dumps({"cmd": "prompt_cancel", "id": wire_id})
+
+
+def build_ask_evt(
+    ask_id: str,
+    questions: Sequence[dict],
+    *,
+    sid: str | None = None,
+    multi_select: bool = False,
+    budget: int = LINE_BUDGET,
+) -> str:
+    """Read-only structured question event (PROTOCOL_V2.md `ask` capability).
+
+    ``questions``: [{"header","text","options":[{"label","desc"}]}]. Text is
+    sanitized and field-capped; if the line still exceeds the budget, option
+    descs are dropped, then options past the first two, then whole questions.
+    """
+    cleaned: list[dict] = []
+    for q in questions:
+        if not isinstance(q, dict):
+            continue
+        options = []
+        raw_options = q.get("options")
+        if isinstance(raw_options, (list, tuple)):
+            for opt in raw_options:
+                if not isinstance(opt, dict):
+                    continue
+                options.append(
+                    {
+                        "label": truncate_utf8_bytes(sanitize(opt.get("label") or ""), 32),
+                        "desc": truncate_utf8_bytes(sanitize(opt.get("desc") or ""), 64),
+                    }
+                )
+        cleaned.append(
+            {
+                "header": truncate_utf8_bytes(sanitize(q.get("header") or ""), 32),
+                "text": truncate_utf8_bytes(sanitize(q.get("text") or ""), 96),
+                "options": options,
+            }
+        )
+
+    def compose() -> str:
+        evt: dict = {
+            "evt": "ask",
+            "id": truncate_utf8_bytes(sanitize(ask_id), WIRE_ID_MAX_BYTES),
+        }
+        if sid:
+            evt["sid"] = truncate_utf8_bytes(sanitize(sid), 16)
+        evt["multiSelect"] = bool(multi_select)
+        evt["questions"] = cleaned
+        return dumps(evt)
+
+    line = compose()
+    if _bytelen(line) > budget:  # drop option descs
+        for q in cleaned:
+            for opt in q["options"]:
+                opt.pop("desc", None)
+        line = compose()
+    while _bytelen(line) > budget and any(len(q["options"]) > 2 for q in cleaned):
+        for q in cleaned:  # trim options from the tail, two survive
+            if len(q["options"]) > 2:
+                q["options"].pop()
+        line = compose()
+    while _bytelen(line) > budget and len(cleaned) > 1:
+        cleaned.pop()
+        line = compose()
     return line
+
+
+def build_ask_cancel(ask_id: str) -> str:
+    """{"evt":"ask_cancel","id":...} — clears a displayed ask."""
+    return dumps({"evt": "ask_cancel", "id": truncate_utf8_bytes(sanitize(ask_id), WIRE_ID_MAX_BYTES)})
