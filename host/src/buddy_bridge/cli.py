@@ -390,7 +390,10 @@ def cmd_hooks(args: argparse.Namespace) -> int:
         settings_path = Path.home() / ".claude" / "settings.json"
         if args.action == "install":
             changed = claude_settings.install(
-                settings_path, gate=cfg.claude_gate, gate_tools=cfg.claude_gate_tools
+                settings_path,
+                gate=cfg.claude_gate,
+                gate_tools=cfg.claude_gate_tools,
+                answer_asks=cfg.telegram_answer_asks,
             )
             print(f"claude hooks {'installed into' if changed else 'already current in'} "
                   f"{settings_path}")
