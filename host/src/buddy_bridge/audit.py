@@ -1,10 +1,13 @@
 """Append-only audit log of gate outcomes at ``<home>/audit.jsonl``.
 
 One JSON object per line: ts (ISO-8601 local), host, agent, sid, tool,
-hint (exactly as shown on the device), decision, source.
+hint (exactly as shown on the device), decision, source, and — for remote
+sources that identify an actor — ``by`` (e.g. the Telegram chat id).
 
 source values:
   device            the buddy's button decided
+  telegram          an allowlisted Telegram chat decided/answered
+                    (``by`` = chat id)
   auto_allow        a matchers.toml auto_allow rule decided
   timeout_fallback  device never answered; fell back to "ask"
   daemon_down       the bridge could not reach the device at all
@@ -22,10 +25,17 @@ from pathlib import Path
 AUDIT_FILENAME = "audit.jsonl"
 
 SOURCE_DEVICE = "device"
+SOURCE_TELEGRAM = "telegram"
 SOURCE_AUTO_ALLOW = "auto_allow"
 SOURCE_TIMEOUT_FALLBACK = "timeout_fallback"
 SOURCE_DAEMON_DOWN = "daemon_down"
-SOURCES = (SOURCE_DEVICE, SOURCE_AUTO_ALLOW, SOURCE_TIMEOUT_FALLBACK, SOURCE_DAEMON_DOWN)
+SOURCES = (
+    SOURCE_DEVICE,
+    SOURCE_TELEGRAM,
+    SOURCE_AUTO_ALLOW,
+    SOURCE_TIMEOUT_FALLBACK,
+    SOURCE_DAEMON_DOWN,
+)
 
 
 def audit_path(home: Path) -> Path:
@@ -42,6 +52,7 @@ def append_audit(
     hint: str,
     decision: str,
     source: str,
+    by: str = "",
     ts: float | None = None,
 ) -> bool:
     record = {
@@ -54,6 +65,8 @@ def append_audit(
         "decision": decision,
         "source": source,
     }
+    if by:
+        record["by"] = by
     try:
         home.mkdir(parents=True, exist_ok=True)
         with audit_path(home).open("a", encoding="utf-8") as fh:

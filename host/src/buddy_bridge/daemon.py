@@ -510,7 +510,7 @@ class Daemon:
         command = str(tool_input.get("command") or "")
         hint = protocol.sanitize(build_hint(tool, tool_input))
 
-        def audit(decision: str, source: str) -> None:
+        def audit(decision: str, source: str, by: str = "") -> None:
             append_audit(
                 self.cfg.home,
                 host=self.cfg.host_id,
@@ -520,6 +520,7 @@ class Daemon:
                 hint=hint,
                 decision=decision,
                 source=source,
+                by=by,
             )
 
         if not tool or is_safe_tool(tool):
@@ -560,7 +561,7 @@ class Daemon:
             )
             await self._send_snapshot(force=True)  # and clear it again
         if decision in (ALLOW, DENY):
-            audit(decision, SOURCE_DEVICE)
+            audit(decision, pending.resolved_source or SOURCE_DEVICE, pending.resolved_by)
         else:
             audit(ASK, SOURCE_TIMEOUT_FALLBACK)
         return {"decision": decision}
@@ -603,7 +604,7 @@ class Daemon:
                 )
             await self._relay_sync(force=True)  # and clear it again
         if decision in (ALLOW, DENY):
-            audit(decision, SOURCE_DEVICE)
+            audit(decision, pending.resolved_source or SOURCE_DEVICE, pending.resolved_by)
         else:
             audit(ASK, SOURCE_TIMEOUT_FALLBACK)
         return {"decision": decision}
@@ -634,7 +635,7 @@ class Daemon:
                 await self._send_snapshot(force=True)  # clear the prompt display
                 await self.link.release()
             if decision in (ALLOW, DENY):
-                audit(decision, SOURCE_DEVICE)
+                audit(decision, pending.resolved_source or SOURCE_DEVICE, pending.resolved_by)
             else:
                 audit(ASK, SOURCE_TIMEOUT_FALLBACK)
             return {"decision": decision}

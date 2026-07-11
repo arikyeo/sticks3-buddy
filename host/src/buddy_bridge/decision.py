@@ -85,6 +85,12 @@ class PendingDecision:
     created: float
     tool: str = ""  # wire prompt "tool" field
     detail: str = ""  # wire prompt "hint" field (tool-less detail)
+    # Who resolved it (set by resolve()): source is an audit SOURCE_* value
+    # ("" = the default, a device button); "by" identifies the actor within
+    # that source (e.g. the Telegram chat id). The gate paths read these to
+    # write the audit record.
+    resolved_source: str = ""
+    resolved_by: str = ""
 
 
 class DecisionRouter:
@@ -138,11 +144,16 @@ class DecisionRouter:
         finally:
             self._pending.pop(pending.wire_id, None)
 
-    def resolve(self, wire_id: str, decision: str) -> bool:
-        """Apply a device decision. False when the id is unknown/already done."""
+    def resolve(self, wire_id: str, decision: str, *, source: str = "", by: str = "") -> bool:
+        """Apply a decision. False when the id is unknown/already done.
+
+        ``source``/``by`` tag WHO decided (audit): empty means the default
+        actor for the calling path (a device button press)."""
         pending = self._pending.get(wire_id)
         if pending is None or pending.future.done():
             return False
+        pending.resolved_source = source
+        pending.resolved_by = by
         pending.future.set_result(decision if decision in DECISIONS else ASK)
         return True
 
@@ -174,6 +185,10 @@ class DecisionRouter:
 
     def pending_count(self) -> int:
         return len(self._pending)
+
+    def all_pending(self) -> list[PendingDecision]:
+        """Every live pending decision, oldest first (holder /pending view)."""
+        return sorted(self._pending.values(), key=lambda p: p.created)
 
     # ---- remote routes (federation) ----
 
