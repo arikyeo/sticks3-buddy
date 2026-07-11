@@ -234,6 +234,64 @@ view, remote approve/deny, ask relay, `[relay] peers` static unicast
 discovery, `[relay] name_short`; every v1 relay message is still spoken
 and v1 peers keep working (cards).
 
+## Device link over WiFi/TCP (`[device_link]`)
+
+The stick can reach the bridge over the LAN instead of BLE: the bridge
+listens on `[device_link] port` (default 48902) and the stick — TCP
+client — dials in whenever it is powered, on WiFi, and the host is
+reachable. One command sets it up (stick connected over BLE first):
+
+```powershell
+buddy-bridge link-provision              # autodetects this machine's LAN IP
+buddy-bridge link-provision --host 100.64.0.7 --port 48902   # overlay/static
+buddy-bridge link-provision --clear      # stick forgets the link, BLE only
+```
+
+`link-provision` mints a `[device_link]` token if the config has none
+(`secrets.token_urlsafe(32)`, persisted to `config.toml`, **never
+printed** — not even once), enables the listener, and sends
+`{"cmd":"link",host,port,token}` to the stick over the **encrypted BLE
+link**. From then on:
+
+- Stick connects over TCP and authenticates its first line
+  (`hello_link`, HMAC-SHA256 over canonical JSON with a ±120 s freshness
+  window — the exact relay signing scheme). Bad signature or stale
+  timestamp: closed without a reply, and that IP's accepts are
+  rate-limited (3/min). One device connection at a time; a newer valid
+  connect replaces the older.
+- While the WiFi link is up it is **the** active link: same hello
+  negotiation, same heartbeats/prompts/asks/cards, and the BLE reconnect
+  loop pauses and releases its connection — the stick's BLE radio is
+  free for other centrals (e.g. the stock desktop app). The federation
+  holder flag follows whichever transport is live, so a wifi-held stick
+  federates normally. `buddy-bridge status` shows
+  `link_transport: "ble" | "wifi" | "none"`.
+- WiFi link drops: BLE reconnect resumes immediately; the stick falls
+  back on its own. Gates over an active WiFi link work even with
+  `mode off`.
+
+### Threat model (read before enabling)
+
+- The `[device_link]` token is **link authority**: whoever holds it can
+  *be* the stick — receive your prompts and answer them. Same trust
+  model as the relay token (trusted LAN or WireGuard/Tailscale overlay
+  only; never port-forward the port to the raw internet; rotate on
+  network changes). Rotate = `link-provision --clear`, blank the token
+  in `config.toml`, re-provision.
+- It is deliberately a **separate secret from `[relay] token`** —
+  sharing one was considered and rejected: the relay token grants
+  approval authority across machines, the device-link token impersonates
+  the device; separate secrets keep the blast radius of a leak separate.
+- The TCP pipe is plaintext after its HMAC handshake. What rides it
+  post-auth is exactly what the encrypted BLE link carries — session
+  titles, prompt hints, decisions — and nothing more. **WiFi passwords
+  never traverse the device link** (`buddy-bridge wifi` refuses unless
+  the encrypted BLE link is up), and the device-link token itself is
+  only ever provisioned over BLE, never over the TCP pipe it protects.
+  `--clear` carries no secret, so it may ride either transport.
+- Zero sockets unless `[device_link] enabled = true` AND the token is
+  non-empty (test-asserted, same rule as the relay).
+
 ## WiFi provisioning
 
 ```powershell
