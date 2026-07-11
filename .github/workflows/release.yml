@@ -51,7 +51,10 @@ jobs:
       - name: Build firmware
         run: |
           TAG="${{ steps.version.outputs.tag }}"
-          export PLATFORMIO_BUILD_FLAGS="-DBUDDY_FW_VERSION=\"${TAG#v}\""
+          # PlatformIO shlex-parses BUILD_FLAGS and strips one quoting level
+          # (v0.1.1 release run failed with "too many decimal points") — the
+          # backslash-escaped quotes survive so the compiler gets a string.
+          export PLATFORMIO_BUILD_FLAGS="-DBUDDY_FW_VERSION=\\\"${TAG#v}\\\""
           pio run -e m5stick-s3-ota
 
       - name: Merge single-image binary
