@@ -59,11 +59,13 @@ void blePairingTick(uint32_t nowMs);
 // False when nothing is connected. For a privacy-enabled host's FIRST
 // pairing this is an unresolved RPA — key nothing durable by it.
 bool blePeerBda(uint8_t out[6]);
-// IDENTITY BD address of the bonded peer on the current link, learned from
-// the SMP auth-complete event. This is the address the Bluedroid bond
-// store keys the bond by — use it for registry records and bond removal.
-// False until the current link has completed authentication.
-bool bleBondedPeerBda(uint8_t out[6]);
+// BOND-STORE key address for the current link, resolved by matching the
+// link's addresses (SMP peer-identity key, auth-complete address, connect
+// address) against esp_ble_get_bond_device_list() — the list the boot
+// reconcile and esp_ble_remove_bond_device() consume, so this is the
+// address durable records and removals must use. False until the current
+// link has completed authentication.
+bool bleBondKeyBda(uint8_t out[6]);
 // Drop the current link. Advertising restarts automatically.
 void bleDisconnect();
 #ifdef BUDDY_BLE_WHITELIST

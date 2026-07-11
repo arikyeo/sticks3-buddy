@@ -49,16 +49,17 @@ static bool     _wasConn      = false;
 static bool     _wasSecure    = false;
 static char     _pairedName[24] = "";    // pending "paired:" toast for main.cpp
 
-// Address the registry keys records by: the bond-store IDENTITY address
-// once the link has authenticated, else the connect-time address. A
+// Address the registry keys records by: the bond store's own key for the
+// link once it has authenticated, else the connect-time address. A
 // privacy-enabled host's (macOS, modern Windows) FIRST pairing connects
 // under an unresolvable RPA, and a record keyed by that RPA matches
 // nothing afterwards — the boot reconcile drops it ("bond gone", hello
 // name lost), a same-session identity-resolved reconnect adopts a
 // duplicate row, and evict/forget feed esp_ble_remove_bond_device() a key
-// the bond store never heard of (silent fail, leaked bond).
+// the bond store never heard of (silent fail, leaked bond). Keying by the
+// store's key makes registry == reconcile == removal true by construction.
 static bool _peerKeyBda(uint8_t out[6]) {
-  if (bleBondedPeerBda(out)) return true;
+  if (bleBondKeyBda(out)) return true;
   return blePeerBda(out);
 }
 
@@ -203,9 +204,9 @@ void hostGluePoll(uint32_t now) {
   bool sec = conn && bleSecure();
   if (sec && !_wasSecure) {
     // Bond established (fresh pairing or LTK resume): make sure the peer is
-    // in the registry — keyed by the bond-store identity address, which is
-    // what survives reboots and what removal calls need — and freshen its
-    // LRU stamp.
+    // in the registry — keyed by the bond store's own key, which is what
+    // the boot reconcile diffs against and what removal calls need — and
+    // freshen its LRU stamp.
     uint8_t bda[6];
     if (_peerKeyBda(bda)) {
       int idx = hostTabFindBda(&_hosts, bda);

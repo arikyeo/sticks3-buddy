@@ -44,17 +44,30 @@ static volatile uint16_t  mtu = 23;
 static esp_bd_addr_t      peerAddr;
 static volatile bool      hasPeer = false;
 
-// Identity address of the bonded peer on the current link, captured from
-// the SMP auth-complete event. A privacy-enabled host's FIRST pairing
-// connects under an unresolvable RPA (its IRK isn't in our resolving list
-// yet), so peerAddr is a one-time address — while the Bluedroid bond store
-// keys the bond by the identity address exchanged during SMP. Registry
-// records and bond removals must use THIS address. peerAddr itself stays
-// connect-time on purpose: the controller tracks the live link by that
-// (pseudo) address, so conn-param updates and disconnect attribution keep
-// working from it.
-static esp_bd_addr_t      bondedAddr;
-static volatile bool      hasBondedPeer = false;
+// Bond-store key resolution for the current link. A privacy-enabled host's
+// FIRST pairing connects under an unresolvable RPA (its IRK isn't in our
+// resolving list yet), so peerAddr is a one-time address — while the
+// Bluedroid bond store files the bond under its own key. Which address
+// that is (SMP identity vs the pairing/pseudo address) is a stack detail
+// that has shifted between IDF releases, so we don't hardcode either:
+// bleBondKeyBda() resolves the key by matching the live link's candidate
+// addresses against esp_ble_get_bond_device_list() — the same list the
+// boot reconcile and esp_ble_remove_bond_device() consume, which makes
+// registry key == reconcile key == removal key true by construction.
+// Candidates, captured on the BLE stack task during SMP:
+//   pidAddr  — the peer identity address from the ESP_LE_KEY_PID key
+//              distribution (custom GAP handler below),
+//   authAddr — the address the auth-complete event reported (the
+//              pairing/pseudo address on 4.4-era Bluedroid),
+//   peerAddr — the connect-time address (identity-or-pseudo when the
+//              stack resolved the peer, raw RPA on a first pairing).
+// peerAddr itself stays connect-time on purpose: the controller tracks
+// the live link by that address, so conn-param updates and disconnect
+// attribution keep working from it.
+static esp_bd_addr_t      pidAddr;
+static volatile bool      hasPidAddr = false;
+static esp_bd_addr_t      authAddr;
+static volatile bool      hasAuthAddr = false;
 
 // Pairing window (Track F P4): while non-zero and in the future, ONLY
 // unbonded peers may connect and pair — bonded hosts are evicted/rejected
@@ -177,7 +190,8 @@ class ServerCallbacks : public BLEServerCallbacks {
     }
     memcpy((void*)peerAddr, who, sizeof(esp_bd_addr_t));
     hasPeer = true;
-    hasBondedPeer = false;   // fresh link — identity known after auth
+    hasPidAddr = false;    // fresh link — key material arrives during SMP
+    hasAuthAddr = false;
     connected = true;
     // Apply the latched link mode: tight if the device is awake, relaxed if
     // it's reconnecting while the screen is off (P7 power).
@@ -204,7 +218,8 @@ class ServerCallbacks : public BLEServerCallbacks {
     passkey = 0;
     mtu = 23;
     hasPeer = false;
-    hasBondedPeer = false;
+    hasPidAddr = false;
+    hasAuthAddr = false;
     // The disconnect event landed — the advertising restart below covers the
     // pairing-window eviction too, so the tick fallback can stand down.
     pairWinAdvKickAt = 0;
@@ -241,12 +256,15 @@ class SecCallbacks : public BLESecurityCallbacks {
     }
     passkey = 0;
     if (cmpl.success) {
-      // For a bonded peer this is the identity address — the bond-store
-      // key — even when the link connected under an unresolved RPA.
-      // Captured BEFORE latching 'secure' so the registry poll can never
-      // observe a secure link without the bonded bda being available.
-      memcpy((void*)bondedAddr, cmpl.bd_addr, sizeof(esp_bd_addr_t));
-      hasBondedPeer = true;
+      // A key-resolution candidate, NOT trusted as the identity: on
+      // 4.4-era Bluedroid this is the pairing/pseudo address forwarded
+      // unchanged from SMP. Captured BEFORE latching 'secure' so the
+      // registry poll can never observe a secure link without the
+      // candidates being in place (the PID key, when the peer
+      // distributes one, has already arrived by now — key distribution
+      // precedes the auth-complete event).
+      memcpy((void*)authAddr, cmpl.bd_addr, sizeof(esp_bd_addr_t));
+      hasAuthAddr = true;
     }
     secure = cmpl.success;
     Serial.printf("[ble] auth %s\n", cmpl.success ? "ok" : "FAIL");
@@ -254,8 +272,28 @@ class SecCallbacks : public BLESecurityCallbacks {
   }
 };
 
+// GAP watcher (chained after the library's own handling): capture the peer
+// identity address from the SMP key-distribution phase. ESP_GAP_BLE_KEY_EVT
+// with ESP_LE_KEY_PID carries the peer's identity address + IRK — the only
+// place the stack hands the identity to the app on this Bluedroid vintage
+// (the auth-complete event reports the pairing address instead). Runs on
+// the BLE stack task; the 'connected' guard mirrors onAuthenticationComplete
+// so a gate-rejected link's stray SMP traffic can't seed the accepted
+// link's candidates.
+static void _gapKeyWatch(esp_gap_ble_cb_event_t event,
+                         esp_ble_gap_cb_param_t* param) {
+  if (event != ESP_GAP_BLE_KEY_EVT) return;
+  if (!connected) return;
+  if (param->ble_security.ble_key.key_type != ESP_LE_KEY_PID) return;
+  memcpy((void*)pidAddr,
+         param->ble_security.ble_key.p_key_value.pid_key.static_addr,
+         sizeof(esp_bd_addr_t));
+  hasPidAddr = true;
+}
+
 void bleInit(const char* deviceName, uint8_t pairMode) {
   BLEDevice::init(deviceName);
+  BLEDevice::setCustomGapHandler(_gapKeyWatch);
   // Request the biggest MTU we can get. macOS negotiates to 185 typically.
   BLEDevice::setMTU(517);
 
@@ -394,9 +432,56 @@ bool blePeerBda(uint8_t out[6]) {
   return true;
 }
 
-bool bleBondedPeerBda(uint8_t out[6]) {
-  if (!hasBondedPeer) return false;
-  memcpy(out, (const void*)bondedAddr, 6);
+// Resolve the bond-store key for the current link by matching the link's
+// candidate addresses against the bond list itself — the exact list the
+// boot reconcile diffs against and esp_ble_remove_bond_device() indexes,
+// so whatever keying this Bluedroid uses, the returned address is the one
+// that works there. Each list entry is checked on both its store key
+// (bd_addr) and, when the peer distributed one, its identity
+// (bond_key.pid_key.static_addr). Called from the main loop only (the
+// static list buffer is single-caller, same pattern as _isBonded on the
+// BLE task). False when nothing has authenticated on this link.
+bool bleBondKeyBda(uint8_t out[6]) {
+  if (!hasAuthAddr && !hasPidAddr) return false;
+  const uint8_t* cand[3];
+  int nc = 0;
+  if (hasPidAddr)  cand[nc++] = (const uint8_t*)pidAddr;
+  if (hasAuthAddr) cand[nc++] = (const uint8_t*)authAddr;
+  if (hasPeer)     cand[nc++] = (const uint8_t*)peerAddr;
+
+  int n = esp_ble_get_bond_device_num();
+  if (n > 0) {
+    static esp_ble_bond_dev_t list[BUDDY_MAX_HOSTS + 2];
+    if (n > (int)(sizeof(list) / sizeof(list[0]))) n = sizeof(list) / sizeof(list[0]);
+    if (esp_ble_get_bond_device_list(&n, list) == ESP_OK) {
+      for (int i = 0; i < n; i++) {
+        bool hasPid = (list[i].bond_key.key_mask & ESP_LE_KEY_PID) != 0;
+        for (int c = 0; c < nc; c++) {
+          if (memcmp(list[i].bd_addr, cand[c], 6) == 0 ||
+              (hasPid && memcmp(list[i].bond_key.pid_key.static_addr,
+                                cand[c], 6) == 0)) {
+            memcpy(out, list[i].bd_addr, 6);
+            if (memcmp(out, (const void*)peerAddr, 6) != 0) {
+              // Key differs from the live link address — the case this
+              // resolution exists for. Log once per lookup for the
+              // hardware smoke (connect vs store key).
+              Serial.printf("[ble] bond key %02x:%02x:%02x:%02x:%02x:%02x"
+                            " (link %02x:%02x:%02x:%02x:%02x:%02x)\n",
+                            out[0], out[1], out[2], out[3], out[4], out[5],
+                            peerAddr[0], peerAddr[1], peerAddr[2],
+                            peerAddr[3], peerAddr[4], peerAddr[5]);
+            }
+            return true;
+          }
+        }
+      }
+    }
+  }
+  // No list match (store write raced, or list API failed): best candidate,
+  // identity first. Callers treat this the same — it only weakens the
+  // guarantee back to best-effort instead of failing the adopt outright.
+  Serial.println("[ble] bond key: no list match, using candidate");
+  memcpy(out, cand[0], 6);
   return true;
 }
 
@@ -433,16 +518,17 @@ void bleWhitelistPin(const uint8_t* bda) {
 #endif
 
 void bleRemoveCurrentBond() {
-  if (!hasPeer && !hasBondedPeer) {
-    Serial.println("[ble] unpair: no peer to remove");
-    return;
-  }
-  // The bond store is keyed by the identity address; the connect-time
-  // address of a first-time-pairing privacy host is an RPA the store never
-  // heard of, and removal by it fails silently.
+  // Resolve the store's own key for this link — the connect-time address
+  // of a first-time-pairing privacy host is an RPA the store never heard
+  // of, and removal by it fails silently.
   esp_bd_addr_t victim;
-  memcpy(victim,
-         hasBondedPeer ? (const void*)bondedAddr : (const void*)peerAddr, 6);
+  if (!bleBondKeyBda(victim)) {
+    if (!hasPeer) {
+      Serial.println("[ble] unpair: no peer to remove");
+      return;
+    }
+    memcpy(victim, (const void*)peerAddr, 6);
+  }
   esp_ble_remove_bond_device(victim);
   Serial.printf("[ble] removed bond %02x:%02x:%02x:%02x:%02x:%02x\n",
     victim[0], victim[1], victim[2], victim[3], victim[4], victim[5]);
