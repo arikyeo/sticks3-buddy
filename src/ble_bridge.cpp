@@ -246,12 +246,27 @@ class SecCallbacks : public BLESecurityCallbacks {
     Serial.printf("[ble] passkey %06lu\n", (unsigned long)pk);
   }
   void onAuthenticationComplete(esp_ble_auth_cmpl_t cmpl) override {
-    // No accepted link -> this event belongs to a gate-rejected bonded
-    // peer whose LTK re-encryption raced our disconnect. Latching secure
-    // here would fire a premature registry adopt the moment the next peer
-    // connects (before its own SMP has run).
-    if (!connected) {
-      Serial.println("[ble] stray auth event ignored (no accepted link)");
+    // Attribute the event to a link before acting on it. Two stray
+    // sources exist: (a) no accepted link — a gate-rejected bonded peer's
+    // LTK re-encryption raced our disconnect; (b) accepted link is a
+    // DIFFERENT peer — the rejected peer vanished mid-air, its disconnect
+    // stalled on the supervision timeout, the pairing-window advertising
+    // fallback let a new peer connect, and the old link's conn-loss
+    // failure (or late success) lands attributed to nobody. Latching
+    // secure/candidates from a stray would graft the old peer onto the
+    // live link's registry adopt; acting on its failure would disconnect
+    // the innocent live link (getConnId() is the newest connection). The
+    // event's bd_addr is the SMP pairing address — same source as the
+    // connect event's remote_bda, so equality holds for both a first
+    // pairing (raw RPA) and a resolved bonded peer (identity). Log the
+    // source so a legit-but-mismatched auth would be visible in the field.
+    if (!connected || !hasPeer ||
+        memcmp(cmpl.bd_addr, (const void*)peerAddr, 6) != 0) {
+      Serial.printf("[ble] stray auth event ignored "
+                    "(%02x:%02x:%02x:%02x:%02x:%02x, %s link)\n",
+                    cmpl.bd_addr[0], cmpl.bd_addr[1], cmpl.bd_addr[2],
+                    cmpl.bd_addr[3], cmpl.bd_addr[4], cmpl.bd_addr[5],
+                    connected ? "foreign to accepted" : "no accepted");
       return;
     }
     passkey = 0;
@@ -283,7 +298,13 @@ class SecCallbacks : public BLESecurityCallbacks {
 static void _gapKeyWatch(esp_gap_ble_cb_event_t event,
                          esp_ble_gap_cb_param_t* param) {
   if (event != ESP_GAP_BLE_KEY_EVT) return;
-  if (!connected) return;
+  // Same attribution rule as onAuthenticationComplete: only key material
+  // whose source address is the accepted link's may seed the candidates —
+  // a stale link's delayed key event must not graft its identity onto the
+  // live peer's registry adopt.
+  if (!connected || !hasPeer ||
+      memcmp(param->ble_security.ble_key.bd_addr,
+             (const void*)peerAddr, 6) != 0) return;
   if (param->ble_security.ble_key.key_type != ESP_LE_KEY_PID) return;
   memcpy((void*)pidAddr,
          param->ble_security.ble_key.p_key_value.pid_key.static_addr,
