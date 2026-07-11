@@ -400,6 +400,86 @@ install`) that the firmware renders; the same tag is never carded twice,
 and nothing fires until a v2 device has completed the hello handshake
 (unknown firmware version = nothing to compare against).
 
+## Telegram bridge (opt-in): a virtual buddy in your pocket
+
+With `[telegram]` configured, the daemon becomes reachable from anywhere:
+push notifications for the same events the stick sees, live session
+queries, and — behind separate opt-ins — answering permission prompts and
+Claude's `AskUserQuestion` right from the chat. Transport is the Telegram
+Bot HTTP API over the stdlib (`urllib` in a worker thread): no new
+dependency, and one `getUpdates` long-poll task that backs off on errors
+(1 s → 60 s) and can never crash or block the daemon. Every send is
+best-effort: retry once, then drop quietly.
+
+```powershell
+buddy-bridge telegram setup    # BotFather walkthrough; token via hidden input
+buddy-bridge telegram test     # live check: getMe + one message per chat
+buddy-bridge telegram status   # config + daemon view (token never printed)
+```
+
+```toml
+[telegram]
+enabled = true
+bot_token = "..."          # from @BotFather — see threat model below
+allowed_chats = [123456789] # REQUIRED: numeric chat ids; everyone else ignored
+events = ["prompt"]         # any of: prompt attention done card update
+allow_decisions = false     # inline [Allow once][Deny] buttons (opt-in)
+answer_asks = false         # answer AskUserQuestion from Telegram (opt-in)
+```
+
+Commands (allowlisted chats only): `/sessions` and `/status` show the
+merged session list across this machine **and every federated peer** (the
+holder view — the same data the stick dashboard renders): state glyph
+(⏳ waiting / ▶ running / · idle), agent letter (C/X), host, title, token
+count, last activity line. `/pending` lists only what's waiting, each item
+with its inline buttons. `/mute [min]` / `/unmute` pause pushes per chat
+(commands still answered). `/help` lists everything.
+
+**Answering permission prompts** (`allow_decisions = true`): the buttons
+route through the exact same `DecisionRouter` path as a stick button press
+— wire id resolves the pending future, the gate's fail-open timeout still
+rules, and a federated peer's prompt is relayed home precisely like a
+stick answer from the holder. Nothing new becomes allowable; Telegram is
+just another button.
+
+**Answering `AskUserQuestion`** (`answer_asks = true`, then re-run
+`buddy-bridge hooks install claude`): the question arrives with one button
+per option (multi-select: toggle + Submit). The mechanism uses the
+documented hook contract — the `AskUserQuestion` `PreToolUse` hook becomes
+*blocking* and, when you pick an option, returns `permissionDecision:
+"allow"` with `updatedInput` = the original `questions` plus an `answers`
+map keyed by the verbatim question text, which Claude Code accepts as the
+answer and skips the terminal dialog. **The honest limits:** while the
+hook waits (up to the `claude_decision` timeout, 300 s default) the
+terminal dialog is *deferred* — answer on Telegram or wait out the
+timeout, after which the native dialog appears exactly as before (fail
+open; the CLI can never brick). A hook cannot answer a question that has
+already reached the terminal dialog, free-text "Other" replies aren't
+supported over Telegram (labels only), and federated peers' asks stay
+display-only (the federation protocol has no ask-answer channel).
+
+### Threat model (read before enabling)
+
+- **The bot token is full control authority.** Anyone holding it reads
+  every notification (prompt hints include commands and paths) and — with
+  the opt-ins on — can approve permission prompts and answer questions.
+  Treat it like an SSH private key: use a **dedicated bot** for this, and
+  assume token compromise = approval forgery. Rotate it at @BotFather if
+  in doubt. The daemon never logs or prints it (`telegram status` shows
+  only `set (hidden)`; transport failures log method + status code only).
+- **The allowlist is required, not optional.** `enabled = true` without a
+  token *and* at least one `allowed_chats` entry stays OFF (warned at
+  startup). Updates from non-allowlisted chats are ignored and the chat id
+  logged once; no reply of any kind is sent.
+- Chat *content* and message text are never written to the daemon log.
+- `allow_decisions` and `answer_asks` default **off**: out of the box the
+  bridge is read-only push + query.
+- Every remote decision and every answered ask appends to
+  `~/.buddy-bridge/audit.jsonl` with `source: "telegram"` and `by: <chat
+  id>`, alongside the existing device/auto-allow records.
+- Commands sent while the daemon is down are dropped on restart (the
+  backlog is discarded), so a queued-up "Allow" can never fire late.
+
 ## Permission gate (fail-open by design)
 
 `PreToolUse` (Claude, install-gated by `[claude] gate = true`) and
@@ -440,11 +520,12 @@ path, never take one away or block your CLI:
 
 Every gate outcome appends one JSON line to `~/.buddy-bridge/audit.jsonl`:
 `ts, host, agent, sid, tool, hint` (exactly as shown on the device),
-`decision`, and `source`:
+`decision`, `source`, and — for telegram — `by` (the chat id):
 
 | source | meaning |
 |---|---|
 | `device` | decided on the stick's buttons |
+| `telegram` | decided/answered from an allowlisted Telegram chat (`by` = chat id) |
 | `auto_allow` | matched an `auto_allow` rule |
 | `timeout_fallback` | device never answered; fell back to native prompt |
 | `daemon_down` | BLE off/disconnected; fell back to native prompt |

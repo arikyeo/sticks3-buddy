@@ -10,8 +10,12 @@ slashes so the JSON stays readable on Windows:
     "C:/path/to/python.exe" -m buddy_bridge.hooks.claude_hook
 
 PreToolUse gets two kinds of entries:
-  * an always-present ``AskUserQuestion`` matcher (non-blocking: the hook
-    just forwards the question payload so a v2 stick can display it);
+  * an always-present ``AskUserQuestion`` matcher. Default: non-blocking,
+    the hook just forwards the question payload so a v2 stick can display
+    it. With ``answer_asks=True`` ([telegram] answer_asks) the command
+    gains ``--answer-asks`` and the same 330s timeout as the gate: the
+    hook then blocks so a Telegram-chosen option can answer the question
+    (timeout falls through to the terminal dialog);
   * the gate entry, written ONLY when [claude] gate=true, with the matcher
     taken from [claude] gate_tools and a 330s timeout (the hook itself
     gives up at 320s, the daemon decides by 300s).
@@ -51,7 +55,9 @@ def hook_command(python_exe: str | None = None) -> str:
     return f'"{py}" -m buddy_bridge.hooks.claude_hook'
 
 
-def _desired_groups(gate: bool, gate_tools: str, python_exe: str | None) -> dict[str, list[dict]]:
+def _desired_groups(
+    gate: bool, gate_tools: str, python_exe: str | None, answer_asks: bool = False
+) -> dict[str, list[dict]]:
     command = hook_command(python_exe)
     desired: dict[str, list[dict]] = {}
     for event in MIRROR_EVENTS:
@@ -59,12 +65,18 @@ def _desired_groups(gate: bool, gate_tools: str, python_exe: str | None) -> dict
         if event == "PostToolUse":
             group = {"matcher": "*", **group}
         desired[event] = [group]
-    # Ask origination first (always installed, non-blocking), then the gate
-    # entry when enabled. `desired` always carries the full PreToolUse list
-    # so gate=False actively removes a stale gate entry.
-    pre: list[dict] = [
-        {"matcher": "AskUserQuestion", "hooks": [{"type": "command", "command": command}]}
-    ]
+    # Ask origination first (always installed; blocking only with
+    # answer_asks), then the gate entry when enabled. `desired` always
+    # carries the full PreToolUse list so gate=False / answer_asks=False
+    # actively remove a stale variant.
+    ask_hook: dict = {"type": "command", "command": command}
+    if answer_asks:
+        ask_hook = {
+            "type": "command",
+            "command": f"{command} --answer-asks",
+            "timeout": GATE_TIMEOUT_SECS,
+        }
+    pre: list[dict] = [{"matcher": "AskUserQuestion", "hooks": [ask_hook]}]
     if gate:
         pre.append(
             {
@@ -84,11 +96,12 @@ def install(
     gate: bool = False,
     gate_tools: str = "Bash",
     python_exe: str | None = None,
+    answer_asks: bool = False,
 ) -> bool:
     """Merge our hooks in. Returns True when the file was modified."""
     data = load_json_config(settings_path)
     merged, changed = merge_hook_groups(
-        data, _desired_groups(gate, gate_tools, python_exe), MARKER
+        data, _desired_groups(gate, gate_tools, python_exe, answer_asks), MARKER
     )
     if not changed:
         return False

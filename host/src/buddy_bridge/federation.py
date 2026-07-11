@@ -362,6 +362,18 @@ class Federation:
             if peer.prompt is not None
         )
 
+    def remote_prompts(self) -> list[dict]:
+        """Every peer's live prompt, oldest-first: the namespaced prompt dict
+        plus the peer's display ``name`` and holder-clock ``first_seen``
+        (the holder-side merged /pending view, e.g. for the Telegram bot)."""
+        out = [
+            {**peer.prompt, "name": peer.name, "first_seen": peer.prompt_first_seen}
+            for peer in self._peers.values()
+            if peer.prompt is not None
+        ]
+        out.sort(key=lambda p: p["first_seen"])
+        return out
+
     def prompt_ids(self) -> set[str]:
         return {p.prompt["id"] for p in self._peers.values() if p.prompt is not None}
 
