@@ -57,6 +57,8 @@ def main(argv: list[str] | None = None) -> int:
     p_hooks.add_argument("agent", choices=("claude", "codex"))
     p_svc = sub.add_parser("service", help="install/uninstall the background service")
     p_svc.add_argument("action", choices=("install", "uninstall"))
+    p_tg = sub.add_parser("telegram", help="Telegram bot: setup / live send test / status")
+    p_tg.add_argument("action", choices=("setup", "test", "status"))
     sub.add_parser("doctor", help="diagnose the local setup")
     sub.add_parser("setup", help="create config + print next steps")
 
@@ -71,6 +73,7 @@ def main(argv: list[str] | None = None) -> int:
         "wifi": cmd_wifi,
         "hooks": cmd_hooks,
         "service": cmd_service,
+        "telegram": cmd_telegram,
         "doctor": cmd_doctor,
         "setup": cmd_setup,
     }[args.cmd]
@@ -468,6 +471,124 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             marked = False
         print(f"{label:14}: {'installed' if marked else 'not installed'} ({path})")
     return 0 if ok else 1
+
+
+def cmd_telegram(args: argparse.Namespace) -> int:
+    if args.action == "setup":
+        return _cmd_telegram_setup()
+    if args.action == "test":
+        return _cmd_telegram_test()
+    return _cmd_telegram_status()
+
+
+def _yes(prompt: str) -> bool:
+    return input(prompt).strip().lower() in ("y", "yes")
+
+
+def _cmd_telegram_setup() -> int:
+    """Interactive [telegram] config. The token is read via getpass only
+    (never a CLI argument, never echoed, never printed back); NO network
+    call happens here — `telegram test` is the live check."""
+    import getpass
+
+    cfg = load_config()
+    print("Telegram 'virtual buddy' setup")
+    print("  1. In Telegram, talk to @BotFather: /newbot -> pick a name -> copy the token.")
+    print("     Use a DEDICATED bot. The token is FULL control of it — treat it like an")
+    print("     SSH private key (anyone holding it can read and answer your prompts).")
+    if cfg.telegram_token:
+        print("  A token is already configured; press Enter to keep it.")
+    token = getpass.getpass("  Bot token (input hidden): ").strip()
+    if token:
+        cfg.telegram_token = token
+    print("  2. Find your numeric chat id: message @userinfobot, OR send your new bot")
+    print("     any message and open  https://api.telegram.org/bot<TOKEN>/getUpdates")
+    print("     in a browser (never share that URL — it embeds the token).")
+    current = ", ".join(str(c) for c in cfg.telegram_chats) or "none"
+    raw = input(f"  Allowed chat id(s), comma-separated [{current}]: ").strip()
+    if raw:
+        chats = []
+        for part in raw.replace(";", ",").split(","):
+            part = part.strip()
+            try:
+                chats.append(int(part))
+            except ValueError:
+                if part:
+                    print(f"  (ignored non-numeric chat id {part!r})")
+        cfg.telegram_chats = tuple(chats)
+    prior_asks = cfg.telegram_answer_asks
+    cfg.telegram_decisions = _yes(
+        "  Answer permission prompts (Allow/Deny buttons) from Telegram? [y/N] "
+    )
+    cfg.telegram_answer_asks = _yes(
+        "  Answer Claude's AskUserQuestion (option buttons) from Telegram? [y/N] "
+    )
+    cfg.telegram_enabled = True
+    save_config(cfg)
+    print(f"saved {cfg.path}")
+    if not cfg.telegram_active:
+        missing = "bot token" if not cfg.telegram_token.strip() else "allowed chat id"
+        print(f"WARNING: telegram stays OFF until a {missing} is configured.")
+    if cfg.telegram_answer_asks != prior_asks:
+        print("answer_asks changed: run `buddy-bridge hooks install claude` to update")
+        print("the AskUserQuestion hook entry.")
+    print("next: `buddy-bridge telegram test` (live send), then restart the daemon.")
+    return 0
+
+
+def _cmd_telegram_test() -> int:
+    """THE one place a live Telegram call is expected: verifies the token
+    (getMe) and sends one test message to every allowlisted chat."""
+    cfg = load_config()
+    if not cfg.telegram_active:
+        print("telegram: not active — run `buddy-bridge telegram setup` first")
+        print(f"  enabled={cfg.telegram_enabled} token={'set' if cfg.telegram_token else 'EMPTY'} "
+              f"chats={len(cfg.telegram_chats)}")
+        return 1
+    from .notify.telegram import TelegramClient
+
+    client = TelegramClient(cfg.telegram_token)
+    me = client.call("getMe", {})
+    if not isinstance(me, dict):
+        print("telegram: getMe failed — bad token or no network (token not shown)")
+        return 1
+    print(f"telegram: bot @{me.get('username') or '?'} ok")
+    failed = 0
+    for chat_id in cfg.telegram_chats:
+        result = client.call(
+            "sendMessage",
+            {"chat_id": chat_id,
+             "text": f"buddy-bridge: test message from {cfg.host_name or cfg.host_id}"},
+        )
+        if result is None:
+            failed += 1
+            print(f"  chat {chat_id}: FAILED (has the chat messaged the bot yet?)")
+        else:
+            print(f"  chat {chat_id}: sent")
+    return 1 if failed else 0
+
+
+def _cmd_telegram_status() -> int:
+    """Config + live daemon view. The token value is NEVER printed."""
+    cfg = load_config(create=False)
+    print(f"enabled       : {cfg.telegram_enabled}")
+    print(f"active        : {cfg.telegram_active}")
+    print(f"bot_token     : {'set (hidden)' if cfg.telegram_token.strip() else 'EMPTY'}")
+    print(f"allowed_chats : {', '.join(str(c) for c in cfg.telegram_chats) or '(none)'}")
+    print(f"events        : {', '.join(cfg.telegram_events) or '(none)'}")
+    print(f"allow_decisions: {cfg.telegram_decisions}")
+    print(f"answer_asks   : {cfg.telegram_answer_asks}")
+    resp = _daemon_request({"event": "status"})
+    if resp is None:
+        print("daemon        : not running")
+        return 0
+    tg = resp.get("telegram") or {}
+    if not tg.get("active"):
+        print("daemon        : running, telegram inactive (restart after config changes)")
+        return 0
+    print(f"daemon        : running, telegram active — queued={tg.get('queued', 0)} "
+          f"muted={tg.get('muted_chats') or []}")
+    return 0
 
 
 def cmd_setup(args: argparse.Namespace) -> int:
