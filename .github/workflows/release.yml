@@ -36,9 +36,6 @@ jobs:
       - name: Install PlatformIO and esptool
         run: pip install platformio esptool
 
-      - name: Build firmware
-        run: pio run -e m5stick-s3
-
       - name: Determine version
         id: version
         run: |
@@ -48,9 +45,18 @@ jobs:
             echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
           fi
 
+      # Ship the OTA-capable env so an updated device keeps its update menu,
+      # and stamp the tag (v-stripped) as the firmware version — the on-device
+      # update gate compares BUDDY_FW_VERSION against the latest release tag.
+      - name: Build firmware
+        run: |
+          TAG="${{ steps.version.outputs.tag }}"
+          export PLATFORMIO_BUILD_FLAGS="-DBUDDY_FW_VERSION=\"${TAG#v}\""
+          pio run -e m5stick-s3-ota
+
       - name: Merge single-image binary
         run: |
-          BUILD_DIR=.pio/build/m5stick-s3
+          BUILD_DIR=.pio/build/m5stick-s3-ota
 
           # board_build.partitions = partitions/sticks3_8mb_ota.csv has
           # ota_0/ota_1 slots, so the merged image includes boot_app0.bin
@@ -79,7 +85,7 @@ jobs:
         run: |
           mkdir -p release
           cp buddy-sticks3-merged.bin release/buddy-sticks3-merged.bin
-          cp .pio/build/m5stick-s3/firmware.bin release/firmware.bin
+          cp .pio/build/m5stick-s3-ota/firmware.bin release/firmware.bin
 
       - name: Generate manifest.json
         run: |

@@ -16,6 +16,9 @@ jobs:
         include:
           - env: m5stick-s3
             continue-on-error: false
+          # The release ships this env — keep it CI-guarded.
+          - env: m5stick-s3-ota
+            continue-on-error: false
           - env: m5stickc-plus
             continue-on-error: false
           - env: m5stickc-plus2

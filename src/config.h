@@ -4,7 +4,11 @@
 // -DBOARD_STICKC_PLUS / -DBOARD_STICKC_PLUS2); anything not board-specific
 // lives in the shared section below.
 
-#define BUDDY_FW_VERSION "1.2.0"
+// Release builds inject the tag version (-DBUDDY_FW_VERSION=\"x.y.z\"),
+// which the OTA update gate compares against the latest release tag.
+#ifndef BUDDY_FW_VERSION
+#define BUDDY_FW_VERSION "0.2.0-dev"
+#endif
 #define BUDDY_PROTO_VER  2
 
 // --- Per-board buffer capacities --------------------------------------------
