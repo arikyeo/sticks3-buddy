@@ -7,6 +7,7 @@ the github/weather card pollers."""
 import asyncio
 import contextlib
 import json
+import logging
 
 from buddy_bridge.adapters.update_cards import (
     DEFAULT_FIRMWARE_REPO,
@@ -248,3 +249,19 @@ async def test_device_fw_version_exposes_last_hello_ack(home):
         }
     )
     assert daemon.device_fw_version() == "2.3.1"
+
+
+async def test_status_payload_carries_device_fw(home, caplog):
+    daemon = Daemon(load_config(home))
+    assert daemon.status_payload()["device_fw"] == ""  # pre-handshake
+    with caplog.at_level(logging.INFO, logger="buddy_bridge.daemon"):
+        await daemon._on_hello_ack(
+            {
+                "ack": "hello",
+                "ok": True,
+                "proto": 2,
+                "data": {"fw": "2.3.1", "maxLine": 4608, "maxSessions": 6, "sel": True},
+            }
+        )
+    assert daemon.status_payload()["device_fw"] == "2.3.1"
+    assert "fw=2.3.1" in caplog.text  # negotiation line names the firmware

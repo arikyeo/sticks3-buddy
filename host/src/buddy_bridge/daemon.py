@@ -401,6 +401,7 @@ class Daemon:
                 "remote_pending": self.federation.pending_total(),
             },
             "device": self.last_device_status,
+            "device_fw": self.device_fw_version(),
             "host_id": self.cfg.host_id,
             "sessions": {"total": total, "running": running, "waiting": waiting},
             "tokens": tokens,
@@ -731,9 +732,9 @@ class Daemon:
         self.device_sel = ack.sel
         if self.v2_active:
             log.info(
-                "ble: negotiated protocol v2 (maxLine=%d budget=%d maxSessions=%d "
-                "caps=%s sel=%s)",
-                ack.max_line, self.line_budget, ack.max_sessions,
+                "ble: negotiated protocol v2 (fw=%s maxLine=%d budget=%d "
+                "maxSessions=%d caps=%s sel=%s)",
+                ack.fw, ack.max_line, self.line_budget, ack.max_sessions,
                 ",".join(ack.caps), ack.sel,
             )
         else:
