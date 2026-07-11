@@ -412,6 +412,30 @@ def build_wifi_list_frame() -> str:
     return dumps({"cmd": "wifi", "list": True})
 
 
+def build_link_frame(host: str, port: int, token: str) -> str:
+    """{"cmd":"link","host":...,"port":...,"token":...} — provision the
+    WiFi/TCP device link (proto >= 2).
+
+    Carries the device-link token, so the daemon only ever sends it over
+    the encrypted BLE pipe — never over the TCP link itself. Like the wifi
+    builders, ``host``/``token`` skip :func:`sanitize` (credential-grade
+    bytes must round-trip exactly; ``dumps`` keeps the wire pure ASCII via
+    ``ensure_ascii``). Ack: ``{"ack":"link","ok":true}`` — the stick never
+    echoes the host or token back.
+    """
+    return dumps({"cmd": "link", "host": host, "port": int(port), "token": token})
+
+
+def build_link_clear_frame() -> str:
+    """{"cmd":"link","clear":true} — forget the provisioned device link.
+
+    Carries no secret, so it may ride whichever transport is active (BLE or
+    the TCP link itself — clearing over WiFi is how the stick is told to
+    fall back to BLE). Ack: ``{"ack":"link","ok":true}``.
+    """
+    return dumps({"cmd": "link", "clear": True})
+
+
 def build_ask_evt(
     ask_id: str,
     questions: Sequence[dict],

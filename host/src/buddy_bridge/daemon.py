@@ -3,6 +3,9 @@
 Responsibilities:
   * loopback IPC server on an ephemeral port + endpoint.json handshake
   * persistent BLE link per [ble] mode
+  * WiFi/TCP device link ([device_link]): when the stick's authenticated
+    TCP connection is up it is THE active link (BLE paused, radio freed);
+    the session pipeline is transport-blind
   * heartbeat: 10s keepalive, immediate on-change sends deduped by content
   * timesync frame on connect and daily thereafter
   * device status poll ({"cmd":"status"}) every 15s
@@ -49,6 +52,7 @@ from .cards import (
 from .config import Config
 from .ble.link import SLOW_RETRY_SECS, LinkManager
 from .federation import Federation
+from .link_tcp import DeviceLinkServer
 from .relay import (
     EV_ATTENTION,
     EV_DECISION,
@@ -92,6 +96,7 @@ TICK_SECS = 1.0
 ONDEMAND_CONNECT_SECS = 5.0
 ONDEMAND_DEADLINE_MARGIN_SECS = 10.0
 WIFI_ACK_TIMEOUT_SECS = 10.0  # max wait for the device's {"ack":"wifi",...}
+LINK_ACK_TIMEOUT_SECS = 10.0  # max wait for the device's {"ack":"link",...}
 RELAY_SYNC_SECS = 2.0  # cadence of mirroring local waits to the holder
 RELAY_CARD_RATE_SECS = 10.0  # max 1 remote card per peer per this window
 REMOTE_PENDING_TTL_SECS = 300.0  # forget a peer's pending we never saw resolved
@@ -216,6 +221,11 @@ class Daemon:
         self._ondemand_lock = asyncio.Lock()  # one on-demand gate at a time
         self._wifi_lock = asyncio.Lock()  # one wifi provisioning request at a time
         self._wifi_ack_future: Optional[asyncio.Future] = None
+        # WiFi/TCP device link (None unless [device_link] enabled + token set,
+        # or a live link-provision starts it)
+        self.devlink: Optional[DeviceLinkServer] = None
+        self._link_lock = asyncio.Lock()  # one link provisioning request at a time
+        self._link_ack_future: Optional[asyncio.Future] = None
         self._tasks: list[asyncio.Task] = []
         self._ble_task: Optional[asyncio.Task] = None
         self._stop_evt = asyncio.Event()
@@ -247,6 +257,32 @@ class Daemon:
     def tokens_totals(self) -> tuple[int, int]:
         """(lifetime, today) output-token totals from the persistent ledger."""
         return self.ledger.totals()
+
+    # ---- transport arbitration (BLE vs WiFi device link) ----
+
+    def _devlink_up(self) -> bool:
+        """True while an authenticated WiFi/TCP device connection is live."""
+        return self.devlink is not None and self.devlink.connected
+
+    def _link_connected(self) -> bool:
+        """Transport-blind device-connected state: the WiFi device link when
+        authenticated, the BLE link otherwise. The whole session pipeline
+        (heartbeats, prompts, asks, cards, the relay holder flag) keys off
+        this; only BLE-sharing mechanics (yield) and secret-carrying frames
+        (wifi/link provisioning) look at ``self.link.connected`` directly."""
+        return self._devlink_up() or self.link.connected
+
+    def _active_link(self):
+        """Whichever transport currently carries the device pipe."""
+        return self.devlink if self._devlink_up() else self.link
+
+    @property
+    def link_transport(self) -> str:
+        if self._devlink_up():
+            return "wifi"
+        if self.link.connected:
+            return "ble"
+        return "none"
 
     def _fed_active(self) -> bool:
         """Remote state is merged into the device view only while the relay
@@ -394,6 +430,11 @@ class Daemon:
             "ble_connected": self.link.connected,
             "ble_yielding": self.yielding,
             "idle_yield_min": self.cfg.idle_yield_min,
+            "link_transport": self.link_transport,
+            "device_fw": self.device_fw_version(),
+            "device_link": (
+                self.devlink.status() if self.devlink is not None else {"active": False}
+            ),
             "relay": self.relay.status() if self.relay is not None else {"active": False},
             "federation": {
                 "peers": self.federation.peer_count(),
@@ -447,6 +488,8 @@ class Daemon:
             return await self.handle_set_mode(msg)
         if event == "wifi":
             return await self.handle_wifi(msg)
+        if event == "link":
+            return await self.handle_link(msg)
         log.debug("ipc: unhandled event %r", msg)
         return None
 
@@ -532,7 +575,9 @@ class Daemon:
         if klass not in (ALWAYS_ASK, STRICT):
             return {"decision": ASK}  # default: native prompt handles it
 
-        if self.cfg.ble_mode == "ondemand":
+        # With the WiFi device link up it is THE active link whatever the
+        # BLE mode says (even "off"): gate over it like a connected link.
+        if self.cfg.ble_mode == "ondemand" and not self._devlink_up():
             result = await self._gate_ondemand(msg, agent, sid, tool, tool_input, hint, audit)
             if result is not None:
                 return result
@@ -543,7 +588,8 @@ class Daemon:
             audit(ASK, SOURCE_DAEMON_DOWN)
             return {"decision": ASK}
 
-        if self.cfg.ble_mode == "off" or not self.link.connected:
+        ble_ok = self.cfg.ble_mode != "off" and self.link.connected
+        if not self._devlink_up() and not ble_ok:
             if self._remote_gate_available():
                 return await self._gate_remote(msg, agent, sid, tool, tool_input, hint, audit)
             audit(ASK, SOURCE_DAEMON_DOWN)
@@ -664,9 +710,11 @@ class Daemon:
             return
         await self._send_line(protocol.build_prompt_cancel(wire_id))
 
-    # ---- BLE ----
+    # ---- device link (shared by the BLE and WiFi transports) ----
 
     async def _on_ble_connect(self) -> None:
+        # Fresh-connection routine for BOTH transports (the WiFi device link
+        # re-runs it per authenticated TCP connection: the stick re-hellos).
         # Spec order: hello first (nothing non-v1 before it completes), then
         # the v1 one-shots (time sync, owner), then the first heartbeat.
         if self.yielding:
@@ -710,6 +758,9 @@ class Daemon:
             return
         if ack == "wifi":
             self._resolve_wifi_ack(obj)
+            return
+        if ack == "link":
+            self._resolve_link_ack(obj)
             return
         if isinstance(ack, str):
             # rx acks and command acks ({"ack":"rx","n":...},
@@ -756,6 +807,29 @@ class Daemon:
         )
         self.link.backoff_floor = SLOW_RETRY_SECS
         await self.link.drop_connection()
+
+    # ---- WiFi device link arbitration ----
+
+    async def _on_devlink_up(self) -> None:
+        """An authenticated TCP device connection came up (or replaced the
+        previous one): it becomes THE active link. BLE is paused — the
+        reconnect loop parks and any live connection is released, leaving
+        the stick's radio free for other centrals (e.g. the stock desktop
+        app) — and the same hello negotiation that opens a BLE connection
+        runs over the TCP pipe (``_send_line`` already routes there)."""
+        log.info("devlink: wifi link authenticated; pausing BLE (radio freed)")
+        self.yielding = False  # yield is a BLE-sharing state only
+        self._idle_since = 0.0
+        self.link.set_paused(True)
+        await self.link.drop_connection()
+        await self._on_ble_connect()
+
+    async def _on_devlink_down(self) -> None:
+        """The TCP device connection dropped: resume the BLE reconnect loop
+        immediately (the stick falls back to BLE on its own)."""
+        log.info("devlink: wifi link down; resuming BLE reconnect")
+        self.link.set_paused(False)
+        self.link.wake()
 
     # ---- yield-when-idle (share the stick between machines) ----
 
@@ -899,14 +973,14 @@ class Daemon:
         self._fed_prompt_ids = current
         self._fed_answered &= current
         await self._sync_remote_asks()
-        if self.link.connected:
+        if self._link_connected():
             await self._send_snapshot()
 
     async def _sync_remote_asks(self) -> None:
         """Mirror federated peers' live asks onto the stick (ask cap only).
         Display-only, like local asks: the [NAME] header prefix tells the
         user which machine's CLI is waiting for the real answer."""
-        if not self.cap_active("ask") or not self.link.connected:
+        if not self.cap_active("ask") or not self._link_connected():
             return
         wanted = self.federation.remote_asks()
         for ask_id in [a for a in self._remote_live_asks if a not in wanted]:
@@ -968,7 +1042,7 @@ class Daemon:
             return
         self.relay.reset_state_sync()
         self._relay_force_sync = True  # picked up by the next 1s tick
-        if self.link.connected:
+        if self._link_connected():
             return
         if self.relay.peers.holder() is None and self._local_busy():
             if self.yielding:
@@ -1087,8 +1161,9 @@ class Daemon:
 
     async def _send_line(self, line: str) -> bool:
         """All outbound protocol lines funnel through here so the rxack
-        watch knows bytes went out."""
-        if await self.link.send_line(line):
+        watch knows bytes went out. Routed to whichever transport carries
+        the device pipe (WiFi device link when authenticated, BLE else)."""
+        if await self._active_link().send_line(line):
             self._tx_since_rx = True
             return True
         return False
@@ -1165,7 +1240,7 @@ class Daemon:
         rides state_sync). Display-only (PROTOCOL_V2.md): the user still
         answers in the CLI; with no stick anywhere, silently do nothing."""
         self.wake_from_yield()  # a question at the keyboard is local activity
-        local_ok = self.cap_active("ask") and self.link.connected
+        local_ok = self.cap_active("ask") and self._link_connected()
         fed_ok = self._remote_gate_available()
         if not local_ok and not fed_ok:
             return
@@ -1258,6 +1333,14 @@ class Daemon:
         if not is_list and not is_clear and not ssid:
             return {"ok": False, "error": "missing ssid"}
         if not self.link.connected:
+            # WiFi credentials only ever ride the encrypted BLE pipe — the
+            # TCP device link is plaintext after its HMAC handshake.
+            if self._devlink_up():
+                return {
+                    "ok": False,
+                    "error": "device is linked over WiFi; WiFi credentials only ride "
+                             "the encrypted BLE link",
+                }
             return {"ok": False, "error": "device not connected"}
         if not self.v2_active:
             return {"ok": False, "error": "device firmware is v1-only (wifi needs protocol v2)"}
@@ -1315,7 +1398,13 @@ class Daemon:
         failed or nothing came back within ``timeout``, default
         WIFI_ACK_TIMEOUT_SECS). Serialized by ``_wifi_lock`` so a second
         concurrent call — including a bulk import's sequential sends —
-        can't steal the first call's pending ack future."""
+        can't steal the first call's pending ack future.
+
+        Pinned to the BLE transport (never ``_send_line``'s active-link
+        routing): wifi frames can carry credentials, which must never ride
+        the plaintext TCP device link — even in a transient state where
+        both transports are live (handle_wifi's guard already requires
+        BLE)."""
         if timeout is None:
             timeout = WIFI_ACK_TIMEOUT_SECS
         async with self._wifi_lock:
@@ -1323,8 +1412,9 @@ class Daemon:
             fut: asyncio.Future = loop.create_future()
             self._wifi_ack_future = fut
             try:
-                if not await self._send_line(frame):
+                if not await self.link.send_line(frame):
                     return None
+                self._tx_since_rx = True
                 return await asyncio.wait_for(fut, timeout)
             except asyncio.TimeoutError:
                 return None
@@ -1334,6 +1424,142 @@ class Daemon:
 
     def _resolve_wifi_ack(self, obj: dict[str, Any]) -> None:
         fut = self._wifi_ack_future
+        if fut is not None and not fut.done():
+            fut.set_result(obj)
+
+    # ---- device-link provisioning ----
+
+    async def handle_link(self, msg: dict[str, Any]) -> dict[str, Any]:
+        """IPC "link" event: provision (or clear) the WiFi/TCP device link.
+
+        Provisioning carries the device-link token, so it ONLY rides the
+        encrypted BLE pipe — never the TCP link itself (plaintext after its
+        HMAC handshake). ``clear`` carries nothing secret and may ride
+        whichever transport is active — clearing over WiFi is how the stick
+        is told to fall back to BLE. ``msg`` carries the token: never pass
+        it to a log call, only host/port are safe to mention.
+        """
+        if msg.get("clear"):
+            if not self._link_connected():
+                return {"ok": False, "error": "device not connected"}
+            if not self.v2_active:
+                return {"ok": False,
+                        "error": "device firmware is v1-only (device link needs protocol v2)"}
+            log.info("daemon: device-link clear requested")
+            ack = await self._send_link_op(protocol.build_link_clear_frame())
+            return self._link_ack_resp(ack)
+
+        host = str(msg.get("host") or "")
+        port = msg.get("port")
+        token = str(msg.get("token") or "")
+        if (
+            not host
+            or not token
+            or not isinstance(port, int)
+            or isinstance(port, bool)
+            or not (0 < port < 65536)
+        ):
+            return {"ok": False, "error": "missing host/port/token"}
+        if not self.link.connected:
+            if self._devlink_up():
+                return {
+                    "ok": False,
+                    "error": "device is linked over WiFi; provisioning rides the encrypted "
+                             "BLE link (link-provision --clear first, then reconnect BLE)",
+                }
+            return {"ok": False, "error": "device not connected"}
+        if not self.v2_active:
+            return {"ok": False,
+                    "error": "device firmware is v1-only (device link needs protocol v2)"}
+        error = await self._ensure_devlink(port, token)
+        if error:
+            return {"ok": False, "error": error}
+        log.info("daemon: device-link provisioning requested (host=%r port=%d)", host, port)
+        # ble_only: even in a transient both-transports-live state the token
+        # must never route to the plaintext TCP pipe.
+        ack = await self._send_link_op(
+            protocol.build_link_frame(host, port, token), ble_only=True
+        )
+        return self._link_ack_resp(ack)
+
+    @staticmethod
+    def _link_ack_resp(ack: Optional[dict[str, Any]]) -> dict[str, Any]:
+        if ack is None:
+            return {"ok": False, "error": "device did not acknowledge within timeout"}
+        resp: dict[str, Any] = {"ok": ack.get("ok") is True}
+        if not resp["ok"]:
+            error = ack.get("error")
+            if isinstance(error, str) and error:
+                resp["error"] = error
+        return resp
+
+    async def _ensure_devlink(self, port: int, token: str) -> Optional[str]:
+        """Make the WiFi listener live for (port, token) BEFORE the stick is
+        told to use it: reuse a matching running listener, else (re)bind.
+        The cfg view is mirrored on success so status reflects reality (the
+        CLI already persisted the config to disk)."""
+        if self.devlink is None or self.devlink.port != port or self.devlink.token != token:
+            old, self.devlink = self.devlink, None
+            if old is not None:
+                await old.stop()
+            error = await self._start_devlink(port, token)
+            if error:
+                return error
+        self.cfg.device_link_enabled = True
+        self.cfg.device_link_port = port
+        self.cfg.device_link_token = token
+        return None
+
+    async def _start_devlink(self, port: int, token: str) -> Optional[str]:
+        """Bind the device-link listener. Only ever called with a non-empty
+        token ([device_link] active, or a provision request that minted
+        one). Returns an error string instead of raising."""
+        server = DeviceLinkServer(
+            port=port,
+            token=token,
+            on_line=self._on_ble_line,
+            on_up=self._on_devlink_up,
+            on_down=self._on_devlink_down,
+        )
+        try:
+            await server.start()
+        except OSError as exc:
+            return f"device-link bind failed: {exc}"
+        self.devlink = server
+        return None
+
+    async def _send_link_op(
+        self, frame: str, timeout: Optional[float] = None, *, ble_only: bool = False
+    ) -> Optional[dict[str, Any]]:
+        """Send a pre-built ``{"cmd":"link",...}`` frame and wait for the
+        device's ``{"ack":"link",...}`` object (None when the send failed or
+        nothing came back within ``timeout``, default LINK_ACK_TIMEOUT_SECS).
+        Serialized by ``_link_lock`` like the wifi ops. ``ble_only`` pins the
+        send to the BLE transport (token-carrying provision frames)."""
+        if timeout is None:
+            timeout = LINK_ACK_TIMEOUT_SECS
+        async with self._link_lock:
+            loop = asyncio.get_running_loop()
+            fut: asyncio.Future = loop.create_future()
+            self._link_ack_future = fut
+            try:
+                if ble_only:
+                    sent = await self.link.send_line(frame)
+                    if sent:
+                        self._tx_since_rx = True
+                else:
+                    sent = await self._send_line(frame)
+                if not sent:
+                    return None
+                return await asyncio.wait_for(fut, timeout)
+            except asyncio.TimeoutError:
+                return None
+            finally:
+                if self._link_ack_future is fut:
+                    self._link_ack_future = None
+
+    def _resolve_link_ack(self, obj: dict[str, Any]) -> None:
+        fut = self._link_ack_future
         if fut is not None and not fut.done():
             fut.set_result(obj)
 
@@ -1354,7 +1580,7 @@ class Daemon:
         return accepted
 
     async def _flush_cards(self) -> None:
-        if not self.cap_active("ntfy") or not self.link.connected:
+        if not self.cap_active("ntfy") or not self._link_connected():
             return
         card = self.cards.pop()
         if card is None:
@@ -1369,7 +1595,7 @@ class Daemon:
             await asyncio.sleep(TICK_SECS)
             try:
                 await self.tick()
-                if not self.link.connected:
+                if not self._link_connected():
                     continue
                 now = time.monotonic()
                 await self._send_snapshot()  # sends on change or 10s keepalive
@@ -1400,24 +1626,36 @@ class Daemon:
         """Send-side dead-link detection (PROTOCOL_V2.md rxack): we have sent
         bytes but seen no rx-ack (or any other traffic) for >20s -> the device
         stopped listening; drop the link so the reconnect loop revives it."""
-        if not self.cap_active("rxack") or not self.link.connected:
+        if not self.cap_active("rxack") or not self._link_connected():
             return
         if not self._tx_since_rx or not self._rx_last_ts:
             return
         if time.monotonic() - self._rx_last_ts <= protocol.RXACK_DEAD_SECS:
             return
         log.warning(
-            "ble: sends unacknowledged for >%.0fs (rxack), declaring link dead",
+            "link: sends unacknowledged for >%.0fs (rxack), declaring %s link dead",
             protocol.RXACK_DEAD_SECS,
+            self.link_transport,
         )
         self._tx_since_rx = False
-        await self.link.drop_connection()
+        await self._active_link().drop_connection()
 
     # ---- lifecycle ----
 
     async def start_background(self) -> list[asyncio.Task]:
         """Extra long-running tasks (adapters, relay)."""
         tasks: list[asyncio.Task] = []
+        if self.cfg.device_link_enabled and not self.cfg.device_link_active:
+            log.warning(
+                "devlink: [device_link] enabled but token is empty — listener stays OFF "
+                "(run `buddy-bridge link-provision` to mint one)"
+            )
+        if self.cfg.device_link_active:
+            error = await self._start_devlink(
+                self.cfg.device_link_port, self.cfg.device_link_token
+            )
+            if error:
+                log.warning("devlink: disabled for this run (%s)", error)
         if self.cfg.relay_enabled and not self.cfg.relay_active:
             log.warning(
                 "relay: [relay] enabled but token is empty — relay stays OFF "
@@ -1429,7 +1667,9 @@ class Daemon:
                 host_name=self.cfg.host_name,
                 port=self.cfg.relay_port,
                 token=self.cfg.relay_token,
-                is_holder=lambda: self.link.connected,
+                # Transport-blind: holder = whoever has the active device
+                # link, WiFi or BLE (wifi-holding must federate too).
+                is_holder=self._link_connected,
                 on_peer_event=self._on_peer_event,
                 on_holder_view=self._on_relay_holder_view,
                 static_peers=self.cfg.relay_peers,
@@ -1497,6 +1737,8 @@ class Daemon:
                     await task
             if self.relay is not None:
                 await self.relay.stop()
+            if self.devlink is not None:
+                await self.devlink.stop()
             await self.link.stop()
             await self.ipc.stop()
             with contextlib.suppress(Exception):

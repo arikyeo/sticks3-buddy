@@ -81,6 +81,11 @@ class Config:
     # unicast too — overlay networks (Tailscale/WireGuard) have no broadcast
     relay_peers: tuple[str, ...] = ()
     relay_name_short: str = ""  # <= 6 chars shown as the [NAME] title prefix
+    # [device_link] (WiFi/TCP transport for the stick: off by default,
+    # zero sockets unless enabled AND a token is set)
+    device_link_enabled: bool = False
+    device_link_port: int = 48902
+    device_link_token: str = ""  # link authority; listener stays OFF while empty
 
     home: Path = field(default_factory=bridge_home)
 
@@ -93,6 +98,13 @@ class Config:
         """The relay requires BOTH the enable flag and a non-empty shared
         token — an unauthenticated LAN listener must be impossible."""
         return self.relay_enabled and bool(self.relay_token.strip())
+
+    @property
+    def device_link_active(self) -> bool:
+        """The device link requires BOTH the enable flag and a non-empty
+        token — same rule as the relay: an unauthenticated LAN listener
+        must be impossible."""
+        return self.device_link_enabled and bool(self.device_link_token.strip())
 
 
 def _get_str(table: dict, key: str, default: str) -> str:
@@ -155,6 +167,9 @@ def load_config(home: Path | None = None, create: bool = True) -> Config:
     timeouts = data.get("timeouts", {}) if isinstance(data.get("timeouts"), dict) else {}
     cards = data.get("cards", {}) if isinstance(data.get("cards"), dict) else {}
     relay = data.get("relay", {}) if isinstance(data.get("relay"), dict) else {}
+    device_link = (
+        data.get("device_link", {}) if isinstance(data.get("device_link"), dict) else {}
+    )
 
     cfg.host_id = _get_str(host, "id", "")
     cfg.host_name = _get_str(host, "name", "")
@@ -196,6 +211,12 @@ def load_config(home: Path | None = None, create: bool = True) -> Config:
     cfg.relay_token = _get_str(relay, "token", "")
     cfg.relay_peers = _get_str_list(relay, "peers")
     cfg.relay_name_short = _get_str(relay, "name_short", "")
+
+    cfg.device_link_enabled = _get_bool(device_link, "enabled", False)
+    cfg.device_link_port = _get_int(device_link, "port", 48902)
+    if not (0 < cfg.device_link_port < 65536):
+        cfg.device_link_port = 48902
+    cfg.device_link_token = _get_str(device_link, "token", "")
 
     changed = False
     if not cfg.host_id:
@@ -264,6 +285,10 @@ def to_toml(cfg: Config) -> str:
         f"token = {_toml_str(cfg.relay_token)}\n"
         f"peers = [{relay_peers}]\n"
         f"name_short = {_toml_str(cfg.relay_name_short)}\n"
+        "\n[device_link]\n"
+        f"enabled = {b(cfg.device_link_enabled)}\n"
+        f"port = {cfg.device_link_port}\n"
+        f"token = {_toml_str(cfg.device_link_token)}\n"
     )
 
 

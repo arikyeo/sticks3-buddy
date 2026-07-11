@@ -139,6 +139,10 @@ class LinkManager:
         self.address = address.strip()
         self.mode = mode
         self.backoff_floor = 0.0
+        # Device-link arbitration (daemon-owned via set_paused): True parks
+        # the connect loop and refuses ondemand arming while the WiFi
+        # transport owns the device, leaving the stick's BLE radio free.
+        self.paused = False
         self._backoff = BACKOFF_BASE_SECS
         self._client = None  # BleakClient | None
         self._assembler = LineAssembler()
@@ -185,6 +189,14 @@ class LinkManager:
         self._want_evt.clear()
         await self.drop_connection()
 
+    def set_paused(self, paused: bool) -> None:
+        """Park/resume the connect loop (WiFi device-link arbitration).
+        Pausing does not drop an existing connection — the daemon does that
+        explicitly; resuming pokes the loop so the next connect attempt (or
+        a parked backoff sleep ending early) happens immediately."""
+        self.paused = bool(paused)
+        self._poke()
+
     def wake(self) -> None:
         """Reset the reconnect backoff to base and interrupt any backoff
         sleep in progress so the next connect attempt happens immediately.
@@ -196,7 +208,7 @@ class LinkManager:
 
     async def ensure_connected(self, timeout: float) -> bool:
         """Arm an ondemand connection and wait for it. True when connected."""
-        if self.mode == "off":
+        if self.mode == "off" or self.paused:
             return False
         self._want_evt.set()
         self._poke()
@@ -240,7 +252,11 @@ class LinkManager:
         self._backoff = BACKOFF_BASE_SECS
         consecutive_misses = 0
         while not self._stop_evt.is_set():
-            if self.mode == "off" or (self.mode == "ondemand" and not self._want_evt.is_set()):
+            if (
+                self.paused
+                or self.mode == "off"
+                or (self.mode == "ondemand" and not self._want_evt.is_set())
+            ):
                 await self._wait_poke()
                 continue
             from bleak import BleakClient
@@ -299,10 +315,12 @@ class LinkManager:
                     time.monotonic() - connect_ts >= STABLE_CONNECTION_SECS
                 ):
                     self._backoff = BACKOFF_BASE_SECS
-                if self.mode == "off" or (
-                    self.mode == "ondemand" and not self._want_evt.is_set()
+                if (
+                    self.paused
+                    or self.mode == "off"
+                    or (self.mode == "ondemand" and not self._want_evt.is_set())
                 ):
-                    continue  # released/switched off: idle instead of backing off
+                    continue  # paused/released/switched off: idle instead of backing off
                 await self._sleep(max(self._backoff, self.backoff_floor))
                 self._backoff = min(self._backoff * 2, BACKOFF_MAX_SECS)
 
