@@ -1,13 +1,15 @@
 """buddy-bridge CLI.
 
-Subcommands: daemon | status | probe | pair | mode | wifi | sessions |
-hooks install/uninstall claude|codex | service install/uninstall | doctor | setup
+Subcommands: daemon | status | probe | pair | mode | wifi | link-provision |
+sessions | hooks install/uninstall claude|codex | service install/uninstall |
+doctor | setup
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import secrets
 import sys
 from pathlib import Path
 
@@ -52,6 +54,20 @@ def main(argv: list[str] | None = None) -> int:
         "--import", dest="import_file", metavar="FILE",
         help="bulk-import networks from a JSON/CSV/TSV/wpa_supplicant file"
     )
+    p_link = sub.add_parser(
+        "link-provision",
+        help="provision the WiFi/TCP device link on the connected buddy (BLE required)",
+    )
+    p_link.add_argument(
+        "--host", help="IP/name the stick should connect to (this machine's LAN IP when omitted)"
+    )
+    p_link.add_argument(
+        "--port", type=int, help="bridge listener port (default: [device_link] port, 48902)"
+    )
+    p_link.add_argument(
+        "--clear", action="store_true",
+        help="clear the provisioned device link from the stick (back to BLE only)"
+    )
     p_hooks = sub.add_parser("hooks", help="install/uninstall agent hooks")
     p_hooks.add_argument("action", choices=("install", "uninstall"))
     p_hooks.add_argument("agent", choices=("claude", "codex"))
@@ -69,6 +85,7 @@ def main(argv: list[str] | None = None) -> int:
         "pair": cmd_pair,
         "mode": cmd_mode,
         "wifi": cmd_wifi,
+        "link-provision": cmd_link_provision,
         "hooks": cmd_hooks,
         "service": cmd_service,
         "doctor": cmd_doctor,
@@ -380,6 +397,77 @@ def _cmd_wifi_import(import_file: str, home: Path) -> int:
         "-- it stores passwords in plain text"
     )
     return 0 if imported == len(entries) else 1
+
+
+_LINK_REQUEST_TIMEOUT_SECS = 12.0  # > daemon's own 10s device-ack wait + IPC headroom
+
+
+def cmd_link_provision(args: argparse.Namespace) -> int:
+    """Provision the WiFi/TCP device link: mint the [device_link] token if
+    missing (persisted to the config, NEVER printed anywhere), make sure the
+    listener config is on, and send the endpoint to the connected buddy over
+    the encrypted BLE link. ``--clear`` tells the stick to forget the link
+    and stick to BLE."""
+    home = bridge_home()
+    if load_live_endpoint(home) is None:
+        print("daemon: not running (start it with `buddy-bridge daemon`)")
+        return 1
+    if args.clear:
+        if args.host or args.port is not None:
+            print("link-provision: --clear takes no --host/--port")
+            return 1
+        resp = _daemon_request({"event": "link", "clear": True}, _LINK_REQUEST_TIMEOUT_SECS)
+        if resp is None:
+            print("daemon: not running")
+            return 1
+        if not resp.get("ok"):
+            print(f"link-provision: {resp.get('error') or 'device rejected the request'}")
+            return 1
+        print("link-provision: device link cleared (the stick is back to BLE only)")
+        return 0
+
+    cfg = load_config()
+    changed = False
+    if args.port is not None:
+        if not (0 < args.port < 65536):
+            print("link-provision: invalid --port")
+            return 1
+        if cfg.device_link_port != args.port:
+            cfg.device_link_port = args.port
+            changed = True
+    if not cfg.device_link_token.strip():
+        # Link authority: lives in the config file only, never on stdout.
+        cfg.device_link_token = secrets.token_urlsafe(32)
+        changed = True
+    if not cfg.device_link_enabled:
+        cfg.device_link_enabled = True
+        changed = True
+    if changed:
+        save_config(cfg)
+
+    host = (args.host or "").strip()
+    if not host:
+        from .link_tcp import detect_host_ip
+
+        host = detect_host_ip()
+    if not host:
+        print("link-provision: could not autodetect this machine's LAN IP; "
+              "pass --host <ip-or-name>")
+        return 1
+    resp = _daemon_request(
+        {"event": "link", "host": host, "port": cfg.device_link_port,
+         "token": cfg.device_link_token},
+        _LINK_REQUEST_TIMEOUT_SECS,
+    )
+    if resp is None:
+        print("daemon: not running")
+        return 1
+    if not resp.get("ok"):
+        print(f"link-provision: {resp.get('error') or 'device rejected the request'}")
+        return 1
+    print(f"link-provision: device link provisioned ({host}:{cfg.device_link_port})")
+    print("the stick will use WiFi when powered and in range, and fall back to BLE otherwise")
+    return 0
 
 
 def cmd_hooks(args: argparse.Namespace) -> int:
