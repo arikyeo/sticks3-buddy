@@ -351,21 +351,37 @@ Device-side additions for the optional WiFi OTA flow (`-DBUDDY_OTA`
 builds). These are firmware extensions, not part of the negotiated v2
 capability set — hosts don't need to know about them to be conformant.
 
-- **`{"cmd":"wifi","ssid":"...","pass":"..."}`** — store WiFi credentials
-  in the device's NVS for later OTA use. Post-hello only (pre-hello it
-  falls into the v1 unknown-cmd swallow, like `prompt_cancel`); accepted
-  over the encrypted BLE link or USB serial. `pass` is optional (open
-  network). Limits: `ssid` ≤ 32 bytes, `pass` ≤ 63 bytes (802.11 maxima).
-  Ack: `{"ack":"wifi","ok":true|false}` — `false` for a missing/oversize
-  field or an NVS write failure. **The credentials are never echoed** — not
-  in the ack, not in `status`, not in `debug_state`, not on the debug
-  serial log. Every board tier accepts and stores the command (creds can
-  be provisioned before flashing an `-ota` build); only `BUDDY_OTA` builds
-  read them back. Factory reset wipes them; forget-host does not.
-  Host-side senders: `buddy-bridge wifi <ssid>` (reference bridge,
-  password via getpass — see host/README.md), the
+- **`{"cmd":"wifi",...}`** — manage the device's stored WiFi network LIST
+  (LittleFS-backed, up to 256 networks, deduplicated by ssid). Post-hello
+  only (pre-hello it falls into the v1 unknown-cmd swallow, like
+  `prompt_cancel`); accepted over the encrypted BLE link or USB serial.
+  Forms:
+  - `{"cmd":"wifi","ssid":"X","pass":"Y"}` — upsert (add, or replace the
+    stored password for that ssid). `pass` optional (open network).
+    Limits: `ssid` ≤ 32 bytes, `pass` ≤ 63 bytes (802.11 maxima).
+    Ack `{"ack":"wifi","ok":true,"n":<count>}`; at capacity the ack is
+    `{"ack":"wifi","ok":false,"error":"full","n":256}` (no eviction).
+  - `{"cmd":"wifi","ssid":"X","remove":true}` — remove by ssid; ack ok+n.
+  - `{"cmd":"wifi","clear":true}` — wipe the list; ack ok, n:0.
+  - `{"cmd":"wifi","list":true}` — ack
+    `{"ack":"wifi","ok":true,"ssids":[...],"n":N}` (**names only**, plus
+    `trunc:true` if the name list was cut to fit the line budget).
+  **Passwords are never echoed** — not in any ack, not in `status`, not in
+  `debug_state`, not on the debug serial log, and the LittleFS file is
+  unreachable over the folder-push/transfer protocol. Every board tier
+  accepts and stores the commands; only `BUDDY_OTA` builds read the list
+  back (join = one scan, strongest-RSSI known network first, then the
+  next visible one). Factory reset wipes the list; forget-host does not.
+  Host-side senders: `buddy-bridge wifi <ssid>` plus
+  `--import <file>` (JSON/CSV/TSV/wpa_supplicant bulk load), `--list`,
+  `--remove`, `--clear` (see host/README.md), the
   `tools/test_protocol.py --wifi SSID PASS` harness, or any raw JSON
   line over serial/BLE.
+- **OTA release discovery is API-free**: the device resolves the latest
+  version from the 302 `Location` of
+  `github.com/<repo>/releases/latest/download/firmware.bin` (no
+  api.github.com call, no unauthenticated rate limit) and downloads that
+  exact versioned asset.
 - **`ntfy` card kind `"update"`** — a host that watches this repo's
   releases may push `{"evt":"ntfy","kind":"update","title":...,"body":...}`
   when a newer firmware is published (the reference bridge does, via its
