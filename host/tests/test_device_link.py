@@ -149,6 +149,21 @@ async def _finish(reader, task):
     await task
 
 
+async def _settle_until(pred, *, tries=200):
+    """Yield the event loop until a (cheap, boolean) predicate holds, or give
+    up. Some cross-connection side effects — the old writer being closed by
+    the replacing connection, an on_down callback firing — land a couple of
+    loop ticks after the awaited call returns, and fixed sleeps race that on
+    Windows' ProactorEventLoop. This only polls booleans (never awaits a
+    production task), so it can never deadlock: worst case it returns False
+    and the assertion fails fast, exactly like a bare assert would."""
+    for _ in range(tries):
+        if pred():
+            return True
+        await asyncio.sleep(0)
+    return pred()
+
+
 async def test_auth_accept_acks_and_fires_on_up():
     ups = []
 
@@ -221,7 +236,9 @@ async def test_newest_wins_replaces_previous_connection():
     server = _server(on_up=on_up, on_down=on_down)
     reader_a, writer_a, task_a = await _connect(server)
     reader_b, writer_b, task_b = await _connect(server)
-    assert writer_a.closed is True  # old closed with the newest taking over
+    # B closes A's writer from inside its own coroutine, a tick or two after
+    # B's _connect settle returns — poll rather than assume it already ran.
+    assert await _settle_until(lambda: writer_a.closed)  # newest took over
     assert server.connected is True
     assert ups == [1, 1]  # hello renegotiation runs per-connection
     await _finish(reader_a, task_a)
@@ -229,7 +246,7 @@ async def test_newest_wins_replaces_previous_connection():
     assert await server.send_line('{"to":"b"}')
     assert writer_b.lines()[-1] == {"to": "b"}
     await _finish(reader_b, task_b)
-    assert downs == [1] and server.connected is False
+    assert await _settle_until(lambda: downs == [1] and server.connected is False)
 
 
 async def test_drop_connection_fires_on_down_stop_does_not():
@@ -243,13 +260,13 @@ async def test_drop_connection_fires_on_down_stop_does_not():
     await server.drop_connection()
     assert writer.closed is True
     await _finish(reader, task)
-    assert downs == [1] and server.connected is False
+    assert await _settle_until(lambda: downs == [1] and server.connected is False)
 
     server2 = _server(on_down=on_down)
     reader2, writer2, task2 = await _connect(server2)
     await server2.stop()  # daemon shutdown: no resume callback wanted
     await _finish(reader2, task2)
-    assert downs == [1]
+    assert downs == [1]  # stop() must NOT fire the down callback
 
 
 async def test_auth_failures_rate_limit_that_ip_only():
