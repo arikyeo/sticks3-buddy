@@ -15,6 +15,7 @@
 #include "ble_bridge.h"
 #include "data.h"
 #include "buddy.h"
+#include "audio/motifs.h"  // sound vocabulary: event motifs + pure scheduler
 #ifdef BUDDY_EXTRAS_FULL
 #include "audio/tunes.h"   // tune engine + slot registry (8MB boards only)
 #include "ir/ir_remote.h"  // raw RMT learn/replay (8MB boards only)
@@ -197,19 +198,48 @@ static void beep(uint16_t freq, uint16_t dur) {
 
 #ifdef BUDDY_EXTRAS_FULL
 // Jingle wrapper: play a tune slot when the tunes setting is on, volume is
-// up and the slot has data; false = caller falls back to the classic beep.
+// up and the slot has data; false = caller falls back to the motif player.
 static bool tunesJingle(const Tune* t) {
   if (!settings().tune || !settings().vol) return false;
   if (!t || !(t->len || t->pcm)) return false;
   jingleStart(t);
   return true;
 }
-#define TUNE_OR_BEEP(slot, f, d) do { if (!tunesJingle(slot)) beep((f), (d)); } while (0)
-#else
-// Non-FULL boards keep the classic beep as the only sound engine; the
-// slot token is never expanded, so SLOT_* needn't exist here.
-#define TUNE_OR_BEEP(slot, f, d) beep((f), (d))
 #endif
+
+// Event sound dispatch (see audio/motifs.h for the vocabulary table).
+// FULL builds route the four slot-mapped moments through the tune engine
+// when tunes are on; everything else — and every event on non-FULL
+// boards — plays its motif via the async player below (loop() ticks it,
+// beep() sounds each note, so s_vol gates every path).
+static MotifPlayer _motif = { 0, 0, 0 };
+static void soundEvent(uint8_t ev) {
+  if (!settings().vol) return;
+#ifdef BUDDY_EXTRAS_FULL
+  const Tune* slot = ev == MOTIF_PROMPT  ? SLOT_ALERT
+                   : ev == MOTIF_APPROVE ? SLOT_APPROVE
+                   : ev == MOTIF_DENY    ? SLOT_DENY
+                   : (ev == MOTIF_DONE || ev == MOTIF_OTA_OK) ? SLOT_DONE
+                   : (const Tune*)nullptr;
+  if (slot && tunesJingle(slot)) return;
+#endif
+  motifStart(&_motif, ev, millis());
+}
+
+// Blocking variant for the one spot that can't use the async player above:
+// the OTA flow (menu > update...) is a single blocking call chain from
+// consent to reboot-or-return with no loop() ticks in between, so neither
+// motifTick() nor tunesJingle() (tuneTick()-driven too) would ever get to
+// sound anything past a motif's first note. Same table, same s_vol gate
+// (inherited from beep()), just driven by delay() between notes instead.
+static void soundEventBlocking(uint8_t ev) {
+  if (ev >= MOTIF_COUNT) return;
+  const Motif& m = MOTIFS[ev];
+  for (uint8_t i = 0; i < m.len; i++) {
+    beep(m.n[i].freq, m.n[i].durMs);
+    delay(m.n[i].durMs + m.n[i].gapMs);
+  }
+}
 
 static void sendCmd(const char* json) {
   Serial.println(json);
@@ -217,10 +247,11 @@ static void sendCmd(const char* json) {
   bleWrite((const uint8_t*)json, n);
   bleWrite((const uint8_t*)"\n", 1);
 }
-const uint8_t INFO_PAGES = 7;
+const uint8_t INFO_PAGES = 8;
 const uint8_t INFO_PG_BUTTONS = 1;
 const uint8_t INFO_PG_HOSTS   = 5;
 const uint8_t INFO_PG_CREDITS = 6;
+const uint8_t INFO_PG_SOUNDS  = 7;
 
 void applyDisplayMode() {
   bool peek = displayMode != DISP_NORMAL;
@@ -607,11 +638,22 @@ static void otaDrawProgress(const char* status, int pct) {
   spr.pushSprite(0, 0);
 }
 
+// Cross-TU sound hook for ota.cpp (mirrors the otaDrawProgress pixel hook
+// just above): the whole flow past otaStart is one blocking call chain
+// with no loop() ticks, so ota.cpp can't reach soundEvent()/motifTick()
+// either — it calls back into this instead. ok=true only on the success
+// path (device reboots right after); false covers every failure return,
+// "already up to date" included — the on-screen message disambiguates.
+static void otaSoundOutcome(bool ok) {
+  soundEventBlocking(ok ? MOTIF_OTA_OK : MOTIF_OTA_FAIL);
+}
+
 // menu > update... — the consent step. Blocks until flashed (device
 // reboots inside otaRun) or failed/up-to-date, which lands back here.
 static void otaStart() {
+  soundEventBlocking(MOTIF_OTA_START);   // double mid: "update starting"
   char err[64];
-  otaRun(otaDrawProgress, err, sizeof(err));
+  otaRun(otaDrawProgress, otaSoundOutcome, err, sizeof(err));
   // Only failure paths return. Leave the message up long enough to read,
   // then hand the screen back to the normal render loop.
   otaDrawProgress(err[0] ? err : "update failed", -1);
@@ -1373,7 +1415,7 @@ void drawInfo() {
       ln("  window   %lus left", (unsigned long)((left + 999) / 1000));
     }
 
-  } else {
+  } else if (infoPage == INFO_PG_CREDITS) {
     _infoHeader(p, y, "CREDITS", infoPage);
     spr.setTextColor(p.textDim, p.bg);
     ln("made by");
@@ -1396,6 +1438,38 @@ void drawInfo() {
     ln("ESP32-S3 + BMI270");
 #else
     ln("ESP32 + MPU6886");
+#endif
+
+  } else {
+    // SOUNDS: the sound-vocabulary legend (audio/motifs.h) — what each
+    // motif reads as — plus a compact key for the dashboard's non-text
+    // glyphs (state-bar color, C/X agent badge). FULL builds also wire
+    // B-long here to play the whole vocabulary in order (soundDemoAll,
+    // BtnB.pressedFor(600) below) so discoverability doesn't require
+    // memorizing this page.
+    _infoHeader(p, y, "SOUNDS", infoPage);
+    spr.setTextColor(p.textDim, p.bg);
+    ln("3 rising = approval");
+    ln("1 high = approved");
+    ln("1 low = denied");
+    ln("2 rising = done");
+    ln("1 soft = new card");
+    ln("rise pair = host on");
+    ln("fall pair = host off");
+    ln("1 tone = pair code");
+#ifdef BUDDY_OTA
+    ln("2 mid = updating");
+    ln("3 low = update fail");
+#endif
+    y += 6;
+    spr.setTextColor(p.text, p.bg);
+    ln("GLYPHS: bar=wait/run/");
+    spr.setTextColor(p.textDim, p.bg);
+    ln(" done, amber/grn/blue");
+    ln(" C=claude  X=codex");
+#ifdef BUDDY_EXTRAS_FULL
+    y += 4;
+    ln("hold B: hear all");
 #endif
   }
 }
@@ -2196,6 +2270,34 @@ void setup() {
   esp_task_wdt_add(NULL);        // watch this (loop) task
 }
 
+#ifdef BUDDY_EXTRAS_FULL
+// SOUNDS info page demo (B-long): play the whole vocabulary in the same
+// order it's listed on screen, back to back, so discoverability doesn't
+// require memorizing the legend. Deliberately gated behind FULL — a rarely
+// used discoverability aid is the first thing to cut if the plain board
+// ever runs flash-tight. OTA_OK is skipped: it's the documented DONE alias
+// (motifs.h), so it would just repeat a sound already heard. Blocking
+// (soundEventBlocking), but checked between notes so an arriving prompt
+// still preempts within one motif's length rather than the whole ~3s
+// sequence — same "approval overlay always wins" guarantee as everywhere
+// else, just re-checked more coarsely here.
+static void soundDemoAll() {
+  if (!settings().vol) { showToast("muted"); return; }
+  static const uint8_t DEMO[] = {
+    MOTIF_PROMPT, MOTIF_APPROVE, MOTIF_DENY, MOTIF_DONE, MOTIF_CARD,
+    MOTIF_CONNECT, MOTIF_DISCONNECT, MOTIF_PASSKEY,
+#ifdef BUDDY_OTA
+    MOTIF_OTA_START, MOTIF_OTA_FAIL,
+#endif
+  };
+  for (uint8_t i = 0; i < sizeof(DEMO); i++) {
+    if (tama.promptId[0]) return;   // let an arriving prompt cut it short
+    soundEventBlocking(DEMO[i]);
+    delay(180);   // gap between motifs, distinct from any motif's own notes
+  }
+}
+#endif
+
 void loop() {
   esp_task_wdt_reset();   // pet the watchdog; loop normally cycles <100ms
   board::update();
@@ -2204,6 +2306,13 @@ void loop() {
 #endif
   t++;
   uint32_t now = millis();
+
+  // Async motif player (audio/motifs.h): sound the next due note, if any.
+  // beep() gates on s_vol, so a mid-motif mute silences the tail too.
+  {
+    const MotifNote* mn = motifTick(&_motif, now);
+    if (mn) beep(mn->freq, mn->durMs);
+  }
 
   blePairingTick(now); // pairing-window expiry + post-evict adv fallback
   hostGluePoll(now);   // multi-host policy engine (soft-pin, pairing window)
@@ -2219,6 +2328,16 @@ void loop() {
     }
   }
   dataPoll(&tama);
+  // Host link sound: edge-triggered off the same tama.connected the HUD
+  // and dashboard already show as "host linked" / "no host" — rising pair
+  // on link-up, falling pair on link-loss. No wake(): ambient status, not
+  // a summons (same call as the ntfy card chirp above). Demo mode always
+  // reports connected (data.h dataPoll), so it never spams this.
+  static bool wasHostConnected = false;
+  if (tama.connected != wasHostConnected) {
+    soundEvent(tama.connected ? MOTIF_CONNECT : MOTIF_DISCONNECT);
+    wasHostConnected = tama.connected;
+  }
   if (statsPollLevelUp()) triggerOneShot(P_CELEBRATE, 3000);
   baseState = derive(tama);
 
@@ -2275,30 +2394,15 @@ void loop() {
 
   // 'Task complete' chime: paired with the celebrate animation. The buddy is
   // the visual notification, but without an audio cue you miss it entirely
-  // when looking at another screen. Respects settings().vol via beep()
-  // (vol 0 = mute drops the tones entirely).
-  //
-  // Two-note ascending chime (2000 Hz → 2800 Hz, the universal "ta-da" of
-  // completion sounds) so it doesn't collide with the existing single-tone
-  // palette (600 deny / 1200 prompt / 1800 cycle / 2400 approve). Note 2 is
-  // scheduled via millis() because M5.Beep.tone() is one-at-a-time —
-  // calling it twice in the same tick stomps the first note.
+  // when looking at another screen. Two-note ascending motif (see
+  // audio/motifs.h MOTIF_DONE, 2000 -> 2800 Hz, the universal "ta-da" of
+  // completion sounds) so it doesn't collide with the rest of the sound
+  // vocabulary. soundEvent() routes it through the tune engine on FULL
+  // builds with tunes on, else the async player above sounds both notes —
+  // s_vol gates every path via beep().
   static PersonaState prevActiveState = P_SLEEP;
-  static uint32_t chimeNote2At = 0;
   if (activeState == P_CELEBRATE && prevActiveState != P_CELEBRATE) {
-#ifdef BUDDY_EXTRAS_FULL
-    if (tunesJingle(SLOT_DONE)) {
-      chimeNote2At = 0;   // the tune replaces both notes
-    } else
-#endif
-    {
-      beep(2000, 100);
-      chimeNote2At = now + 130;
-    }
-  }
-  if (chimeNote2At && (int32_t)(now - chimeNote2At) >= 0) {
-    beep(2800, 150);
-    chimeNote2At = 0;
+    soundEvent(MOTIF_DONE);
   }
   prevActiveState = activeState;
 
@@ -2357,7 +2461,7 @@ void loop() {
     if (tama.promptId[0]) {
       promptArrivedMs = millis();
       wake();
-      TUNE_OR_BEEP(SLOT_ALERT, 1200, 80);   // alert
+      soundEvent(MOTIF_PROMPT);   // urgent rising triple: "come here"
       // Jump to the approval screen no matter what was open — drawApproval
       // only runs from drawHUD which only runs in DISP_NORMAL.
       displayMode = DISP_NORMAL;
@@ -2380,13 +2484,13 @@ void loop() {
   }
   prevPromptLive = promptLive;
 
-  // ntfy card arrival: short chirp (vol-gated via beep) and deliberately
+  // ntfy card arrival: soft blip (MOTIF_CARD, vol-gated) and deliberately
   // NO wake() — attention without screen burn. If the screen is off it
   // stays off; the unread badge and carousel pick it up later.
   static uint32_t seenNtfyTotal = 0;
   if (_ntfy.total > seenNtfyTotal) {
     seenNtfyTotal = _ntfy.total;
-    beep(1600, 50);
+    soundEvent(MOTIF_CARD);
   }
 
   // Ask arrival (v2, read-only): chirp + re-arm the overlay for the new id.
@@ -2477,7 +2581,7 @@ void loop() {
         responseSent = true;
         uint32_t tookS = (millis() - promptArrivedMs) / 1000;
         statsOnApproval(tookS);
-        TUNE_OR_BEEP(SLOT_APPROVE, 2400, 60);
+        soundEvent(MOTIF_APPROVE);   // single short high confirm
         if (tookS < 5) triggerOneShot(P_HEART, 2000);
       } else if (askShowing()) {
         beep(1800, 30);
@@ -2580,6 +2684,13 @@ void loop() {
         showToast("no sessions");
       }
     }
+#ifdef BUDDY_EXTRAS_FULL
+    else if (displayMode == DISP_INFO && infoPage == INFO_PG_SOUNDS) {
+      // legend page: hold B to hear the whole vocabulary in order
+      btnBLong = true;
+      soundDemoAll();
+    }
+#endif
   }
   if (M5.BtnB.wasReleased()) {
     if (swallowBtnB || btnBLong) {
@@ -2590,7 +2701,7 @@ void loop() {
       sendCmd(cmd);
       responseSent = true;
       statsOnDenial();
-      TUNE_OR_BEEP(SLOT_DENY, 600, 60);
+      soundEvent(MOTIF_DENY);   // single short low
     } else if (askShowing()) {
       beep(2400, 30);
       askDismissed = true;   // read-only card — B just puts it away
@@ -2703,7 +2814,7 @@ void loop() {
 
   static uint32_t lastPasskey = 0;
   uint32_t pk = blePasskey();
-  if (pk && !lastPasskey) { wake(); beep(1800, 60); }
+  if (pk && !lastPasskey) { wake(); soundEvent(MOTIF_PASSKEY); }
   lastPasskey = pk;
 
   // The pet/GIF paths deliberately repaint only their own bands, so pixels

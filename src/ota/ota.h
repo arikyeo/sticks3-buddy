@@ -20,10 +20,15 @@
 // status = short lowercase step label for the progress screen;
 // pct = 0..100 during the download, -1 for indeterminate steps.
 typedef void (*OtaProgressFn)(const char* status, int pct);
+// Sound-vocabulary hook (see src/audio/motifs.h): called exactly once per
+// otaRun, ok=true only on the success path (right before the reboot),
+// false on every failure return (including "already up to date"). May be
+// nullptr for a silent caller.
+typedef void (*OtaSoundFn)(bool ok);
 
 // Blocking; returns only on failure or already-up-to-date, with errBuf
 // holding a short screen-sized message. Success reboots the device.
-bool otaRun(OtaProgressFn progress, char* errBuf, size_t errLen);
+bool otaRun(OtaProgressFn progress, OtaSoundFn sound, char* errBuf, size_t errLen);
 
 // True while otaRun is between its first and last step — main.cpp's
 // power-scaling busy guard (belt-and-suspenders: the blocking flow never

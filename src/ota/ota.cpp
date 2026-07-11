@@ -63,6 +63,7 @@ static volatile bool _otaBusy = false;
 bool otaInProgress() { return _otaBusy; }
 
 static OtaProgressFn _cb = nullptr;
+static OtaSoundFn _sound = nullptr;
 static int _lastPct = -1;
 
 // Every step report also pets the loop-task watchdog: the whole flow runs
@@ -97,6 +98,7 @@ static bool _fail(char* errBuf, size_t errLen, const char* msg) {
   _wifiOff();
   esp_task_wdt_init(12, true);   // restore the loop watchdog budget
   _otaBusy = false;
+  if (_sound) _sound(false);   // every terminal-failure return, one motif
   return false;
 }
 
@@ -125,8 +127,9 @@ static int _probeRedirect(const char* url, char* loc, size_t locLen) {
   return code;
 }
 
-bool otaRun(OtaProgressFn progress, char* errBuf, size_t errLen) {
+bool otaRun(OtaProgressFn progress, OtaSoundFn sound, char* errBuf, size_t errLen) {
   _cb = progress;
+  _sound = sound;
   _lastPct = -1;
   if (errLen) errBuf[0] = 0;
   _otaBusy = true;
@@ -265,6 +268,7 @@ bool otaRun(OtaProgressFn progress, char* errBuf, size_t errLen) {
     // machinery takes over: main.cpp marks the slot valid after 15s of
     // healthy uptime, or the next reboot falls back to this slot).
     _prog("rebooting", 100);
+    if (_sound) _sound(true);
     _wifiOff();
     _otaBusy = false;
     delay(600);   // let the progress screen land before the panel dies
