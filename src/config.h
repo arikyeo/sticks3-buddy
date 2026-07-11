@@ -4,7 +4,7 @@
 // -DBOARD_STICKC_PLUS / -DBOARD_STICKC_PLUS2); anything not board-specific
 // lives in the shared section below.
 
-#define BUDDY_FW_VERSION "0.2.0-dev"
+#define BUDDY_FW_VERSION "1.2.0"
 #define BUDDY_PROTO_VER  2
 
 // --- Per-board buffer capacities --------------------------------------------
