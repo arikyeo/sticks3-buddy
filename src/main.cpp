@@ -2,6 +2,7 @@
 #include "config.h"
 #include "hal/hal.h"
 #include "logic/wrap_text_logic.h"
+#include "logic/ui_layout_logic.h"
 #include "logic/persona_logic.h"
 #include "logic/clock_display_logic.h"
 #include "logic/clock_orient_logic.h"
@@ -52,6 +53,10 @@ const int CY_BASE = 120;
 // Colors used across multiple UI surfaces
 const uint16_t HOT   = 0xFA20;   // red-orange: warnings, impatience, deny
 const uint16_t PANEL = 0x2104;   // overlay panel background
+// Session-state vocabulary (dashboard bars, HUD/clock pips, legend):
+// amber = waiting, green = running, blue = done, palette-dim = idle.
+const uint16_t AMBER   = 0xFD20;
+const uint16_t DONEBLU = 0x441F;
 
 // PersonaState / stateNames / derivePersona live in logic/persona_logic.h
 
@@ -71,8 +76,12 @@ uint8_t menuSel     = 0;
 bool    btnALong    = false;
 bool    btnBLong    = false;
 
-enum DisplayMode { DISP_NORMAL, DISP_SESSIONS, DISP_PET, DISP_CLOCK, DISP_CARDS, DISP_INFO, DISP_COUNT };
-uint8_t displayMode = DISP_NORMAL;
+// DISP_DASH sits first so the A-press walk from the dashboard lands on the
+// pet next ("pet one press away"); which of the two is HOME at boot comes
+// from settings().home (NVS s_home). DISP_NORMAL keeps its role as the
+// never-skipped anchor, prompt-arrival target, and overlay host.
+enum DisplayMode { DISP_DASH, DISP_NORMAL, DISP_SESSIONS, DISP_PET, DISP_CLOCK, DISP_CARDS, DISP_INFO, DISP_COUNT };
+uint8_t displayMode = DISP_NORMAL;   // setup() re-seats this from settings().home
 uint8_t cardSel = 0;    // DISP_CARDS view index, 0 = newest
 uint8_t infoPage = 0;
 uint8_t petPage = 0;
@@ -258,11 +267,11 @@ uint8_t settingsSel  = 0;
 #ifdef BUDDY_EXTRAS_FULL
 // FULL builds get a "tunes" row after volume; applySetting/drawSettings
 // remap the rows below it so the base indices stay board-independent.
-const char* settingsItems[] = { "brightness", "volume", "tunes", "pairing", "host mode", "bluetooth", "wifi", "led", "transcript", "clock rot", "ascii pet", "reset", "back" };
-const uint8_t SETTINGS_N = 13;
+const char* settingsItems[] = { "brightness", "volume", "tunes", "pairing", "host mode", "bluetooth", "wifi", "led", "transcript", "clock rot", "ascii pet", "home scr", "reset", "back" };
+const uint8_t SETTINGS_N = 14;
 #else
-const char* settingsItems[] = { "brightness", "volume", "pairing", "host mode", "bluetooth", "wifi", "led", "transcript", "clock rot", "ascii pet", "reset", "back" };
-const uint8_t SETTINGS_N = 12;
+const char* settingsItems[] = { "brightness", "volume", "pairing", "host mode", "bluetooth", "wifi", "led", "transcript", "clock rot", "ascii pet", "home scr", "reset", "back" };
+const uint8_t SETTINGS_N = 13;
 #endif
 
 bool    resetOpen = false;
@@ -354,8 +363,17 @@ static void applySetting(uint8_t idx) {
     case 7: s.hud = !s.hud; break;
     case 8: s.clockRot = (s.clockRot + 1) % 3; break;
     case 9: nextPet(); return;
-    case 10: resetOpen = true; resetSel = 0; resetConfirmIdx = 0xFF; return;
-    case 11: settingsOpen = false; characterInvalidate(); return;
+    case 10:
+      // home screen toggle: dashboard <-> pet. Jump there right away so
+      // the change is visible without a reboot.
+      s.home = s.home ? 0 : 1;
+      settingsSave();
+      displayMode = s.home == 1 ? DISP_NORMAL : DISP_DASH;
+      applyDisplayMode();
+      showToast(s.home ? "home: pet" : "home: dash");
+      return;
+    case 11: resetOpen = true; resetSel = 0; resetConfirmIdx = 0xFF; return;
+    case 12: settingsOpen = false; characterInvalidate(); return;
   }
   settingsSave();
 }
@@ -500,6 +518,8 @@ static void drawSettings() {
       uint8_t total = buddySpeciesCount() + (gifAvailable ? 1 : 0);
       uint8_t pos   = buddyMode ? buddySpeciesIdx() + 1 : total;
       spr.printf("%u/%u", pos, total);
+    } else if (vi == 10) {
+      spr.print(s.home ? " pet" : "dash");
     }
   }
   drawMenuHints(p, mx, mw, my + mh - 12, "Next", "Change");
@@ -818,10 +838,20 @@ static void clockUpdateOrient() {
 
 static uint8_t clockDow() { return (uint8_t)_clk.tm_wday % 7; }
 
+// One color per session state, used by every glanceable surface (dashboard
+// bars, HUD/clock pips, the info legend) so the vocabulary stays learnable:
+// amber = waiting, green = running, blue = done, dim = idle.
+static uint16_t sessStateColor(uint8_t st, const Palette& p) {
+  return st == SES_WAIT ? AMBER
+       : st == SES_RUN  ? GREEN
+       : st == SES_DONE ? DONEBLU : p.textDim;
+}
+
 // Host/session status strip: connected host's name (or "no host") on the
-// left, one pip per session on the right — wait pips hot, running green,
-// idle/done dim outlines. Same vocabulary as the HUD badge line. Draws to
-// either surface (portrait sprite / landscape LCD) via the TFT_eSPI base.
+// left, one pip per session on the right — wait pips amber, running green,
+// done blue outlines, idle dim outlines. Same vocabulary as the HUD badge
+// line. Draws to either surface (portrait sprite / landscape LCD) via the
+// TFT_eSPI base.
 static void drawClockStrip(TFT_eSPI* g, int y) {
   const Palette& p = characterPalette();
   g->setTextSize(1);
@@ -837,8 +867,7 @@ static void drawClockStrip(TFT_eSPI* g, int y) {
   }
   int wpx = g->width();
   for (uint8_t i = 0; i < _sessions.count; i++) {
-    uint16_t c = _sessions.s[i].state == SES_WAIT ? HOT
-               : _sessions.s[i].state == SES_RUN  ? GREEN : p.textDim;
+    uint16_t c = sessStateColor(_sessions.s[i].state, p);
     int px = wpx - 8 - (int)(_sessions.count - 1 - i) * 7;
     if (_sessions.s[i].state == SES_RUN || _sessions.s[i].state == SES_WAIT)
       g->fillCircle(px, y + 3, 2, c);
@@ -1644,6 +1673,120 @@ static void drawSessions() {
   spr.print(pinIdx >= 0 ? "B:next  hold:unpin" : "B:next  hold:pin");
 }
 
+// DISP_DASH: the glanceable "what are my agents doing" board, and the
+// default home screen (settings > home). Full-sprite takeover — the pet
+// doesn't tick here, it's one A-press away. Layout:
+//   header  BIG waiting count (amber) when any session waits, else the
+//           running count (green); host name right-aligned.
+//   rows    one per session (up to 6, host sends waiting-first): 8px
+//           state bar on the left edge (sessStateColor vocabulary), boxed
+//           C/X agent badge, size-2 title, right-aligned compact tokens.
+//           Waiting rows get a filled amber background for pop.
+//   ticker  newest transcript line at the bottom, simple offset marquee
+//           when it doesn't fit (ui_layout_logic.h marqueeOffset).
+// A pending approval never renders under this screen: prompt arrival
+// forces DISP_NORMAL, and while a prompt is live A/B answer it instead of
+// navigating, so the approval overlay always preempts the dashboard.
+static void drawDash() {
+  const Palette& p = characterPalette();
+  spr.fillSprite(p.bg);
+  spr.setTextSize(1);
+
+  // Host name, top right (dim; the header count is the attention magnet)
+  const char* hn = hostGlueActiveName();
+  char hb[12];
+  snprintf(hb, sizeof(hb), "%.10s",
+           tama.connected ? (hn[0] ? hn : "host") : "no host");
+  spr.setTextColor(p.textDim, p.bg);
+  spr.setCursor(W - (int)strlen(hb) * 6 - 4, 4);
+  spr.print(hb);
+
+  if (_sessions.count == 0) {
+    spr.setTextDatum(MC_DATUM);
+    spr.setTextSize(2);
+    spr.setTextColor(p.text, p.bg);
+    spr.drawString("no sessions", CX, 104);
+    spr.setTextColor(tama.connected ? GREEN : p.textDim, p.bg);
+    spr.drawString(tama.connected ? "host linked" : "no host", CX, 136);
+    spr.setTextDatum(TL_DATUM);
+    spr.setTextSize(1);
+    return;
+  }
+
+  // Big count: waiting sessions dominate (that's the "come look" number);
+  // with none waiting, show how many are running.
+  uint8_t nw = 0, nr = 0;
+  for (uint8_t i = 0; i < _sessions.count; i++) {
+    if (_sessions.s[i].state == SES_WAIT) nw++;
+    else if (_sessions.s[i].state == SES_RUN) nr++;
+  }
+  char cnt[4];
+  snprintf(cnt, sizeof(cnt), "%u", nw ? nw : nr);
+  spr.setTextSize(3);
+  spr.setTextColor(nw ? AMBER : (nr ? GREEN : p.textDim), p.bg);
+  spr.setCursor(4, 4);
+  spr.print(cnt);
+  spr.setTextSize(1);
+  spr.setTextColor(nw ? AMBER : p.textDim, p.bg);
+  spr.setCursor(4 + (int)strlen(cnt) * 18 + 5, 14);
+  spr.print(nw ? "waiting" : "running");
+  spr.drawFastHLine(0, 31, W, p.textDim);
+
+  // Session rows, table order (host sends waiting-first)
+  const int RH = 30;
+  int y = 34;
+  for (uint8_t i = 0; i < _sessions.count && i < BUDDY_MAX_SESSIONS; i++) {
+    const Session& s = _sessions.s[i];
+    bool waitRow = s.state == SES_WAIT;
+    uint16_t rowBg = waitRow ? AMBER : p.bg;
+    uint16_t fg    = waitRow ? 0x0000
+                   : (s.state == SES_RUN ? p.text : p.textDim);
+    if (waitRow) spr.fillRect(8, y, W - 8, RH - 2, AMBER);
+    spr.fillRect(0, y, 8, RH - 2, sessStateColor(s.state, p));
+
+    // boxed agent badge: C = claude, X = codex
+    char a = (s.agent[0] == 'x' || strncmp(s.agent, "codex", 5) == 0) ? 'X' : 'C';
+    spr.drawRect(11, y + 3, 16, 21, fg);
+    spr.setTextSize(2);
+    spr.setTextColor(fg, rowBg);
+    spr.setCursor(14, y + 6);
+    spr.print(a);
+
+    spr.setCursor(30, y + 6);
+    spr.printf("%.6s", s.title[0] ? s.title : s.sid);
+
+    char tok[8];
+    fmtTok(tok, sizeof(tok), s.tok);
+    spr.setTextSize(1);
+    spr.setTextColor(waitRow ? 0x0000 : p.textDim, rowBg);
+    spr.setCursor(W - (int)strlen(tok) * 6 - 3, y + 10);
+    spr.print(tok);
+    y += RH;
+  }
+
+  // Bottom ticker: newest transcript line (or the summary msg / an active
+  // character-transfer progress line). Marquee restarts when the line
+  // generation changes so a fresh entry always starts readable.
+  spr.drawFastHLine(0, H - 16, W, p.textDim);
+  char xb[24];
+  const char* tick;
+  if (xferActive()) {
+    snprintf(xb, sizeof(xb), "installing %luK/%luK",
+             (unsigned long)(xferProgress() / 1024),
+             (unsigned long)(xferTotal() / 1024));
+    tick = xb;
+  } else {
+    tick = tama.nLines ? tama.lines[tama.nLines - 1] : tama.msg;
+  }
+  static uint16_t mqGen = 0xFFFF;
+  static uint32_t mqT0  = 0;
+  if (tama.lineGen != mqGen) { mqGen = tama.lineGen; mqT0 = millis(); }
+  uint16_t off = marqueeOffset((uint16_t)strlen(tick), 21, (millis() - mqT0) / 250);
+  spr.setTextColor(p.text, p.bg);
+  spr.setCursor(4, H - 11);
+  spr.printf("%.21s", tick + off);
+}
+
 // Ask overlay (protocol v2, read-only): first question of an ask event.
 // Priority sits just below the approval overlay — a pending permission
 // prompt always wins the bottom area. A scrolls the option cursor, B or
@@ -1796,8 +1939,7 @@ void drawHUD() {
       spr.print(nb);
     }
     for (uint8_t i = 0; i < _sessions.count; i++) {
-      uint16_t c = _sessions.s[i].state == SES_WAIT ? HOT
-                 : _sessions.s[i].state == SES_RUN  ? GREEN : p.textDim;
+      uint16_t c = sessStateColor(_sessions.s[i].state, p);
       int px = W - 8 - (int)(_sessions.count - 1 - i) * 7;
       if (_sessions.s[i].state == SES_RUN || _sessions.s[i].state == SES_WAIT)
         spr.fillCircle(px, by + 3, 2, c);
@@ -1925,6 +2067,9 @@ void setup() {
   // so a fresh install lands on the GIF). With no GIF installed, 0xFF falls
   // through to buddyInit()'s clamped default.
   buddyMode = !(gifAvailable && speciesIdxLoad() == SPECIES_GIF);
+  // Home screen: dashboard by default (NVS s_home, seeded 0 by nvsMigrate
+  // v5), pet for those who flip settings > home.
+  displayMode = settings().home == 1 ? DISP_NORMAL : DISP_DASH;
   applyDisplayMode();
 
   {
@@ -2400,6 +2545,15 @@ void loop() {
     } else if (displayMode == DISP_CARDS) {
       beep(2400, 30);
       if (_ntfy.count) cardSel = (uint8_t)((cardSel + 1) % _ntfy.count);
+    } else if (displayMode == DISP_DASH) {
+      // drill into the detailed session list
+      beep(2400, 30);
+      if (_sessions.count > 0) {
+        displayMode = DISP_SESSIONS;
+        applyDisplayMode();
+      } else {
+        showToast("no sessions");
+      }
     } else {
       beep(2400, 30);
       msgScroll = (msgScroll >= 30) ? 0 : msgScroll + 1;
@@ -2477,6 +2631,9 @@ void loop() {
   if (napping || screenOff || landscapeClock) {
     // skip sprite render — face-down, powered off, or landscape clock
     // (which draws direct-to-LCD below)
+  } else if (displayMode == DISP_DASH && !blePasskey()) {
+    // dashboard owns the whole sprite (drawDash below repaints it fully);
+    // the pet doesn't tick here. Passkey still repaints via its own screen.
   } else if (buddyMode) {
     buddyTick(activeState);
   } else if (characterLoaded()) {
@@ -2509,6 +2666,7 @@ void loop() {
   } else if (!napping && !screenOff) {
     if (blePasskey()) drawPasskey();
     else if (clocking) drawClock();
+    else if (displayMode == DISP_DASH) drawDash();
     else if (displayMode == DISP_CLOCK) drawClockScreen();
     else if (displayMode == DISP_CARDS) drawCards();
     else if (displayMode == DISP_EXTRAS) drawExtrasScreen();

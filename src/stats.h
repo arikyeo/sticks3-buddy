@@ -44,6 +44,11 @@ static bool _dirty = false;
 // v3 → v4: extras wave — s_tune (U8 0/1, default 1) gates the tune-jingle
 // engine on BUDDY_EXTRAS_FULL builds. Seeded on every board so the pref
 // survives moving a bond/NVS image between board tiers.
+// v4 → v5: s_home (U8: 0 dashboard, 1 pet) picks the boot/home screen.
+// Seeded 0 for EVERYONE — existing users included — because the dashboard
+// is the glanceable "what are my agents doing" screen the device exists
+// for; the pet stays one A-press away (and one settings toggle from being
+// home again).
 // Idempotent: sv=N short-circuits every boot after the first.
 //
 // NOT part of the schema: the "wifi" namespace. It held the LEGACY single
@@ -53,7 +58,7 @@ static bool _dirty = false;
 // migrates the old keys out on boot; wifiCredsWipe() stays so factory
 // reset clears whatever a legacy image left behind (forget-host keeps it —
 // hosts and networks are unrelated concerns).
-static const uint8_t NVS_SCHEMA_V = 4;
+static const uint8_t NVS_SCHEMA_V = 5;
 
 inline void nvsMigrate() {
   _prefs.begin("buddy", false);
@@ -82,6 +87,10 @@ inline void nvsMigrate() {
   if (_prefs.getUChar("sv", 0) < 4) {
     if (!_prefs.isKey("s_tune")) _prefs.putUChar("s_tune", 1);
     _prefs.putUChar("sv", 4);
+  }
+  if (_prefs.getUChar("sv", 0) < 5) {
+    if (!_prefs.isKey("s_home")) _prefs.putUChar("s_home", 0);
+    _prefs.putUChar("sv", 5);
   }
   _prefs.end();
 }
@@ -252,9 +261,10 @@ struct Settings {
   int8_t  hostsel;   // -1 auto, 0..6 pinned host registry slot
   uint8_t hostfb;    // pinned-host no-show fallback: 0 stay, 1 auto after 30s
   uint8_t tune;      // 0/1: tune jingles (acts only on BUDDY_EXTRAS_FULL builds)
+  uint8_t home;      // home screen: 0 = dashboard (DISP_DASH), 1 = pet
 };
 
-static Settings _settings = { 3, true, false, true, true, 0, 4, 0, -1, 1, 1 };
+static Settings _settings = { 3, true, false, true, true, 0, 4, 0, -1, 1, 1, 0 };
 
 inline void settingsLoad() {
   nvsMigrate();   // idempotent; setup() calls settingsLoad before statsLoad,
@@ -278,6 +288,8 @@ inline void settingsLoad() {
   if (_settings.hostfb > 1) _settings.hostfb = 1;
   _settings.tune     = _prefs.getUChar("s_tune", 1);   // seeded by nvsMigrate v4
   if (_settings.tune > 1) _settings.tune = 1;
+  _settings.home     = _prefs.getUChar("s_home", 0);   // seeded by nvsMigrate v5
+  if (_settings.home > 1) _settings.home = 0;
   _prefs.end();
 }
 
@@ -294,6 +306,7 @@ inline void settingsSave() {
   _prefs.putChar("hostsel",  _settings.hostsel);
   _prefs.putUChar("hostfb",  _settings.hostfb);
   _prefs.putUChar("s_tune",  _settings.tune);
+  _prefs.putUChar("s_home",  _settings.home);
   _prefs.end();
 }
 
