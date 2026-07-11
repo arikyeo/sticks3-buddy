@@ -81,6 +81,15 @@ class Config:
     # unicast too — overlay networks (Tailscale/WireGuard) have no broadcast
     relay_peers: tuple[str, ...] = ()
     relay_name_short: str = ""  # <= 6 chars shown as the [NAME] title prefix
+    # [telegram] (push + remote-control bot: off by default, zero network
+    # unless active). The bot token is FULL control of the bot — treat it
+    # like an SSH key; it is never logged and never printed by the CLI.
+    telegram_enabled: bool = False
+    telegram_token: str = ""  # BotFather token; telegram stays OFF while empty
+    telegram_chats: tuple[int, ...] = ()  # allowlisted chat ids; REQUIRED
+    telegram_events: tuple[str, ...] = ("prompt",)  # prompt|attention|done|card|update
+    telegram_decisions: bool = False  # inline Allow/Deny buttons answer gates
+    telegram_answer_asks: bool = False  # AskUserQuestion answerable from Telegram
 
     home: Path = field(default_factory=bridge_home)
 
@@ -93,6 +102,16 @@ class Config:
         """The relay requires BOTH the enable flag and a non-empty shared
         token — an unauthenticated LAN listener must be impossible."""
         return self.relay_enabled and bool(self.relay_token.strip())
+
+    @property
+    def telegram_active(self) -> bool:
+        """Telegram requires the enable flag AND a token AND at least one
+        allowlisted chat — an open (answer-anyone) bot must be impossible."""
+        return (
+            self.telegram_enabled
+            and bool(self.telegram_token.strip())
+            and bool(self.telegram_chats)
+        )
 
 
 def _get_str(table: dict, key: str, default: str) -> str:
@@ -131,6 +150,13 @@ def _get_str_list(table: dict, key: str) -> tuple[str, ...]:
     return tuple(v for v in val if isinstance(v, str) and v.strip())
 
 
+def _get_int_list(table: dict, key: str) -> tuple[int, ...]:
+    val = table.get(key)
+    if not isinstance(val, list):
+        return ()
+    return tuple(v for v in val if isinstance(v, int) and not isinstance(v, bool))
+
+
 def load_config(home: Path | None = None, create: bool = True) -> Config:
     """Load config from ``<home>/config.toml``, tolerant of unknown/bad keys.
 
@@ -155,6 +181,7 @@ def load_config(home: Path | None = None, create: bool = True) -> Config:
     timeouts = data.get("timeouts", {}) if isinstance(data.get("timeouts"), dict) else {}
     cards = data.get("cards", {}) if isinstance(data.get("cards"), dict) else {}
     relay = data.get("relay", {}) if isinstance(data.get("relay"), dict) else {}
+    telegram = data.get("telegram", {}) if isinstance(data.get("telegram"), dict) else {}
 
     cfg.host_id = _get_str(host, "id", "")
     cfg.host_name = _get_str(host, "name", "")
@@ -197,6 +224,14 @@ def load_config(home: Path | None = None, create: bool = True) -> Config:
     cfg.relay_peers = _get_str_list(relay, "peers")
     cfg.relay_name_short = _get_str(relay, "name_short", "")
 
+    cfg.telegram_enabled = _get_bool(telegram, "enabled", False)
+    cfg.telegram_token = _get_str(telegram, "bot_token", "")
+    cfg.telegram_chats = _get_int_list(telegram, "allowed_chats")
+    events = _get_str_list(telegram, "events")
+    cfg.telegram_events = events if "events" in telegram else ("prompt",)
+    cfg.telegram_decisions = _get_bool(telegram, "allow_decisions", False)
+    cfg.telegram_answer_asks = _get_bool(telegram, "answer_asks", False)
+
     changed = False
     if not cfg.host_id:
         cfg.host_id = mint_host_id()
@@ -222,6 +257,8 @@ def to_toml(cfg: Config) -> str:
     b = lambda v: "true" if v else "false"  # noqa: E731
     repos = ", ".join(_toml_str(r) for r in cfg.cards_repos)
     relay_peers = ", ".join(_toml_str(p) for p in cfg.relay_peers)
+    tg_chats = ", ".join(str(c) for c in cfg.telegram_chats)
+    tg_events = ", ".join(_toml_str(e) for e in cfg.telegram_events)
     weather = ""
     if cfg.cards_weather_lat is not None and cfg.cards_weather_lon is not None:
         weather = (
@@ -264,6 +301,13 @@ def to_toml(cfg: Config) -> str:
         f"token = {_toml_str(cfg.relay_token)}\n"
         f"peers = [{relay_peers}]\n"
         f"name_short = {_toml_str(cfg.relay_name_short)}\n"
+        "\n[telegram]\n"
+        f"enabled = {b(cfg.telegram_enabled)}\n"
+        f"bot_token = {_toml_str(cfg.telegram_token)}\n"
+        f"allowed_chats = [{tg_chats}]\n"
+        f"events = [{tg_events}]\n"
+        f"allow_decisions = {b(cfg.telegram_decisions)}\n"
+        f"answer_asks = {b(cfg.telegram_answer_asks)}\n"
     )
 
 
