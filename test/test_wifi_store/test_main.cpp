@@ -5,6 +5,7 @@
 // migration shape (upsert into an empty list lands in slot 0), and the
 // names-only list formatter (a pass must never appear in any output).
 #include <unity.h>
+#include <stdio.h>
 #include <string.h>
 #include "logic/wifi_store_logic.h"
 
