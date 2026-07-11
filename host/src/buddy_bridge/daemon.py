@@ -78,6 +78,8 @@ from .matchers import (
     is_safe_tool,
     load_matchers,
 )
+from .notify.telegram import TelegramNotifier
+from .notify.telegram_bot import TelegramBot
 from .registry import SessionRegistry
 from .usage import LEDGER_FILENAME, UsageLedger
 
@@ -213,6 +215,13 @@ class Daemon:
         self._fed_ask: Optional[dict[str, Any]] = None  # our ask riding state_sync
         self._relay_force_sync = False  # holder changed: full resync next tick
         self._fed_tasks: set[asyncio.Task] = set()  # decision relays in flight
+        # Telegram "virtual buddy" (None unless [telegram] enabled + token
+        # + >=1 allowlisted chat): push notifier + interactive bot.
+        self.telegram: Optional[TelegramNotifier] = None
+        self.telegram_bot: Optional[TelegramBot] = None
+        if cfg.telegram_active:
+            self.telegram = TelegramNotifier(cfg, self.registry)
+            self.telegram_bot = TelegramBot(cfg, self, self.telegram)
         self._ondemand_lock = asyncio.Lock()  # one on-demand gate at a time
         self._wifi_lock = asyncio.Lock()  # one wifi provisioning request at a time
         self._wifi_ack_future: Optional[asyncio.Future] = None
@@ -395,6 +404,9 @@ class Daemon:
             "ble_yielding": self.yielding,
             "idle_yield_min": self.cfg.idle_yield_min,
             "relay": self.relay.status() if self.relay is not None else {"active": False},
+            "telegram": (
+                self.telegram.status() if self.telegram is not None else {"active": False}
+            ),
             "federation": {
                 "peers": self.federation.peer_count(),
                 "remote_sessions": self.federation.counts()[0],
@@ -443,6 +455,13 @@ class Daemon:
         if event == "ask_pending":
             await self.handle_ask_pending(msg)  # fire-and-forget: no reply line
             return None
+        if event == "ask_answer":
+            # Blocking AskUserQuestion answer request from the Claude hook
+            # (--answer-asks). Always replies: {"answers": None} = no
+            # Telegram answer, fall through to the native dialog.
+            if self.telegram_bot is not None:
+                return await self.telegram_bot.handle_ask_answer(msg)
+            return {"answers": None}
         if event == "set_mode":
             return await self.handle_set_mode(msg)
         if event == "wifi":
@@ -485,6 +504,8 @@ class Daemon:
             codex.handle_event(self.registry, msg)
         else:
             return
+        if self.telegram is not None:
+            self.telegram.push_hook_event(msg)  # attention/done fan-out
         if msg.get("name") == "SessionEnd":
             self.router.cancel_session(str(agent), str(msg.get("session_id") or ""))
 
@@ -567,7 +588,7 @@ class Daemon:
         return {"decision": decision}
 
     def _create_pending(self, msg, agent, sid, tool, tool_input, hint):
-        return self.router.create(
+        pending = self.router.create(
             agent,
             sid,
             str(msg.get("tool_use_id") or ""),
@@ -575,6 +596,9 @@ class Daemon:
             tool=protocol.sanitize(tool),
             detail=protocol.sanitize(extract_detail(tool_input)),
         )
+        if self.telegram is not None:
+            self.telegram.push_prompt(pending)  # every gate path funnels here
+        return pending
 
     def _remote_gate_available(self) -> bool:
         """A federated v2 holder is on the air: gates can be answered from
@@ -899,6 +923,9 @@ class Daemon:
             await self._cancel_displayed_prompt(wire_id, decision_from_device=answered)
         self._fed_prompt_ids = current
         self._fed_answered &= current
+        if self.telegram is not None:
+            # deduped inside the notifier: only NEW remote prompts push
+            self.telegram.push_remote_prompts(self.federation.remote_prompts())
         await self._sync_remote_asks()
         if self.link.connected:
             await self._send_snapshot()
@@ -1166,6 +1193,10 @@ class Daemon:
         rides state_sync). Display-only (PROTOCOL_V2.md): the user still
         answers in the CLI; with no stick anywhere, silently do nothing."""
         self.wake_from_yield()  # a question at the keyboard is local activity
+        if self.telegram is not None and not self.cfg.telegram_answer_asks:
+            # Read-only mirror (with answer_asks the blocking ask_answer
+            # request delivers the interactive version instead).
+            self.telegram.push_ask(msg)
         local_ok = self.cap_active("ask") and self.link.connected
         fed_ok = self._remote_gate_available()
         if not local_ok and not fed_ok:
@@ -1352,6 +1383,8 @@ class Daemon:
         accepted = self.cards.submit(card)
         if accepted:
             self.wake_from_yield()  # a queued card wants the link back
+            if self.telegram is not None:
+                self.telegram.push_card(card)
         return accepted
 
     async def _flush_cards(self) -> None:
@@ -1441,6 +1474,14 @@ class Daemon:
                 log.warning("relay: disabled for this run (bind failed: %s)", exc)
                 await self.relay.stop()
                 self.relay = None
+        if self.cfg.telegram_enabled and not self.cfg.telegram_active:
+            log.warning(
+                "telegram: [telegram] enabled but bot_token/allowed_chats missing — "
+                "telegram stays OFF"
+            )
+        if self.telegram is not None and self.telegram_bot is not None:
+            tasks.append(asyncio.create_task(self.telegram.run(), name="telegram-notify"))
+            tasks.append(asyncio.create_task(self.telegram_bot.run(), name="telegram-bot"))
         if self.cfg.claude_enabled:
             tasks.append(asyncio.create_task(self.claude_tailer.run(), name="claude-jsonl"))
         if self.cfg.codex_enabled:
