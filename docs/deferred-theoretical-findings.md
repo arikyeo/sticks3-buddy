@@ -20,6 +20,22 @@ happening.
   chunks right after a pairing-window eviction, or a peer that never performs
   its own MTU exchange.
 
+### Candidate address arrays are guarded by volatile flags, not volatile themselves
+- **Where:** `src/ble_bridge.cpp` — `pidAddr`/`authAddr` (and the pre-existing
+  `peerAddr`) are plain arrays written on the BLE stack task and read from the
+  main loop, gated by `volatile` bool flags written after the data.
+- **Why deferred:** this is the codebase's established idiom (`peerAddr` +
+  `hasPeer` shipped in every upstream fork). Volatile-qualifying the arrays
+  changes nothing real — every access casts through `memcpy`, and `volatile`
+  orders only volatile accesses among themselves. The writes land nanoseconds
+  after the flag's producer-side sequence point; the consumer reads on a main
+  loop pass milliseconds later, and ESP32 Xtensa cores retire stores to
+  coherent memory in order. A genuine fix would be a portMUX critical section
+  (rxBuf's pattern), which is heavier than the risk warrants here.
+- **What would make it real:** field evidence of a torn candidate address
+  (bond-key resolution logging an address that matches neither the link nor
+  any bond entry), or a port to a core with weaker store ordering.
+
 ### Auth-failure disconnect races a same-instant connection swap
 - **Where:** `src/ble_bridge.cpp` `onAuthenticationComplete` failure path —
   `server->disconnect(server->getConnId())` targets the newest connection; a
