@@ -44,6 +44,18 @@ static volatile uint16_t  mtu = 23;
 static esp_bd_addr_t      peerAddr;
 static volatile bool      hasPeer = false;
 
+// Identity address of the bonded peer on the current link, captured from
+// the SMP auth-complete event. A privacy-enabled host's FIRST pairing
+// connects under an unresolvable RPA (its IRK isn't in our resolving list
+// yet), so peerAddr is a one-time address — while the Bluedroid bond store
+// keys the bond by the identity address exchanged during SMP. Registry
+// records and bond removals must use THIS address. peerAddr itself stays
+// connect-time on purpose: the controller tracks the live link by that
+// (pseudo) address, so conn-param updates and disconnect attribution keep
+// working from it.
+static esp_bd_addr_t      bondedAddr;
+static volatile bool      hasBondedPeer = false;
+
 // Pairing window (Track F P4): while non-zero and in the future, ONLY
 // unbonded peers may connect and pair — bonded hosts are evicted/rejected
 // for the window's duration so a new machine gets the link to itself (see
@@ -165,6 +177,7 @@ class ServerCallbacks : public BLEServerCallbacks {
     }
     memcpy((void*)peerAddr, who, sizeof(esp_bd_addr_t));
     hasPeer = true;
+    hasBondedPeer = false;   // fresh link — identity known after auth
     connected = true;
     // Apply the latched link mode: tight if the device is awake, relaxed if
     // it's reconnecting while the screen is off (P7 power).
@@ -191,6 +204,7 @@ class ServerCallbacks : public BLEServerCallbacks {
     passkey = 0;
     mtu = 23;
     hasPeer = false;
+    hasBondedPeer = false;
     // The disconnect event landed — the advertising restart below covers the
     // pairing-window eviction too, so the tick fallback can stand down.
     pairWinAdvKickAt = 0;
@@ -226,6 +240,14 @@ class SecCallbacks : public BLESecurityCallbacks {
       return;
     }
     passkey = 0;
+    if (cmpl.success) {
+      // For a bonded peer this is the identity address — the bond-store
+      // key — even when the link connected under an unresolved RPA.
+      // Captured BEFORE latching 'secure' so the registry poll can never
+      // observe a secure link without the bonded bda being available.
+      memcpy((void*)bondedAddr, cmpl.bd_addr, sizeof(esp_bd_addr_t));
+      hasBondedPeer = true;
+    }
     secure = cmpl.success;
     Serial.printf("[ble] auth %s\n", cmpl.success ? "ok" : "FAIL");
     if (!cmpl.success && server) server->disconnect(server->getConnId());
@@ -372,6 +394,12 @@ bool blePeerBda(uint8_t out[6]) {
   return true;
 }
 
+bool bleBondedPeerBda(uint8_t out[6]) {
+  if (!hasBondedPeer) return false;
+  memcpy(out, (const void*)bondedAddr, 6);
+  return true;
+}
+
 void bleDisconnect() {
   if (server && connected) server->disconnect(server->getConnId());
 }
@@ -405,14 +433,19 @@ void bleWhitelistPin(const uint8_t* bda) {
 #endif
 
 void bleRemoveCurrentBond() {
-  if (!hasPeer) {
+  if (!hasPeer && !hasBondedPeer) {
     Serial.println("[ble] unpair: no peer to remove");
     return;
   }
-  esp_ble_remove_bond_device(peerAddr);
+  // The bond store is keyed by the identity address; the connect-time
+  // address of a first-time-pairing privacy host is an RPA the store never
+  // heard of, and removal by it fails silently.
+  esp_bd_addr_t victim;
+  memcpy(victim,
+         hasBondedPeer ? (const void*)bondedAddr : (const void*)peerAddr, 6);
+  esp_ble_remove_bond_device(victim);
   Serial.printf("[ble] removed bond %02x:%02x:%02x:%02x:%02x:%02x\n",
-    peerAddr[0], peerAddr[1], peerAddr[2],
-    peerAddr[3], peerAddr[4], peerAddr[5]);
+    victim[0], victim[1], victim[2], victim[3], victim[4], victim[5]);
 }
 
 void bleClearBonds() {

@@ -49,6 +49,19 @@ static bool     _wasConn      = false;
 static bool     _wasSecure    = false;
 static char     _pairedName[24] = "";    // pending "paired:" toast for main.cpp
 
+// Address the registry keys records by: the bond-store IDENTITY address
+// once the link has authenticated, else the connect-time address. A
+// privacy-enabled host's (macOS, modern Windows) FIRST pairing connects
+// under an unresolvable RPA, and a record keyed by that RPA matches
+// nothing afterwards — the boot reconcile drops it ("bond gone", hello
+// name lost), a same-session identity-resolved reconnect adopts a
+// duplicate row, and evict/forget feed esp_ble_remove_bond_device() a key
+// the bond store never heard of (silent fail, leaked bond).
+static bool _peerKeyBda(uint8_t out[6]) {
+  if (bleBondedPeerBda(out)) return true;
+  return blePeerBda(out);
+}
+
 // --- NVS ---------------------------------------------------------------------
 // Layout: "n" (U8 used-slot count), "seq" (U32 LRU counter), "h0".."h6"
 // (HostRec blobs, compact — h{i} exists iff i < n).
@@ -190,10 +203,33 @@ void hostGluePoll(uint32_t now) {
   bool sec = conn && bleSecure();
   if (sec && !_wasSecure) {
     // Bond established (fresh pairing or LTK resume): make sure the peer is
-    // in the registry and freshen its LRU stamp.
+    // in the registry — keyed by the bond-store identity address, which is
+    // what survives reboots and what removal calls need — and freshen its
+    // LRU stamp.
     uint8_t bda[6];
-    if (blePeerBda(bda)) {
+    if (_peerKeyBda(bda)) {
       int idx = hostTabFindBda(&_hosts, bda);
+      if (idx < 0) {
+        // The link may already sit in the table under its connect-time RPA
+        // (a hello-route adopt that beat this transition, or a record laid
+        // down by firmware that keyed by connect address): re-key that
+        // record to the identity instead of adopting a duplicate row.
+        uint8_t connBda[6];
+        if (blePeerBda(connBda) && memcmp(connBda, bda, 6) != 0) {
+          int old = hostTabFindBda(&_hosts, connBda);
+          if (old >= 0 && hostTabRekey(&_hosts, old, bda)) {
+            idx = old;
+            Serial.printf("[hosts] re-keyed '%s' to identity bda\n",
+                          _hosts.h[idx].name);
+            // A re-key means a FRESH bond whose adopt transition was
+            // missed — so the adopt path's window close + paired toast
+            // were missed too. Both are idempotent; do them here.
+            bleAllowPairing(false, 0);
+            strncpy(_pairedName, _hosts.h[idx].name, sizeof(_pairedName) - 1);
+            _pairedName[sizeof(_pairedName) - 1] = 0;
+          }
+        }
+      }
       if (idx < 0) {
         if (_hosts.count >= BUDDY_MAX_HOSTS) {
           int v = hostTabLru(&_hosts);
@@ -277,9 +313,12 @@ bool hostGlueOnHello(const char* hostId, const char* name, const char* app,
   // leave _connSlot stale, and a stale-slot write puts the new host's hello
   // into the old host's record — the "hosts list lost the first host" live
   // defect. hostTabHelloRoute also adopts an unknown-but-encrypted peer,
-  // healing a missed secure-transition adopt as a side effect.
+  // healing a missed secure-transition adopt as a side effect. The key is
+  // the bond-store identity address (a hello only flows on an encrypted
+  // link, so it's known) — the connect-time fallback covers a first
+  // pairing only until auth completes, never a hello.
   uint8_t bda[6];
-  if (blePeerBda(bda)) {
+  if (_peerKeyBda(bda)) {
     int idx = hostTabHelloRoute(&_hosts, bda, hostId, name, app);
     if (idx >= 0) {
       if (_connSlot >= 0 && _connSlot != idx)

@@ -108,6 +108,57 @@ void test_drop_compacts_and_remaps_pin() {
   TEST_ASSERT_EQUAL_INT8(-1, hostTabRemapPin(-1, 0));
 }
 
+void test_rekey_moves_key_and_preserves_fields() {
+  HostTable t;
+  hostTabInit(&t);
+  uint8_t rpa[6], identity[6];
+  bdaSet(rpa, 0x50);
+  bdaSet(identity, 0xA0);
+  int i = hostTabAdopt(&t, rpa);
+  hostTabHello(&t, i, "a1b2c3d4", "Arik's Mac", "claude");
+  uint32_t seen = t.h[i].lastSeen;
+
+  TEST_ASSERT_TRUE(hostTabRekey(&t, i, identity));
+  TEST_ASSERT_EQUAL_UINT(1, t.count);                       // same row, moved key
+  TEST_ASSERT_EQUAL_INT(i, hostTabFindBda(&t, identity));
+  TEST_ASSERT_EQUAL_INT(-1, hostTabFindBda(&t, rpa));       // old key gone
+  TEST_ASSERT_EQUAL_STRING("Arik's Mac", t.h[i].name);      // fields preserved
+  TEST_ASSERT_EQUAL_STRING("a1b2c3d4", t.h[i].hostId);
+  TEST_ASSERT_EQUAL_STRING("claude", t.h[i].app);
+  TEST_ASSERT_EQUAL_UINT32(seen, t.h[i].lastSeen);          // not an LRU touch
+}
+
+void test_rekey_refuses_duplicate_key() {
+  HostTable t;
+  hostTabInit(&t);
+  uint8_t a[6], b[6];
+  bdaSet(a, 0x10);
+  bdaSet(b, 0x20);
+  hostTabAdopt(&t, a);
+  hostTabAdopt(&t, b);
+  HostTable before;
+  memcpy(&before, &t, sizeof(t));
+  // Moving slot 0 onto slot 1's key would make hostTabFindBda ambiguous.
+  TEST_ASSERT_FALSE(hostTabRekey(&t, 0, b));
+  TEST_ASSERT_EQUAL_MEMORY(&before, &t, sizeof(t));
+  // Re-keying a record to its own address is a successful no-op.
+  TEST_ASSERT_TRUE(hostTabRekey(&t, 0, a));
+  TEST_ASSERT_EQUAL_MEMORY(&before, &t, sizeof(t));
+}
+
+void test_rekey_out_of_range_is_noop() {
+  HostTable t;
+  hostTabInit(&t);
+  uint8_t a[6], x[6];
+  bdaSet(a, 0x10);
+  bdaSet(x, 0x30);
+  hostTabAdopt(&t, a);
+  TEST_ASSERT_FALSE(hostTabRekey(&t, -1, x));
+  TEST_ASSERT_FALSE(hostTabRekey(&t, 1, x));
+  TEST_ASSERT_EQUAL_INT(0, hostTabFindBda(&t, a));
+  TEST_ASSERT_EQUAL_INT(-1, hostTabFindBda(&t, x));
+}
+
 void test_drop_out_of_range_is_noop() {
   HostTable t;
   hostTabInit(&t);
@@ -127,6 +178,9 @@ int main(int, char**) {
   RUN_TEST(test_hello_updates_and_sanitizes);
   RUN_TEST(test_hello_truncates_hostid_to_8_chars);
   RUN_TEST(test_drop_compacts_and_remaps_pin);
+  RUN_TEST(test_rekey_moves_key_and_preserves_fields);
+  RUN_TEST(test_rekey_refuses_duplicate_key);
+  RUN_TEST(test_rekey_out_of_range_is_noop);
   RUN_TEST(test_drop_out_of_range_is_noop);
   return UNITY_END();
 }

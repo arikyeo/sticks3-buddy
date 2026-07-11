@@ -95,6 +95,25 @@ inline int hostTabHelloRoute(HostTable* t, const uint8_t bda[6],
   return idx;
 }
 
+// Re-key a record to a new BD address, preserving every other field (name,
+// hostId, app, LRU stamp). Needed because a privacy-enabled host's FIRST
+// pairing connects under an unresolvable RPA: a record adopted by that
+// connect-time address matches nothing once the SMP exchange establishes
+// the identity address the bond store keys by — the boot reconcile would
+// drop it (hello name lost), a same-session identity-resolved reconnect
+// would duplicate it, and evict/forget would feed the bond store a key it
+// never heard of. Refuses (returns false) when idx is invalid or a
+// DIFFERENT record already owns newBda — a duplicate key would make
+// hostTabFindBda ambiguous. Re-keying a record to its own address is a
+// successful no-op.
+inline bool hostTabRekey(HostTable* t, int idx, const uint8_t newBda[6]) {
+  if (idx < 0 || idx >= (int)t->count) return false;
+  int owner = hostTabFindBda(t, newBda);
+  if (owner >= 0 && owner != idx) return false;
+  memcpy(t->h[idx].bda, newBda, 6);
+  return true;
+}
+
 // Least-recently-seen used slot; -1 when the table is empty.
 inline int hostTabLru(const HostTable* t) {
   int best = -1;

@@ -54,9 +54,16 @@ uint32_t blePairingRemainingMs();   // 0 = window closed
 // advertising 500ms after window-open eviction if the peer's disconnect
 // event never landed).
 void blePairingTick(uint32_t nowMs);
-// BD address of the currently connected peer (identity address once the
-// stack resolved it). False when nothing is connected.
+// CONNECT-TIME BD address of the current peer (identity address only when
+// the stack could resolve it, i.e. for a peer whose IRK we already hold).
+// False when nothing is connected. For a privacy-enabled host's FIRST
+// pairing this is an unresolved RPA — key nothing durable by it.
 bool blePeerBda(uint8_t out[6]);
+// IDENTITY BD address of the bonded peer on the current link, learned from
+// the SMP auth-complete event. This is the address the Bluedroid bond
+// store keys the bond by — use it for registry records and bond removal.
+// False until the current link has completed authentication.
+bool bleBondedPeerBda(uint8_t out[6]);
 // Drop the current link. Advertising restarts automatically.
 void bleDisconnect();
 #ifdef BUDDY_BLE_WHITELIST
