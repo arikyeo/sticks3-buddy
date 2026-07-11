@@ -237,17 +237,70 @@ and v1 peers keep working (cards).
 ## WiFi provisioning
 
 ```powershell
-buddy-bridge wifi <ssid>         # prompts for the password
+buddy-bridge wifi <ssid>              # upsert: prompts for the password
+buddy-bridge wifi <ssid> --remove     # drop one stored network
+buddy-bridge wifi --list              # show SSIDs stored on the device
+buddy-bridge wifi --clear             # drop every stored network (confirms)
+buddy-bridge wifi --import creds.json # bulk-load several networks
 ```
 
-Sends `{"cmd":"wifi","ssid":...,"pass":...}` to the connected buddy over
-the running daemon's IPC and waits up to 10 s for
-`{"ack":"wifi","ok":true|false}`. Requires protocol v2 — a stopped daemon,
-a disconnected link, or a v1-only stick all print a clear error and exit
-1, and the password is never requested in that case. The password is read
-with `getpass` (no terminal echo): it never appears on the command line
-or in shell history, and is never written to a log line, `audit.jsonl`,
-or `cards.log`.
+The device keeps a small list of networks, upserted by SSID (re-sending an
+SSID updates its password in place rather than adding a duplicate). Every
+op is one of `{"cmd":"wifi",...}` sent to the connected buddy over the
+running daemon's IPC, acknowledged with `{"ack":"wifi","ok":...}` (10 s
+timeout). Every one of these requires protocol v2 — a stopped daemon, a
+disconnected link, or a v1-only stick print a clear error and exit 1
+before anything is requested (no password prompt in that case, and
+`--clear` won't even ask you to confirm). A password is only ever read
+with `getpass` (no terminal echo): it never appears on the command line,
+in shell history, or in a log line, `audit.jsonl`, or `cards.log` —
+`--remove`/`--list`/`--clear` never prompt for one at all.
+
+The device holds up to 256 networks; beyond that it rejects further
+upserts (`ok:false, error:"full"`) instead of evicting an older one, so
+provisioning a network never silently drops a different one.
+
+### Bulk import (`--import`)
+
+```powershell
+buddy-bridge wifi --import creds.json
+buddy-bridge wifi --import creds.csv
+buddy-bridge wifi --import wpa_supplicant.conf
+```
+
+Sends one upsert per network, **sequentially** — each ack is awaited
+before the next network is sent — in the file's order. Format is
+auto-detected:
+
+- **JSON list**: `[{"ssid": "Home", "pass": "hunter2"}, {"ssid": "Office", "pass": "..."}]`
+  (`"password"` is also accepted as an alias for `"pass"`).
+- **JSON map**: `{"Home": "hunter2", "Office": "..."}`
+- **CSV/TSV**: one `ssid,pass` (or tab-separated `ssid<TAB>pass`) pair per
+  line; blank lines and lines starting with `#` are skipped. Fields with
+  embedded commas/tabs need quoting (`"My, Home Net",p@ss,word`) — parsed
+  with Python's `csv` module, so standard quoting rules apply. There is no
+  header row; put `#` in front of one to skip it.
+- **wpa_supplicant.conf** (best-effort): `network={ ssid="..." psk="..." }`
+  blocks are scanned for quoted `ssid`/`psk` pairs. A block with a raw-hex
+  `psk` (64 hex chars, unquoted) or no `psk` at all (open/EAP networks) is
+  skipped with a warning — only a quoted ASCII passphrase can be resent to
+  the device.
+
+Any row/entry that doesn't parse (missing field, wrong JSON shape, an
+unsupported wpa_supplicant block, ...) is skipped with a warning naming
+its SSID — one bad line doesn't abort the rest of the file. A file that
+can't be read or doesn't resemble any supported format at all (missing,
+empty, non-UTF8, top-level JSON that's neither a list nor an object)
+prints one clear error and exits 1 instead of a traceback.
+
+If the file has more than 256 networks, `buddy-bridge` warns up front
+(rare — the device supports 256); if the device is already close to full,
+import stops the moment it gets back `error:"full"` rather than
+continuing to hammer a full device, and reports how many networks were
+never sent (by name). The final line reports how many networks were
+imported and the device's resulting count, and reminds you to delete the
+import file — **passwords in it are plain text**, and once they're on the
+device (over the encrypted BLE link) the host never keeps a copy.
 
 ## Protocol v2
 
