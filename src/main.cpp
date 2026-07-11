@@ -264,13 +264,16 @@ const uint8_t EXTRAS_N = 2;
 
 bool    settingsOpen = false;
 uint8_t settingsSel  = 0;
+// Labels are size 2 now (12px/glyph), so they stay <= 7 chars: bright =
+// brightness, host = host mode, bt = bluetooth, feed = HUD transcript
+// feed, clock = clock rotation, pet = ascii pet, home = home screen.
 #ifdef BUDDY_EXTRAS_FULL
 // FULL builds get a "tunes" row after volume; applySetting/drawSettings
 // remap the rows below it so the base indices stay board-independent.
-const char* settingsItems[] = { "brightness", "volume", "tunes", "pairing", "host mode", "bluetooth", "wifi", "led", "transcript", "clock rot", "ascii pet", "home scr", "reset", "back" };
+const char* settingsItems[] = { "bright", "volume", "tunes", "pairing", "host", "bt", "wifi", "led", "feed", "clock", "pet", "home", "reset", "back" };
 const uint8_t SETTINGS_N = 14;
 #else
-const char* settingsItems[] = { "brightness", "volume", "pairing", "host mode", "bluetooth", "wifi", "led", "transcript", "clock rot", "ascii pet", "home scr", "reset", "back" };
+const char* settingsItems[] = { "bright", "volume", "pairing", "host", "bt", "wifi", "led", "feed", "clock", "pet", "home", "reset", "back" };
 const uint8_t SETTINGS_N = 13;
 #endif
 
@@ -471,27 +474,42 @@ static void drawMenuHints(const Palette& p, int mx, int mw, int hy,
   spr.fillTriangle(x, hy, x, hy + 6, x + 5, hy + 3, p.textDim);
 }
 
+// Size-2 menu rows: the selected row is a filled body-color bar instead of
+// a "> " cursor — the prefix chars don't fit at 12px/glyph on 135px.
+static void drawMenuRow(int mx, int mw, int rowY, bool sel, const Palette& p) {
+  if (sel) spr.fillRect(mx + 2, rowY - 2, mw - 4, 18, p.body);
+  spr.setTextSize(2);
+  spr.setTextColor(sel ? p.bg : p.textDim, sel ? p.body : PANEL);
+  spr.setCursor(mx + 6, rowY);
+}
+
+// Settings panel: size-2 labels in an 8-row scroll window (14 rows at
+// 18px don't fit 240px), size-1 values right-aligned, ^/v overflow marks.
 static void drawSettings() {
   const Palette& p = characterPalette();
-  int mw = 118, mh = 16 + SETTINGS_N * 14 + MENU_HINT_H;
+  const uint8_t VIS = 8;
+  uint8_t rows = SETTINGS_N < VIS ? SETTINGS_N : VIS;
+  uint8_t win = windowStart(settingsSel, SETTINGS_N, VIS);
+  int mw = 128, mh = 12 + rows * 18 + MENU_HINT_H;
   int mx = (W - mw) / 2, my = (H - mh) / 2;
   spr.fillRoundRect(mx, my, mw, mh, 4, PANEL);
   spr.drawRoundRect(mx, my, mw, mh, 4, p.textDim);
-  spr.setTextSize(1);
   Settings& s = settings();
   bool vals[] = { s.bt, s.wifi, s.led, s.hud };
-  for (int i = 0; i < SETTINGS_N; i++) {
+  for (uint8_t r = 0; r < rows; r++) {
+    uint8_t i = win + r;
     bool sel = (i == settingsSel);
-    spr.setTextColor(sel ? p.text : p.textDim, PANEL);
-    spr.setCursor(mx + 6, my + 8 + i * 14);
-    spr.print(sel ? "> " : "  ");
+    int rowY = my + 8 + r * 18;
+    uint16_t rowBg = sel ? p.body : PANEL;
+    drawMenuRow(mx, mw, rowY, sel, p);
     spr.print(settingsItems[i]);
-    spr.setCursor(mx + mw - 36, my + 8 + i * 14);
-    spr.setTextColor(p.textDim, PANEL);
+    spr.setTextSize(1);
+    spr.setCursor(mx + mw - 36, rowY + 4);
+    spr.setTextColor(sel ? p.bg : p.textDim, rowBg);
     int vi = i;   // base-table index (see applySetting's remap)
 #ifdef BUDDY_EXTRAS_FULL
     if (i == 2) {
-      spr.setTextColor(s.tune ? GREEN : p.textDim, PANEL);
+      if (!sel) spr.setTextColor(s.tune ? GREEN : p.textDim, rowBg);
       spr.print(s.tune ? " on" : "off");
       continue;
     }
@@ -509,7 +527,7 @@ static void drawSettings() {
       else spr.printf("%.5s", hostGlueGet((uint8_t)s.hostsel)
                                 ? hostGlueGet((uint8_t)s.hostsel)->name : "?");
     } else if (vi >= 4 && vi <= 7) {
-      spr.setTextColor(vals[vi-4] ? GREEN : p.textDim, PANEL);
+      if (!sel) spr.setTextColor(vals[vi-4] ? GREEN : p.textDim, rowBg);
       spr.print(vals[vi-4] ? " on" : "off");
     } else if (vi == 8) {
       static const char* const RN[] = { "auto", "port", "land" };
@@ -521,6 +539,14 @@ static void drawSettings() {
     } else if (vi == 10) {
       spr.print(s.home ? " pet" : "dash");
     }
+  }
+  // scroll-window overflow marks
+  spr.setTextSize(1);
+  spr.setTextColor(p.textDim, PANEL);
+  if (win > 0) { spr.setCursor(mx + mw - 10, my + 3); spr.print('^'); }
+  if (win + rows < SETTINGS_N) {
+    spr.setCursor(mx + mw - 10, my + 8 + rows * 18 - 8);
+    spr.print('v');
   }
   drawMenuHints(p, mx, mw, my + mh - 12, "Next", "Change");
 }
@@ -558,7 +584,15 @@ static void otaDrawProgress(const char* status, int pct) {
   spr.setTextColor(p.body, p.bg);
   spr.setCursor(8, 56);  spr.print("FIRMWARE UPDATE");
   spr.setTextColor(p.text, p.bg);
-  spr.setCursor(8, 96);  spr.printf("%.20s", status);
+  // Step labels ("downloading", "rebooting") read at size 2; error strings
+  // are longer and keep size 1 so they survive whole.
+  if (strlen(status) <= 11) {
+    spr.setTextSize(2);
+    spr.setCursor(2, 92);  spr.print(status);
+    spr.setTextSize(1);
+  } else {
+    spr.setCursor(8, 96);  spr.printf("%.20s", status);
+  }
   const int BX = 8, BW = W - 16, BH = 10, BY = 120;
   spr.drawRect(BX, BY, BW, BH, p.textDim);
   if (pct >= 0) {
@@ -615,37 +649,31 @@ void menuConfirm() {
 
 void drawMenu() {
   const Palette& p = characterPalette();
-  int mw = 118, mh = 16 + MENU_N * 14 + MENU_HINT_H;
+  int mw = 122, mh = 12 + MENU_N * 18 + MENU_HINT_H;
   int mx = (W - mw) / 2, my = (H - mh) / 2;
   spr.fillRoundRect(mx, my, mw, mh, 4, PANEL);
   spr.drawRoundRect(mx, my, mw, mh, 4, p.textDim);
-  spr.setTextSize(1);
   for (int i = 0; i < MENU_N; i++) {
-    bool sel = (i == menuSel);
-    spr.setTextColor(sel ? p.text : p.textDim, PANEL);
-    spr.setCursor(mx + 6, my + 8 + i * 14);
-    spr.print(sel ? "> " : "  ");
+    drawMenuRow(mx, mw, my + 8 + i * 18, i == menuSel, p);
     spr.print(menuItems[i]);
-    if (i == 6) spr.print(dataDemo() ? "  on" : "  off");
+    if (i == 6) spr.print(dataDemo() ? " on" : "");
   }
+  spr.setTextSize(1);
   drawMenuHints(p, mx, mw, my + mh - 12);
 }
 
 // extras submenu: same panel pattern as the main menu.
 static void drawExtras() {
   const Palette& p = characterPalette();
-  int mw = 118, mh = 16 + EXTRAS_N * 14 + MENU_HINT_H;
+  int mw = 122, mh = 12 + EXTRAS_N * 18 + MENU_HINT_H;
   int mx = (W - mw) / 2, my = (H - mh) / 2;
   spr.fillRoundRect(mx, my, mw, mh, 4, PANEL);
   spr.drawRoundRect(mx, my, mw, mh, 4, p.textDim);
-  spr.setTextSize(1);
   for (int i = 0; i < EXTRAS_N; i++) {
-    bool sel = (i == extrasSel);
-    spr.setTextColor(sel ? p.text : p.textDim, PANEL);
-    spr.setCursor(mx + 6, my + 8 + i * 14);
-    spr.print(sel ? "> " : "  ");
+    drawMenuRow(mx, mw, my + 8 + i * 18, i == extrasSel, p);
     spr.print(extrasItems[i]);
   }
+  spr.setTextSize(1);
   drawMenuHints(p, mx, mw, my + mh - 12, "Next", "Select");
 }
 
@@ -779,19 +807,30 @@ static void forgetConfirm() {
 }
 
 // Bottom-center toast, drawn last so it floats over every surface.
+// Size 2 for arm's-length reading; long messages wrap to two rows.
 static void drawToast() {
   if (!toastMsg[0]) return;
   if ((int32_t)(millis() - toastUntil) >= 0) { toastMsg[0] = 0; return; }
   const Palette& p = characterPalette();
-  int tw = (int)strlen(toastMsg) * 6 + 12;
+  char rows[2][24];
+  uint8_t n = wrapInto(toastMsg, rows, 2, 10);
+  if (n == 0) { toastMsg[0] = 0; return; }
+  int maxLen = (int)strlen(rows[0]);
+  if (n > 1 && (int)strlen(rows[1]) > maxLen) maxLen = (int)strlen(rows[1]);
+  int tw = maxLen * 12 + 12;
+  if (tw > W - 2) tw = W - 2;
+  int th = n * 16 + 8;
   int tx = (W - tw) / 2;
-  int ty = H - 56;
-  spr.fillRoundRect(tx, ty, tw, 14, 3, PANEL);
-  spr.drawRoundRect(tx, ty, tw, 14, 3, p.textDim);
-  spr.setTextSize(1);
+  int ty = H - 56 - (n > 1 ? 16 : 0);
+  spr.fillRoundRect(tx, ty, tw, th, 3, PANEL);
+  spr.drawRoundRect(tx, ty, tw, th, 3, p.textDim);
+  spr.setTextSize(2);
   spr.setTextColor(p.text, PANEL);
-  spr.setCursor(tx + 6, ty + 4);
-  spr.print(toastMsg);
+  for (uint8_t i = 0; i < n; i++) {
+    spr.setCursor(tx + 6, ty + 5 + i * 16);
+    spr.print(rows[i]);
+  }
+  spr.setTextSize(1);
 }
 
 // Clock orientation: gravity along the in-plane X axis means the stick is
@@ -1128,17 +1167,19 @@ bool checkShake() {
 
 
 // Persistent screen-level title row ("INFO  n/3") matching the PET header,
-// then a per-page section label below it. The fixed title is the cue that
-// B cycles pages here just like it does on PET.
+// then a per-page section label below it at size 2 — the page's headline.
+// The fixed title is the cue that B cycles pages here just like on PET.
 static void _infoHeader(const Palette& p, int& y, const char* section, uint8_t page) {
   spr.setTextColor(p.text, p.bg);
   spr.setCursor(4, y); spr.print("Info");
   spr.setTextColor(p.textDim, p.bg);
   spr.setCursor(W - 28, y); spr.printf("%u/%u", page + 1, INFO_PAGES);
-  y += 12;
+  y += 10;
+  spr.setTextSize(2);
   spr.setTextColor(p.body, p.bg);
   spr.setCursor(4, y); spr.print(section);
-  y += 12;
+  spr.setTextSize(1);
+  y += 20;
 }
 
 void drawPasskey() {
@@ -1362,34 +1403,45 @@ void drawInfo() {
 
 static void drawApproval() {
   const Palette& p = characterPalette();
-  const int AREA = 78;
+  const int AREA = 112;   // grew from 78 so tool + hint read at size 3/2
   spr.fillRect(0, H - AREA, W, AREA, p.bg);
   spr.drawFastHLine(0, H - AREA, W, p.textDim);
 
   spr.setTextSize(1);
   spr.setTextColor(p.textDim, p.bg);
-  spr.setCursor(4, H - AREA + 4);
+  spr.setCursor(4, H - AREA + 3);
   uint32_t waited = (millis() - promptArrivedMs) / 1000;
   if (waited >= 10) spr.setTextColor(HOT, p.bg);
   spr.printf("approve? %lus", (unsigned long)waited);
 
-  // Size 2 only if it fits one line (~10 chars at 12px on 135px screen)
+  // Tool name: size 3 when it fits one line (7 chars at 18px), else size 2
+  // hard-chunked to two 10-char lines (tool ids have no spaces to wrap on).
   int toolLen = strlen(tama.promptTool);
   spr.setTextColor(p.text, p.bg);
-  spr.setTextSize(toolLen <= 10 ? 2 : 1);
-  spr.setCursor(4, H - AREA + (toolLen <= 10 ? 14 : 18));
-  spr.print(tama.promptTool);
-  spr.setTextSize(1);
-
-  // Hint wraps at ~21 chars to two lines under the tool name
-  spr.setTextColor(p.textDim, p.bg);
-  int hlen = strlen(tama.promptHint);
-  spr.setCursor(4, H - AREA + 34);
-  spr.printf("%.21s", tama.promptHint);
-  if (hlen > 21) {
-    spr.setCursor(4, H - AREA + 42);
-    spr.printf("%.21s", tama.promptHint + 21);
+  if (toolLen <= 7) {
+    spr.setTextSize(3);
+    spr.setCursor(4, H - AREA + 14);
+    spr.print(tama.promptTool);
+  } else {
+    spr.setTextSize(2);
+    spr.setCursor(4, H - AREA + 14);
+    spr.printf("%.10s", tama.promptTool);
+    if (toolLen > 10) {
+      spr.setCursor(4, H - AREA + 30);
+      spr.printf("%.10s", tama.promptTool + 10);
+    }
   }
+
+  // Hint at size 2, word-wrapped to two 10-char lines
+  spr.setTextSize(2);
+  spr.setTextColor(p.textDim, p.bg);
+  char hrows[2][24];
+  uint8_t nH = wrapInto(tama.promptHint, hrows, 2, 10);
+  for (uint8_t i = 0; i < nH; i++) {
+    spr.setCursor(4, H - AREA + 48 + i * 18);
+    spr.print(hrows[i]);
+  }
+  spr.setTextSize(1);
 
   // v2: owning-session badge. With a focus pin active, prompts from other
   // sessions are flagged instead of hidden — approvals are too important to
@@ -1400,14 +1452,14 @@ static void drawApproval() {
     bool other = _sessions.pinSid[0] &&
                  strcmp(_sessions.pinSid, tama.promptSid) != 0;
     spr.setTextColor(other ? HOT : p.body, p.bg);
-    spr.setCursor(4, H - AREA + 52);
+    spr.setCursor(4, H - AREA + 88);
     if (other) spr.printf("[other: %.10s]", title);
     else       spr.printf("[%.16s]", title);
     if (tama.promptQn > 0) {
       char qb[8];
       snprintf(qb, sizeof(qb), "+%uq", tama.promptQn);
       spr.setTextColor(p.textDim, p.bg);
-      spr.setCursor(W - (int)strlen(qb) * 6 - 4, H - AREA + 52);
+      spr.setCursor(W - (int)strlen(qb) * 6 - 4, H - AREA + 88);
       spr.print(qb);
     }
   }
@@ -1605,67 +1657,84 @@ static void fmtTok(char* out, size_t cap, uint32_t v) {
   else                snprintf(out, cap, "%lu", (unsigned long)v);
 }
 
-// DISP_SESSIONS: per-session list from the v2 heartbeat. Two rows each:
-// [cursor][state][agent] title ....tok / dimmed last-line. State glyphs are
-// ASCII because the on-device fonts stop at 0x7E: > run, ! wait, . idle,
-// * done. BtnB short moves the selection, BtnB long pins/unpins focus.
+// DISP_SESSIONS: per-session list from the v2 heartbeat, paginated 4-up so
+// the titles read at size 2 from arm's length. Each row: 4px state bar on
+// the left edge (sessStateColor vocabulary), size-2 cursor + C/X agent +
+// title line, size-1 last-activity line with right-aligned tokens. BtnB
+// short moves the selection (the page follows the cursor), BtnB long
+// pins/unpins focus.
 static void drawSessions() {
   const Palette& p = characterPalette();
   const int TOP = 70;
+  const uint8_t PER = 4;   // rows per page
   spr.fillRect(0, TOP, W, H - TOP, p.bg);
-  spr.setTextSize(1);
   int y = TOP + 2;
-
-  // Header: connected host's name left, session count right. (Spec sketch
-  // says "<hostname> · N sess" — the middot isn't in the ASCII font.)
-  const char* hn = hostGlueActiveName();
-  spr.setTextColor(p.text, p.bg);
-  spr.setCursor(4, y);
-  spr.printf("%.13s", hn[0] ? hn : (tama.connected ? "host" : "no host"));
-  char cnt[10];
-  snprintf(cnt, sizeof(cnt), "%u sess", _sessions.count);
-  spr.setTextColor(p.textDim, p.bg);
-  spr.setCursor(W - (int)strlen(cnt) * 6 - 4, y);
-  spr.print(cnt);
-  y += 14;
 
   int selIdx = sessionTabSelIdx(&_sessions);
   int pinIdx = sessionTabPinIdx(&_sessions);
-  for (uint8_t i = 0; i < _sessions.count; i++) {
+  uint8_t pages = pageCount(_sessions.count, PER);
+  uint8_t page  = pageOf((uint8_t)(selIdx < 0 ? 0 : selIdx), PER);
+
+  // Header: connected host's name (size 2), page/count meta right (size 1)
+  const char* hn = hostGlueActiveName();
+  spr.setTextSize(2);
+  spr.setTextColor(p.text, p.bg);
+  spr.setCursor(4, y);
+  spr.printf("%.8s", hn[0] ? hn : (tama.connected ? "host" : "no host"));
+  char cnt[10];
+  if (pages > 1) snprintf(cnt, sizeof(cnt), "p%u/%u", page + 1, pages);
+  else           snprintf(cnt, sizeof(cnt), "%u sess", _sessions.count);
+  spr.setTextSize(1);
+  spr.setTextColor(p.textDim, p.bg);
+  spr.setCursor(W - (int)strlen(cnt) * 6 - 4, y + 5);
+  spr.print(cnt);
+  y = TOP + 22;
+
+  if (_sessions.count == 0) {   // emptied out while on screen
+    spr.setTextSize(2);
+    spr.setTextColor(p.textDim, p.bg);
+    spr.setCursor(4, y + 20);
+    spr.print("no sessions");
+    spr.setTextSize(1);
+    return;
+  }
+
+  const int RH = 34;
+  uint8_t start = pageStart(page, PER);
+  uint8_t nOn   = rowsOnPage(_sessions.count, page, PER);
+  for (uint8_t r = 0; r < nOn; r++) {
+    uint8_t i = start + r;
     const Session& s = _sessions.s[i];
     bool sel = (int)i == selIdx;
-    char g = s.state == SES_RUN  ? '>' :
-             s.state == SES_WAIT ? '!' :
-             s.state == SES_DONE ? '*' : '.';
+    spr.fillRect(0, y, 4, RH - 3, sessStateColor(s.state, p));
+
+    // Row line 1 (size 2): cursor, agent letter, title
     char a = (s.agent[0] == 'x' || strncmp(s.agent, "codex", 5) == 0) ? 'X' : 'C';
-
-    // Row 1: cursor, state glyph (waiting highlighted), agent, title, tokens
-    spr.setCursor(2, y);
+    spr.setTextSize(2);
     spr.setTextColor(sel ? p.text : p.textDim, p.bg);
-    spr.print(sel ? '>' : ' ');
-    spr.setTextColor(s.state == SES_WAIT ? HOT : (sel ? p.text : p.textDim), p.bg);
-    spr.print(g);
-    spr.setTextColor(sel ? p.text : p.textDim, p.bg);
-    spr.print(a);
-    spr.print(' ');
-    spr.printf("%.12s", s.title[0] ? s.title : s.sid);
-    char tok[8];
-    fmtTok(tok, sizeof(tok), s.tok);
-    spr.setTextColor(p.textDim, p.bg);
-    spr.setCursor(W - (int)strlen(tok) * 6 - 4, y);
-    spr.print(tok);
-    y += 9;
-
-    // Row 2: last activity line, dimmed; focus-pin marker at the far right
-    spr.setTextColor(p.textDim, p.bg);
     spr.setCursor(8, y);
-    spr.printf("%.19s", s.last);
+    spr.print(sel ? '>' : ' ');
+    spr.setTextColor(s.state == SES_WAIT ? AMBER : (sel ? p.text : p.textDim), p.bg);
+    spr.print(a);
+    spr.setTextColor(sel ? p.text : p.textDim, p.bg);
+    spr.setCursor(36, y);
+    spr.printf("%.7s", s.title[0] ? s.title : s.sid);
     if ((int)i == pinIdx) {
       spr.setTextColor(p.body, p.bg);
-      spr.setCursor(W - 10, y);
-      spr.print("#");
+      spr.setCursor(W - 14, y);
+      spr.print('#');
     }
-    y += 11;
+
+    // Row line 2 (size 1): last activity, tokens right
+    spr.setTextSize(1);
+    spr.setTextColor(p.textDim, p.bg);
+    spr.setCursor(8, y + 17);
+    spr.printf("%.15s", s.last);
+    char tok[8];
+    fmtTok(tok, sizeof(tok), s.tok);
+    spr.setCursor(W - (int)strlen(tok) * 6 - 4, y + 17);
+    spr.print(tok);
+    y += RH;
   }
 
   spr.setTextColor(p.textDim, p.bg);
@@ -1856,20 +1925,23 @@ static void drawCards() {
   const Palette& p = characterPalette();
   const int TOP = 70;
   spr.fillRect(0, TOP, W, H - TOP, p.bg);
-  spr.setTextSize(1);
   int y = TOP + 2;
   _ntfy.unread = 0;                       // viewed — badge clears
   if (cardSel >= _ntfy.count) cardSel = 0;
   const NtfyCard* c = ntfyCardAt(&_ntfy, cardSel);
 
+  spr.setTextSize(2);
   spr.setTextColor(p.text, p.bg);
   spr.setCursor(4, y); spr.print("Cards");
+  spr.setTextSize(1);
   spr.setTextColor(p.textDim, p.bg);
-  spr.setCursor(W - 28, y); spr.printf("%u/%u", cardSel + 1, _ntfy.count);
-  y += 14;
+  spr.setCursor(W - 28, y + 5); spr.printf("%u/%u", cardSel + 1, _ntfy.count);
+  y += 20;
   if (!c) {   // ring emptied under us — carousel will skip next cycle
+    spr.setTextSize(2);
     spr.setTextColor(p.textDim, p.bg);
     spr.setCursor(4, y); spr.print("no cards");
+    spr.setTextSize(1);
     return;
   }
 
@@ -1887,14 +1959,17 @@ static void drawCards() {
   }
   y += 12;
 
+  // Title at size 2 (two 10-char lines), body stays size-1 reading text
   char rows[2][24];
-  uint8_t nR = wrapInto(c->title, rows, 2, 21);
+  uint8_t nR = wrapInto(c->title, rows, 2, 10);
+  spr.setTextSize(2);
   spr.setTextColor(p.text, p.bg);
-  for (uint8_t i = 0; i < nR; i++) { spr.setCursor(4, y); spr.print(rows[i]); y += 9; }
+  for (uint8_t i = 0; i < nR; i++) { spr.setCursor(4, y); spr.print(rows[i]); y += 17; }
+  spr.setTextSize(1);
   y += 4;
 
   char brows[8][24];
-  uint8_t nB = wrapInto(c->body, brows, 8, 21);
+  uint8_t nB = wrapInto(c->body, brows, 6, 21);
   spr.setTextColor(p.textDim, p.bg);
   for (uint8_t i = 0; i < nB; i++) { spr.setCursor(4, y); spr.print(brows[i]); y += 9; }
 
@@ -1908,43 +1983,45 @@ void drawHUD() {
   if (tama.qAskId[0] && !askDismissed) { drawAsk(); return; }
   const Palette& p = characterPalette();
   const int SHOW = 3, LH = 8, WIDTH = 21;
-  const int BADGE = 10;
+  const int BADGE = 20;   // size-2 host/pin name needs a taller line
   const int AREA = SHOW * LH + 4 + BADGE;
   spr.fillRect(0, H - AREA, W, AREA, p.bg);
   spr.setTextSize(1);
 
   // Host badge line (v2): connected host's name — or the focus-pinned
-  // session's title — plus ntfy count and one pip per session (host sends
-  // waiting-first; wait pips run hot, running green).
+  // session's title — at size 2, plus ntfy count and one pip per session
+  // (host sends waiting-first; sessStateColor vocabulary).
   {
     int by = H - AREA + 1;
     int pinIdx = sessionTabPinIdx(&_sessions);
+    spr.setTextSize(2);
     spr.setCursor(4, by);
     if (pinIdx >= 0) {
       spr.setTextColor(p.body, p.bg);
-      spr.printf("#%.11s", _sessions.s[pinIdx].title);
+      spr.printf("#%.5s", _sessions.s[pinIdx].title);
     } else if (!tama.connected) {
       spr.setTextColor(p.textDim, p.bg);
       spr.print("no host");
     } else {
       const char* hn = hostGlueActiveName();
       spr.setTextColor(p.textDim, p.bg);
-      spr.printf("%.11s", hn[0] ? hn : "host");
+      spr.printf("%.6s", hn[0] ? hn : "host");
     }
+    spr.setTextSize(1);
     if (_ntfy.unread) {   // clears once the cards screen is viewed
       char nb[6];
       snprintf(nb, sizeof(nb), "n%u", _ntfy.unread);
       spr.setTextColor(p.body, p.bg);
-      spr.setCursor(W - 8 - (int)_sessions.count * 7 - (int)strlen(nb) * 6, by);
+      spr.setCursor(W - 8 - (int)_sessions.count * 7 - (int)strlen(nb) * 6, by + 5);
       spr.print(nb);
     }
     for (uint8_t i = 0; i < _sessions.count; i++) {
       uint16_t c = sessStateColor(_sessions.s[i].state, p);
       int px = W - 8 - (int)(_sessions.count - 1 - i) * 7;
       if (_sessions.s[i].state == SES_RUN || _sessions.s[i].state == SES_WAIT)
-        spr.fillCircle(px, by + 3, 2, c);
+        spr.fillCircle(px, by + 8, 2, c);
       else
-        spr.drawCircle(px, by + 3, 2, c);
+        spr.drawCircle(px, by + 8, 2, c);
     }
   }
 
@@ -2290,6 +2367,18 @@ void loop() {
       if (buddyMode) buddyInvalidate();
     }
   }
+
+  // Approval overlay teardown: the overlay repaints a 112px band that the
+  // pet/HUD paths won't fully cover afterwards, so clear the sprite once on
+  // the prompt's falling edge (answered upstream, timed out, or cleared).
+  static bool prevPromptLive = false;
+  bool promptLive = tama.promptId[0] != 0;
+  if (prevPromptLive && !promptLive) {
+    spr.fillSprite(characterPalette().bg);
+    characterInvalidate();
+    if (buddyMode) buddyInvalidate();
+  }
+  prevPromptLive = promptLive;
 
   // ntfy card arrival: short chirp (vol-gated via beep) and deliberately
   // NO wake() — attention without screen burn. If the screen is off it
