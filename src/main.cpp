@@ -416,10 +416,11 @@ static void applyReset(uint8_t idx) {
   } else {
     // factory reset: NVS namespace wipes + filesystem format + BLE bonds.
     // Clears stats, owner, petname, species, settings, the host registry,
-    // WiFi credentials, GIF characters, and any stored LTKs so the next
-    // desktop has to re-pair. (Forget-host deliberately does NOT touch the
-    // WiFi creds — hosts and networks are unrelated concerns; only the
-    // full privacy wipe takes them.)
+    // WiFi networks (LittleFS.format() takes /wifi.dat; wifiCredsWipe()
+    // sheds any legacy NVS pair), GIF characters, and any stored LTKs so
+    // the next desktop has to re-pair. (Forget-host deliberately does NOT
+    // touch the WiFi list — hosts and networks are unrelated concerns;
+    // only the full privacy wipe takes them.)
     _prefs.begin("buddy", false);
     _prefs.clear();
     _prefs.end();
@@ -1232,6 +1233,8 @@ void drawInfo() {
     ln("  heap     %uKB", ESP.getFreeHeap() / 1024);
     ln("  bright   %u/4", settings().bright);
     ln("  bt       %s", settings().bt ? (dataBtActive() ? "linked" : "on") : "off");
+    // count only — names stay off-screen, and a pass never leaves the store
+    ln("  wifi     %u nets", (unsigned)wifiStoreCount());
     if (board::hasInternalTemp()) ln("  temp     %dC", board::internalTempC());
 
   } else if (infoPage == 4) {
@@ -1913,6 +1916,10 @@ void setup() {
   BOOT_TRACE("sprite");
   characterInit(nullptr);
   BOOT_TRACE("character");
+  // Legacy WiFi cred migration (NVS single ssid/pass -> LittleFS /wifi.dat
+  // list). Must follow characterInit — that's where LittleFS gets mounted.
+  // No-op every boot after the keys are gone.
+  wifiStoreInit();
   gifAvailable = characterLoaded();
   // species NVS: 0..N-1 = ASCII species, 0xFF = use GIF (also the default,
   // so a fresh install lands on the GIF). With no GIF installed, 0xFF falls

@@ -8,6 +8,7 @@
 #include "host_registry.h"
 #include "session_table.h"
 #include "proto_parse.h"
+#include "wifi_store.h"
 #include "xfer.h"
 
 // Device-side wiring for the protocol parse core (proto_parse.h): the two
@@ -114,12 +115,19 @@ bool protoHelloAccept(const ProtoHello& h) {
   return hostGlueOnHello(h.id, h.name, h.app, h.viaBle);
 }
 
-// NVS "wifi" namespace via stats.h (xfer.h pulled it in above). Stored on
-// every board tier — a plain build can be provisioned first and flashed
-// with an -ota env later — but only BUDDY_OTA builds ever read it back.
-// No logging here on purpose: the pass must not reach the serial port.
-bool protoWifiCreds(const char* ssid, const char* pass) {
-  return wifiCredsStore(ssid, pass);
+// WiFi network list via wifi_store.h (LittleFS /wifi.dat; the legacy NVS
+// single-cred migrates at boot). Stored on every board tier — a plain build
+// can be provisioned first and flashed with an -ota env later — but only
+// BUDDY_OTA builds ever read it back to join. No logging here on purpose:
+// a pass must never reach the serial port.
+int16_t protoWifiUpsert(const char* ssid, const char* pass) {
+  return wifiStoreUpsert(ssid, pass);
+}
+int16_t protoWifiRemove(const char* ssid) { return wifiStoreRemove(ssid); }
+bool    protoWifiClear() { return wifiStoreClear(); }
+uint16_t protoWifiCount() { return wifiStoreCount(); }
+uint16_t protoWifiSsids(char* out, size_t outLen) {
+  return wifiStoreFormatSsids(out, outLen);
 }
 
 const char* protoBoardName()  { return board::name(); }
