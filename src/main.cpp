@@ -2093,11 +2093,15 @@ void loop() {
     float gax, gay, gaz;
     board::imuAccel(&gax, &gay, &gaz);
     GestureEvent ge = gestureFeed(gest, gax, gay, gaz, now);
-    if (ge == GE_FLIP && !napping && !isFaceDown() && !tama.promptId[0] &&
+    if (ge == GE_FLIP && !napping && !tama.promptId[0] &&
         hostGlueCount() > 0) {
       // Flip = pin the next bonded host, same cycle as settings > host
-      // mode (auto -> h0 -> ... -> auto). The flat face-down pose is
-      // excluded — that gesture belongs to the nap.
+      // mode (auto -> h0 -> ... -> auto). No isFaceDown() gate here any
+      // more: GE_FLIP now only fires on the return-to-upright edge (see
+      // gesture_logic.h), so it's already gone by the time a flip would
+      // read as face-down. !napping stays as a belt-and-suspenders no-op
+      // guard — nap needs sustained face-down, which a flip-and-return
+      // never holds long enough to reach.
       int8_t next = settings().hostsel + 1;
       if (next >= (int8_t)hostGlueCount()) next = -1;
       settings().hostsel = next;
