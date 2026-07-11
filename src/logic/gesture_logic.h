@@ -101,6 +101,7 @@ inline GestureEvent gestureFeed(GestureState& g, float ax, float ay, float az,
   (void)ax; (void)ay;   // both gestures are z-axis affairs
   GestureEvent ev = GE_NONE;
   bool flipLocked = (int32_t)(nowMs - g.flipLockoutUntilMs) < 0;
+  bool wasArmed = g.armed;   // upright at entry — see the tap gate below
 
   // ---- flip: inverted dip that returns upright fires on the return ------
   if (az > GE_Z_UP_G) {
@@ -146,14 +147,15 @@ inline GestureEvent gestureFeed(GestureState& g, float ax, float ay, float az,
   float delta = fabsf(az - g.zEma);
   g.zEma = g.zEma * 0.7f + az * 0.3f;
 
-  // Taps only pair while the flip detector is armed (device is currently
-  // read as upright). That single gate kills the false pair a flip's own
-  // two z excursions (down then up) would otherwise produce — big z swings
-  // 200 ms apart are indistinguishable from taps by waveform alone, and
-  // `armed` is false for the entire span between leaving and returning to
-  // upright.
+  // Taps only pair on STEADY-upright samples: armed both before this feed
+  // (wasArmed) and after the flip section ran (g.armed). Gating on g.armed
+  // alone is not enough — a flip's return edge re-arms in the same sample
+  // it spikes, so two flip round trips ~350 ms apart would pair as a
+  // double tap (caught by CI executing the native suite). Big z swings are
+  // indistinguishable from taps by waveform alone; steadiness is the
+  // discriminator.
   bool locked = (int32_t)(nowMs - g.lockoutUntilMs) < 0;
-  if (!locked && g.armed && delta > GE_TAP_DELTA_G) {
+  if (!locked && wasArmed && g.armed && delta > GE_TAP_DELTA_G) {
     if ((nowMs - g.lastSpikeMs) >= GE_TAP_MIN_GAP_MS) {
       if (g.tapPending && (nowMs - g.tapAtMs) <= GE_TAP_MAX_GAP_MS) {
         g.tapPending = false;
