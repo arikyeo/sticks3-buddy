@@ -140,13 +140,33 @@ async def _connect(server, *, raw=None, ip="192.168.1.50", ts=None, token=TOKEN,
     writer = FakeWriter(ip)
     reader.feed_data(raw if raw is not None else build_hello_link(MAC, token, ts=ts))
     task = asyncio.create_task(server._on_connection(reader, writer))
-    await asyncio.sleep(settle)
+    # Settle until THIS connection's handshake resolves — its own ack line is
+    # written on auth success, or the task returns on rejection. (Waiting on
+    # the server-wide `connected` flag is wrong: with a prior connection still
+    # live it's already True, so we'd return before this one authenticates —
+    # the newest-wins takeover then races the assertions on Windows.)
+    await _await_until(lambda: bool(writer.data) or task.done())
     return reader, writer, task
+
+
+async def _await_until(pred, *, tries=200):
+    """Yield to the loop until pred() is true (or give up). Fixed sleeps race
+    on Windows' ProactorEventLoop — poll the actual condition instead."""
+    for _ in range(tries):
+        if pred():
+            return True
+        await asyncio.sleep(0)
+    return pred()
 
 
 async def _finish(reader, task):
     reader.feed_eof()
     await task
+    # The on_down callback runs in the task's finally block, but the awaited
+    # task can resolve one loop-tick before that coroutine is scheduled on
+    # some platforms — let it settle so callback-side-effect asserts are
+    # deterministic.
+    await asyncio.sleep(0)
 
 
 async def test_auth_accept_acks_and_fires_on_up():
@@ -221,7 +241,9 @@ async def test_newest_wins_replaces_previous_connection():
     server = _server(on_up=on_up, on_down=on_down)
     reader_a, writer_a, task_a = await _connect(server)
     reader_b, writer_b, task_b = await _connect(server)
-    assert writer_a.closed is True  # old closed with the newest taking over
+    # The old writer is closed from inside B's coroutine, a couple of awaits
+    # past B's own ack — poll for it rather than assume it already ran.
+    assert await _await_until(lambda: writer_a.closed)  # newest took over
     assert server.connected is True
     assert ups == [1, 1]  # hello renegotiation runs per-connection
     await _finish(reader_a, task_a)
@@ -229,7 +251,7 @@ async def test_newest_wins_replaces_previous_connection():
     assert await server.send_line('{"to":"b"}')
     assert writer_b.lines()[-1] == {"to": "b"}
     await _finish(reader_b, task_b)
-    assert downs == [1] and server.connected is False
+    assert await _await_until(lambda: downs == [1] and server.connected is False)
 
 
 async def test_drop_connection_fires_on_down_stop_does_not():
@@ -243,13 +265,13 @@ async def test_drop_connection_fires_on_down_stop_does_not():
     await server.drop_connection()
     assert writer.closed is True
     await _finish(reader, task)
-    assert downs == [1] and server.connected is False
+    assert await _await_until(lambda: downs == [1] and server.connected is False)
 
     server2 = _server(on_down=on_down)
     reader2, writer2, task2 = await _connect(server2)
     await server2.stop()  # daemon shutdown: no resume callback wanted
     await _finish(reader2, task2)
-    assert downs == [1]
+    assert downs == [1]  # stop() must NOT fire the down callback
 
 
 async def test_auth_failures_rate_limit_that_ip_only():
