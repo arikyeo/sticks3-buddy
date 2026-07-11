@@ -5,6 +5,7 @@
 #include <ArduinoJson.h>
 #include "config.h"
 #include "logic/utf8_text_logic.h"
+#include "logic/wifi_store_logic.h"
 #include "session_table.h"
 
 // Protocol v1+v2 parse core (PROTOCOL_V2.md). Header-only with file-static
@@ -179,10 +180,23 @@ bool        protoXferCommand(JsonDocument& doc);    // v1 cmd path; true = consu
 void        protoSetClock(uint32_t epoch, int32_t tzOffsetSec);
 void        protoTokens(uint32_t bridgeTotal);
 bool        protoHelloAccept(const ProtoHello& h);  // registry store; returns data.sel
-// Persist WiFi credentials for the OTA flow ({"cmd":"wifi"} post-hello).
-// Returns false when the store failed; the caller has already validated
-// presence + length. Implementations must never log or echo the pass.
-bool        protoWifiCreds(const char* ssid, const char* pass);
+// WiFi network LIST management ({"cmd":"wifi"} post-hello). The store is
+// device-side (LittleFS /wifi.dat via src/wifi_store.*, pure semantics in
+// logic/wifi_store_logic.h); these hooks bind the parse core to it. The
+// caller has already validated presence + length. Implementations must
+// never log or echo a pass — anywhere.
+//   upsert → new count, or WIFI_LIST_FULL (cap, nothing evicted) /
+//            WIFI_LIST_ERR (bad input or store failure)
+//   remove → new count, or WIFI_LIST_ERR when the ssid isn't stored
+//   clear  → true when the list is empty on disk afterwards
+//   count  → stored networks right now
+//   ssids  → fills out with names as JSON string literals ("a","b" — no
+//            brackets, NEVER a pass); returns how many fit outLen
+int16_t     protoWifiUpsert(const char* ssid, const char* pass);
+int16_t     protoWifiRemove(const char* ssid);
+bool        protoWifiClear();
+uint16_t    protoWifiCount();
+uint16_t    protoWifiSsids(char* out, size_t outLen);
 const char* protoBoardName();
 const char* protoDeviceName();
 #ifdef BUDDY_DEBUG
@@ -328,20 +342,56 @@ inline bool protoApplyJson(const char* line, TamaState* out, ProtoState* ps) {
     _protoMaybeRxAck(ps);
     return true;
   }
-  // WiFi credential provisioning for the OTA flow. Post-hello only, like
-  // prompt_cancel — pre-hello it falls into the v1 unknown-cmd swallow, so
-  // v1 byte-identity holds. Reaches the device over the encrypted BLE link
-  // or USB serial (physical access). Limits are the 802.11 maxima (SSID 32
-  // bytes, WPA2-PSK passphrase 63). The ack never echoes the values, and
-  // neither does anything else (status, debug_state, logs) — see the hook
-  // contract above.
+  // WiFi network list management for the OTA flow. Post-hello only, like
+  // prompt_cancel — pre-hello every form falls into the v1 unknown-cmd
+  // swallow, so v1 byte-identity holds. Reaches the device over the
+  // encrypted BLE link or USB serial (physical access). Limits are the
+  // 802.11 maxima (SSID 32 bytes, WPA2-PSK passphrase 63). Sub-commands
+  // (first match wins): list / clear / remove (by ssid) / upsert (default).
+  //   {"cmd":"wifi","ssid":"X","pass":"Y"}   → {"ack":"wifi","ok":true,"n":N}
+  //     at cap:                          → ok:false + "error":"full" + n
+  //   {"cmd":"wifi","ssid":"X","remove":true} → ok + n
+  //   {"cmd":"wifi","clear":true}             → ok + n:0
+  //   {"cmd":"wifi","list":true}   → ok + "ssids":["a","b"] + n (NAMES ONLY;
+  //     if every name can't fit one line, "trunc":true rides along and n
+  //     still reports the full stored count)
+  // No ack — and nothing else (status, debug_state, logs) — ever echoes a
+  // pass; see the hook contract above.
   if (cmd && strcmp(cmd, "wifi") == 0 && ps->helloSeen && ps->effProto >= 2) {
-    const char* ssid = doc["ssid"];
-    const char* pass = doc["pass"] | "";
-    bool ok = ssid && ssid[0] && strlen(ssid) <= 32 && strlen(pass) <= 63 &&
-              protoWifiCreds(ssid, pass);
-    char b[40];
-    snprintf(b, sizeof(b), "{\"ack\":\"wifi\",\"ok\":%s}", ok ? "true" : "false");
+    // Static buffers: the list ack outgrows what this stack frame should
+    // carry. Single-TU + single-threaded parse (same rule as the stores
+    // above), so file-statics are safe.
+    static char b[1024];
+    if (doc["list"] | false) {
+      static char names[928];
+      uint16_t shown = protoWifiSsids(names, sizeof(names));
+      uint16_t n = protoWifiCount();
+      snprintf(b, sizeof(b),
+               "{\"ack\":\"wifi\",\"ok\":true,\"ssids\":[%s],\"n\":%u%s}",
+               names, (unsigned)n, shown < n ? ",\"trunc\":true" : "");
+    } else if (doc["clear"] | false) {
+      bool ok = protoWifiClear();
+      snprintf(b, sizeof(b), "{\"ack\":\"wifi\",\"ok\":%s,\"n\":%u}",
+               ok ? "true" : "false", (unsigned)protoWifiCount());
+    } else if (doc["remove"] | false) {
+      const char* ssid = doc["ssid"];
+      int16_t r = (ssid && ssid[0] && strlen(ssid) <= 32)
+                      ? protoWifiRemove(ssid) : WIFI_LIST_ERR;
+      snprintf(b, sizeof(b), "{\"ack\":\"wifi\",\"ok\":%s,\"n\":%u}",
+               r >= 0 ? "true" : "false", (unsigned)protoWifiCount());
+    } else {
+      const char* ssid = doc["ssid"];
+      const char* pass = doc["pass"] | "";
+      int16_t r = (ssid && ssid[0] && strlen(ssid) <= 32 && strlen(pass) <= 63)
+                      ? protoWifiUpsert(ssid, pass) : WIFI_LIST_ERR;
+      if (r == WIFI_LIST_FULL)
+        snprintf(b, sizeof(b),
+                 "{\"ack\":\"wifi\",\"ok\":false,\"error\":\"full\",\"n\":%u}",
+                 (unsigned)protoWifiCount());
+      else
+        snprintf(b, sizeof(b), "{\"ack\":\"wifi\",\"ok\":%s,\"n\":%u}",
+                 r >= 0 ? "true" : "false", (unsigned)protoWifiCount());
+    }
     protoEmit(b);
     _protoMaybeRxAck(ps);
     return true;

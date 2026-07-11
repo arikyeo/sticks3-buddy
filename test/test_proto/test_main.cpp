@@ -43,12 +43,32 @@ void protoSetClock(uint32_t epoch, int32_t tz) {
 }
 void protoTokens(uint32_t total) { g_tokens = total; g_tokenCalls++; }
 bool protoHelloAccept(const ProtoHello& h) { g_hello = h; g_helloCalls++; return g_helloSel; }
-static std::string g_wifiSsid, g_wifiPass;
+// WiFi hooks ride the real pure model (logic/wifi_store_logic.h) over a
+// TINY cap so the "full" ack is reachable without 256 feeds; only the
+// device persistence (LittleFS) is stubbed away by g_wifiStoreOk.
+static WifiCred g_wifiSlots[4];
+static WifiList g_wifiList = { g_wifiSlots, 0, 4 };
 static int  g_wifiCalls = 0;
 static bool g_wifiStoreOk = true;
-bool protoWifiCreds(const char* ssid, const char* pass) {
-  g_wifiSsid = ssid; g_wifiPass = pass ? pass : ""; g_wifiCalls++;
-  return g_wifiStoreOk;
+int16_t protoWifiUpsert(const char* ssid, const char* pass) {
+  g_wifiCalls++;
+  if (!g_wifiStoreOk) return WIFI_LIST_ERR;
+  return wifiListUpsert(&g_wifiList, ssid, pass);
+}
+int16_t protoWifiRemove(const char* ssid) {
+  g_wifiCalls++;
+  if (!g_wifiStoreOk) return WIFI_LIST_ERR;
+  return wifiListRemove(&g_wifiList, ssid);
+}
+bool protoWifiClear() {
+  g_wifiCalls++;
+  if (!g_wifiStoreOk) return false;
+  wifiListClear(&g_wifiList);
+  return true;
+}
+uint16_t protoWifiCount() { return g_wifiList.n; }
+uint16_t protoWifiSsids(char* out, size_t outLen) {
+  return wifiListFormatSsids(&g_wifiList, out, outLen);
 }
 const char* protoBoardName()  { return "TestBoard"; }
 const char* protoDeviceName() { return "Buddy"; }
@@ -80,7 +100,9 @@ void setUp() {
   g_xferCalls = 0; g_clockCalls = 0; g_tokenCalls = 0; g_helloCalls = 0;
   g_clockEpoch = 0; g_clockTz = 0; g_tokens = 0;
   g_helloSel = true;
-  g_wifiSsid.clear(); g_wifiPass.clear(); g_wifiCalls = 0; g_wifiStoreOk = true;
+  memset(g_wifiSlots, 0, sizeof(g_wifiSlots));
+  g_wifiList.n = 0;
+  g_wifiCalls = 0; g_wifiStoreOk = true;
   g_now = 1000;
 }
 void tearDown() {}
@@ -406,21 +428,29 @@ void test_no_rxack_without_host_cap() {
   TEST_ASSERT_EQUAL_INT(0, (int)g_emits.size());
 }
 
-// ---- wifi provisioning (Track F P8) ------------------------------------------
+// ---- wifi list management (Track F P8 + multi-network) -----------------------
 void test_wifi_cmd_post_hello_stores_and_acks() {
   doHello();
   feed("{\"cmd\":\"wifi\",\"ssid\":\"HomeNet\",\"pass\":\"hunter22\"}");
   TEST_ASSERT_EQUAL_INT(1, g_wifiCalls);
-  TEST_ASSERT_EQUAL_STRING("HomeNet", g_wifiSsid.c_str());
-  TEST_ASSERT_EQUAL_STRING("hunter22", g_wifiPass.c_str());
-  TEST_ASSERT_EQUAL_INT(1, emitsContaining("\"ack\":\"wifi\",\"ok\":true"));
+  TEST_ASSERT_EQUAL_UINT16(1, g_wifiList.n);
+  TEST_ASSERT_EQUAL_STRING("HomeNet",  g_wifiList.c[0].ssid);
+  TEST_ASSERT_EQUAL_STRING("hunter22", g_wifiList.c[0].pass);
+  TEST_ASSERT_EQUAL_INT(1, emitsContaining("\"ack\":\"wifi\",\"ok\":true,\"n\":1"));
   // secrecy: neither value may appear in anything we emitted
   TEST_ASSERT_EQUAL_INT(0, emitsContaining("HomeNet"));
   TEST_ASSERT_EQUAL_INT(0, emitsContaining("hunter22"));
   // open network: absent pass is legal and stored as ""
   feed("{\"cmd\":\"wifi\",\"ssid\":\"CafeOpen\"}");
   TEST_ASSERT_EQUAL_INT(2, g_wifiCalls);
-  TEST_ASSERT_EQUAL_STRING("", g_wifiPass.c_str());
+  TEST_ASSERT_EQUAL_UINT16(2, g_wifiList.n);
+  TEST_ASSERT_EQUAL_STRING("", g_wifiList.c[1].pass);
+  TEST_ASSERT_EQUAL_INT(1, emitsContaining("\"ack\":\"wifi\",\"ok\":true,\"n\":2"));
+  // upsert: same ssid replaces the pass in place, count stays
+  feed("{\"cmd\":\"wifi\",\"ssid\":\"HomeNet\",\"pass\":\"newpass9\"}");
+  TEST_ASSERT_EQUAL_UINT16(2, g_wifiList.n);
+  TEST_ASSERT_EQUAL_STRING("newpass9", g_wifiList.c[0].pass);
+  TEST_ASSERT_EQUAL_INT(2, emitsContaining("\"ack\":\"wifi\",\"ok\":true,\"n\":2"));
 }
 
 void test_wifi_cmd_rejects_bad_input() {
@@ -431,15 +461,67 @@ void test_wifi_cmd_rejects_bad_input() {
   feed("{\"cmd\":\"wifi\",\"ssid\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}");
   TEST_ASSERT_EQUAL_INT(0, g_wifiCalls);                 // store never reached
   TEST_ASSERT_EQUAL_INT(3, emitsContaining("\"ack\":\"wifi\",\"ok\":false"));
-  g_wifiStoreOk = false;                                 // NVS failure path
+  g_wifiStoreOk = false;                                 // store failure path
   feed("{\"cmd\":\"wifi\",\"ssid\":\"HomeNet\"}");
   TEST_ASSERT_EQUAL_INT(1, g_wifiCalls);
   TEST_ASSERT_EQUAL_INT(4, emitsContaining("\"ack\":\"wifi\",\"ok\":false"));
 }
 
+void test_wifi_cmd_full_acks_error_without_evicting() {
+  doHello();
+  feed("{\"cmd\":\"wifi\",\"ssid\":\"n1\",\"pass\":\"p\"}");
+  feed("{\"cmd\":\"wifi\",\"ssid\":\"n2\",\"pass\":\"p\"}");
+  feed("{\"cmd\":\"wifi\",\"ssid\":\"n3\",\"pass\":\"p\"}");
+  feed("{\"cmd\":\"wifi\",\"ssid\":\"n4\",\"pass\":\"p\"}");   // stub cap = 4
+  g_emits.clear();
+  feed("{\"cmd\":\"wifi\",\"ssid\":\"n5\",\"pass\":\"p\"}");
+  TEST_ASSERT_EQUAL_INT(1, emitsContaining(
+      "\"ack\":\"wifi\",\"ok\":false,\"error\":\"full\",\"n\":4"));
+  TEST_ASSERT_EQUAL_UINT16(4, g_wifiList.n);
+  TEST_ASSERT_EQUAL_STRING("n1", g_wifiList.c[0].ssid);  // nothing evicted
+  // replacing an existing ssid still works at cap
+  g_emits.clear();
+  feed("{\"cmd\":\"wifi\",\"ssid\":\"n2\",\"pass\":\"p2\"}");
+  TEST_ASSERT_EQUAL_INT(1, emitsContaining("\"ack\":\"wifi\",\"ok\":true,\"n\":4"));
+  TEST_ASSERT_EQUAL_STRING("p2", g_wifiList.c[1].pass);
+}
+
+void test_wifi_cmd_remove_and_clear() {
+  doHello();
+  feed("{\"cmd\":\"wifi\",\"ssid\":\"HomeNet\",\"pass\":\"pw\"}");
+  feed("{\"cmd\":\"wifi\",\"ssid\":\"Office\",\"pass\":\"pw2\"}");
+  g_emits.clear();
+  feed("{\"cmd\":\"wifi\",\"ssid\":\"HomeNet\",\"remove\":true}");
+  TEST_ASSERT_EQUAL_INT(1, emitsContaining("\"ack\":\"wifi\",\"ok\":true,\"n\":1"));
+  TEST_ASSERT_EQUAL_UINT16(1, g_wifiList.n);
+  TEST_ASSERT_EQUAL_STRING("Office", g_wifiList.c[0].ssid);
+  g_emits.clear();
+  feed("{\"cmd\":\"wifi\",\"ssid\":\"HomeNet\",\"remove\":true}");   // already gone
+  TEST_ASSERT_EQUAL_INT(1, emitsContaining("\"ack\":\"wifi\",\"ok\":false,\"n\":1"));
+  g_emits.clear();
+  feed("{\"cmd\":\"wifi\",\"clear\":true}");
+  TEST_ASSERT_EQUAL_INT(1, emitsContaining("\"ack\":\"wifi\",\"ok\":true,\"n\":0"));
+  TEST_ASSERT_EQUAL_UINT16(0, g_wifiList.n);
+}
+
+void test_wifi_cmd_list_names_only() {
+  doHello();
+  feed("{\"cmd\":\"wifi\",\"ssid\":\"HomeNet\",\"pass\":\"s3cret-one\"}");
+  feed("{\"cmd\":\"wifi\",\"ssid\":\"CafeOpen\"}");
+  g_emits.clear();
+  feed("{\"cmd\":\"wifi\",\"list\":true}");
+  TEST_ASSERT_EQUAL_INT(1, emitsContaining(
+      "\"ack\":\"wifi\",\"ok\":true,\"ssids\":[\"HomeNet\",\"CafeOpen\"],\"n\":2"));
+  // the list is THE names-only surface: ssids yes, pass never
+  TEST_ASSERT_EQUAL_INT(0, emitsContaining("s3cret"));
+  TEST_ASSERT_EQUAL_INT(0, emitsContaining("trunc"));    // everything fit
+}
+
 void test_wifi_cmd_pre_hello_is_v1_swallowed() {
   feed("{\"cmd\":\"wifi\",\"ssid\":\"HomeNet\",\"pass\":\"hunter22\"}");
-  TEST_ASSERT_EQUAL_INT(0, g_wifiCalls);                 // nothing stored
+  feed("{\"cmd\":\"wifi\",\"list\":true}");              // new forms swallow too
+  feed("{\"cmd\":\"wifi\",\"clear\":true}");
+  TEST_ASSERT_EQUAL_INT(0, g_wifiCalls);                 // nothing stored/read
   TEST_ASSERT_EQUAL_INT(0, (int)g_emits.size());         // no ack — v1 purity
   TEST_ASSERT_EQUAL_STRING("wifi", g_lastXferCmd.c_str());  // v1 catch-all ate it
 }
@@ -488,6 +570,9 @@ int main(int, char**) {
   RUN_TEST(test_no_rxack_without_host_cap);
   RUN_TEST(test_wifi_cmd_post_hello_stores_and_acks);
   RUN_TEST(test_wifi_cmd_rejects_bad_input);
+  RUN_TEST(test_wifi_cmd_full_acks_error_without_evicting);
+  RUN_TEST(test_wifi_cmd_remove_and_clear);
+  RUN_TEST(test_wifi_cmd_list_names_only);
   RUN_TEST(test_wifi_cmd_pre_hello_is_v1_swallowed);
   RUN_TEST(test_debug_state_swallowed_without_flag);
   return UNITY_END();
