@@ -367,8 +367,11 @@ def build_prompt_cancel(wire_id: str) -> str:
     return dumps({"cmd": "prompt_cancel", "id": wire_id})
 
 
+WIFI_MAX_ENTRIES = 256  # device-side LittleFS-backed cap; ack {"error":"full"} beyond it
+
+
 def build_wifi_frame(ssid: str, password: str) -> str:
-    """{"cmd":"wifi","ssid":...,"pass":...} — WiFi provisioning, proto>=2 only.
+    """{"cmd":"wifi","ssid":...,"pass":...} — WiFi upsert-by-ssid, proto>=2 only.
 
     Unlike every other builder here, ``ssid``/``password`` are NOT run
     through :func:`sanitize`: that function is for *display* text
@@ -376,9 +379,37 @@ def build_wifi_frame(ssid: str, password: str) -> str:
     '?') and would corrupt credential bytes that must round-trip exactly
     for the AP handshake to succeed. ``dumps()`` still guarantees a
     pure-ASCII wire via JSON's ``ensure_ascii`` \\uXXXX escaping, so line
-    framing is never at risk.
+    framing is never at risk. Ack: ``{"ack":"wifi","ok":true,"n":<count>}``,
+    or ``{"ok":false,"error":"full","n":<count>}`` once the device is at
+    :data:`WIFI_MAX_ENTRIES`.
     """
     return dumps({"cmd": "wifi", "ssid": ssid, "pass": password})
+
+
+def build_wifi_remove_frame(ssid: str) -> str:
+    """{"cmd":"wifi","ssid":...,"remove":true} — drop one stored network.
+
+    ``ssid`` is not sanitized, matching :func:`build_wifi_frame`: it must
+    match the stored credential byte-for-byte, not a display rendering of
+    it. Ack: ``{"ack":"wifi","ok":true,"n":<count>}``.
+    """
+    return dumps({"cmd": "wifi", "ssid": ssid, "remove": True})
+
+
+def build_wifi_clear_frame() -> str:
+    """{"cmd":"wifi","clear":true} — drop every stored network.
+
+    Ack: ``{"ack":"wifi","ok":true,"n":0}``.
+    """
+    return dumps({"cmd": "wifi", "clear": True})
+
+
+def build_wifi_list_frame() -> str:
+    """{"cmd":"wifi","list":true} — enumerate stored SSIDs (names only).
+
+    Ack: ``{"ack":"wifi","ok":true,"ssids":[...],"n":<count>}``.
+    """
+    return dumps({"cmd": "wifi", "list": True})
 
 
 def build_ask_evt(

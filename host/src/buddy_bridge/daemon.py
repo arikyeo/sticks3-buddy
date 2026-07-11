@@ -1236,33 +1236,86 @@ class Daemon:
     # ---- wifi provisioning ----
 
     async def handle_wifi(self, msg: dict[str, Any]) -> dict[str, Any]:
-        """IPC "wifi" event: relay credentials to a v2 device and wait for
-        its ack. ``msg`` (and the ``password`` local below) carry the
-        plaintext password — never pass ``msg`` itself to a log call, only
-        the ssid is safe to mention."""
+        """IPC "wifi" event: relay one WiFi op (upsert/remove/clear/list) to
+        a v2 device and wait for its ack. ``msg`` (and the ``password``
+        local below) may carry the plaintext password — never pass ``msg``
+        itself to a log call, only the ssid/op are safe to mention.
+
+        ``msg`` shapes (mirrors the device's own upsert-by-ssid list):
+          ``{"ssid","pass"}``  -> upsert            ack adds ``n``
+          ``{"ssid","remove":true}`` -> remove one   ack adds ``n``
+          ``{"clear":true}``   -> remove all         ack adds ``n`` (0)
+          ``{"list":true}``    -> enumerate          ack adds ``ssids``, ``n``
+
+        Validation precedence matches the original single-op handler:
+        missing-ssid is checked before liveness/protocol so a doomed
+        request never bothers looking at link state.
+        """
+        is_list = bool(msg.get("list"))
+        is_clear = bool(msg.get("clear"))
         ssid = str(msg.get("ssid") or "")
         password = str(msg.get("pass") or "")
-        if not ssid:
+        if not is_list and not is_clear and not ssid:
             return {"ok": False, "error": "missing ssid"}
         if not self.link.connected:
             return {"ok": False, "error": "device not connected"}
         if not self.v2_active:
             return {"ok": False, "error": "device firmware is v1-only (wifi needs protocol v2)"}
-        log.info("daemon: wifi provisioning requested (ssid=%r)", ssid)
-        ok = await self.send_wifi(ssid, password)
-        if ok is None:
+
+        if is_list:
+            log.info("daemon: wifi list requested")
+            frame = protocol.build_wifi_list_frame()
+        elif is_clear:
+            log.info("daemon: wifi clear requested")
+            frame = protocol.build_wifi_clear_frame()
+        elif msg.get("remove"):
+            log.info("daemon: wifi remove requested (ssid=%r)", ssid)
+            frame = protocol.build_wifi_remove_frame(ssid)
+        else:
+            log.info("daemon: wifi provisioning requested (ssid=%r)", ssid)
+            frame = protocol.build_wifi_frame(ssid, password)
+
+        ack = await self._send_wifi_op(frame)
+        if ack is None:
             return {"ok": False, "error": "device did not acknowledge within timeout"}
-        return {"ok": ok}
+        resp: dict[str, Any] = {"ok": ack.get("ok") is True}
+        if not resp["ok"]:
+            error = ack.get("error")
+            if isinstance(error, str) and error:
+                resp["error"] = error
+        n = ack.get("n")
+        if isinstance(n, int) and not isinstance(n, bool):
+            resp["n"] = n
+        if is_list:
+            ssids = ack.get("ssids")
+            if isinstance(ssids, list):
+                resp["ssids"] = [s for s in ssids if isinstance(s, str)]
+        return resp
 
     async def send_wifi(
         self, ssid: str, password: str, timeout: Optional[float] = None
     ) -> Optional[bool]:
-        """Send ``{"cmd":"wifi",...}`` and wait for the device's
-        ``{"ack":"wifi","ok":...}``. Returns the device's ``ok`` verbatim,
-        or None when the send failed or nothing came back within
-        ``timeout`` (default WIFI_ACK_TIMEOUT_SECS). Serialized by
-        ``_wifi_lock`` so a second concurrent call can't steal the first
-        call's pending ack future."""
+        """Send an upsert ``{"cmd":"wifi",...}`` and wait for the device's
+        ack. Returns the device's ``ok`` verbatim, or None when the send
+        failed or nothing came back within ``timeout`` (default
+        WIFI_ACK_TIMEOUT_SECS). Bool-only convenience wrapper around
+        :meth:`_send_wifi_op` kept for existing callers/tests;
+        :meth:`handle_wifi` calls :meth:`_send_wifi_op` directly so it can
+        also surface ``n``/``ssids``/``error``."""
+        ack = await self._send_wifi_op(protocol.build_wifi_frame(ssid, password), timeout)
+        if ack is None:
+            return None
+        return ack.get("ok") is True
+
+    async def _send_wifi_op(
+        self, frame: str, timeout: Optional[float] = None
+    ) -> Optional[dict[str, Any]]:
+        """Send a pre-built ``{"cmd":"wifi",...}`` frame and wait for the
+        device's full ``{"ack":"wifi",...}`` object (None when the send
+        failed or nothing came back within ``timeout``, default
+        WIFI_ACK_TIMEOUT_SECS). Serialized by ``_wifi_lock`` so a second
+        concurrent call — including a bulk import's sequential sends —
+        can't steal the first call's pending ack future."""
         if timeout is None:
             timeout = WIFI_ACK_TIMEOUT_SECS
         async with self._wifi_lock:
@@ -1270,7 +1323,7 @@ class Daemon:
             fut: asyncio.Future = loop.create_future()
             self._wifi_ack_future = fut
             try:
-                if not await self._send_line(protocol.build_wifi_frame(ssid, password)):
+                if not await self._send_line(frame):
                     return None
                 return await asyncio.wait_for(fut, timeout)
             except asyncio.TimeoutError:
@@ -1282,10 +1335,7 @@ class Daemon:
     def _resolve_wifi_ack(self, obj: dict[str, Any]) -> None:
         fut = self._wifi_ack_future
         if fut is not None and not fut.done():
-            # Strict identity check (matches parse_hello_ack's style): only
-            # a literal JSON `true` counts as success, so a malformed or
-            # wrong-typed `ok` can never be misread as one.
-            fut.set_result(obj.get("ok") is True)
+            fut.set_result(obj)
 
     # ---- info cards (extras: ntfy) ----
 
